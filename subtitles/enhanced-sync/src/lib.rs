@@ -34,14 +34,7 @@ const MAX_DECODE_INPUT_BYTES: usize = 64 * 1024 * 1024;
 const MIN_EFFECTIVE_OFFSET_MS: i64 = 50;
 
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("describe") {
-        println!(
-            "{}",
-            serde_json::to_string(&descriptor()).expect("descriptor serializes")
-        );
-        return;
-    }
-    scryer_plugin_pdk::run_subtitle_sync_plugin(handle_command);
+    scryer_plugin_pdk::run_subtitle_sync_plugin_with_descriptor(descriptor, handle_command);
 }
 
 fn handle_command(request: SubtitleSyncPluginProcessRequest) -> SubtitleSyncPluginProcessResponse {

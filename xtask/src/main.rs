@@ -45,6 +45,9 @@ const CHILD_CATALOG_V2_SCHEMA: &str = "scryer.plugin.child_catalog.v2";
 const CATALOG_V3_SCHEMA: &str = "scryer.plugin.catalog.v3";
 const CATALOG_V3_REDIRECT_SCHEMA: &str = "scryer.plugin.catalog.v3.redirect";
 const PLUGIN_MANIFEST_SCHEMA: &str = "scryer.plugin.v1";
+const PLUGIN_DESCRIPTOR_CUSTOM_SECTION_V1: &str = "scryer.plugin-descriptor.v1";
+const PLUGIN_DESCRIPTOR_CUSTOM_SECTION_PREFIX: &str = "scryer.plugin-descriptor.";
+const PLUGIN_DESCRIPTOR_CUSTOM_SECTION_MAX_BYTES: usize = 1024 * 1024;
 const WASM_OPT_LEVEL_SIZE: &str = "-Oz";
 const WASM_OPT_LEVEL_SPEED: &str = "-O3";
 const ZSTD_LEVEL: &str = "-19";
@@ -623,6 +626,7 @@ struct PreparedCompressedArtifact {
 #[derive(Clone, Debug)]
 struct PreparedPluginVariant {
     feature_set: WasmFeatureSet,
+    descriptor: PluginDescriptor,
     optimized_wasm: PathBuf,
     bytes: u64,
     wasm_digests: Vec<String>,
@@ -4531,7 +4535,7 @@ fn optimize_and_compress_wasm(
     dist: &Path,
     feature_set: &WasmFeatureSet,
     lane: PluginArtifactLane,
-) -> Result<(PathBuf, PathBuf, PathBuf)> {
+) -> Result<(PathBuf, PathBuf, PathBuf, PluginDescriptor)> {
     fs::create_dir_all(dist)?;
     let optimized = dist.join(plugin_variant_uncompressed_file_name(feature_set, lane));
     let compressed = dist.join(plugin_variant_logical_file_name(feature_set, lane, "zst"));
@@ -4547,6 +4551,9 @@ fn optimize_and_compress_wasm(
     }
     wasm_opt.arg(wasm).arg("-o").arg(&optimized);
     run_checked(&mut wasm_opt)?;
+    let descriptor = load_descriptor_from_wasm(&optimized)?;
+    validate_descriptor_contract(&descriptor)?;
+    embed_plugin_descriptor(&optimized, &descriptor)?;
     run_checked(
         ctx.command("zstd")
             .arg(ZSTD_LEVEL)
@@ -4556,7 +4563,142 @@ fn optimize_and_compress_wasm(
             .arg(&compressed),
     )?;
     write_brotli_file(&optimized, &compressed_br)?;
-    Ok((optimized, compressed, compressed_br))
+    Ok((optimized, compressed, compressed_br, descriptor))
+}
+
+fn read_wasm_u32_leb(bytes: &[u8], offset: &mut usize) -> Result<u32> {
+    let mut value = 0u32;
+    for shift in (0..35).step_by(7) {
+        let byte = *bytes
+            .get(*offset)
+            .ok_or_else(|| anyhow!("truncated WASM section length"))?;
+        *offset += 1;
+        if shift == 28 && byte & 0xf0 != 0 {
+            bail!("WASM section length exceeds u32");
+        }
+        value |= u32::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    bail!("invalid WASM section length encoding")
+}
+
+fn write_wasm_u32_leb(mut value: u32, output: &mut Vec<u8>) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        output.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+fn descriptor_custom_section<'a>(wasm: &'a [u8]) -> Result<Option<(&'a str, &'a [u8])>> {
+    if !wasm.starts_with(b"\0asm\x01\0\0\0") {
+        bail!("plugin artifact is not a core WebAssembly module");
+    }
+    let mut offset = 8usize;
+    let mut found = None;
+    while offset < wasm.len() {
+        let section_id = wasm[offset];
+        offset += 1;
+        let section_len = read_wasm_u32_leb(wasm, &mut offset)? as usize;
+        let section_end = offset
+            .checked_add(section_len)
+            .filter(|end| *end <= wasm.len())
+            .ok_or_else(|| anyhow!("truncated WASM section payload"))?;
+        if section_id == 0 {
+            let mut custom_offset = offset;
+            let name_len = read_wasm_u32_leb(wasm, &mut custom_offset)? as usize;
+            let name_end = custom_offset
+                .checked_add(name_len)
+                .filter(|end| *end <= section_end)
+                .ok_or_else(|| anyhow!("truncated WASM custom section name"))?;
+            let name = std::str::from_utf8(&wasm[custom_offset..name_end])
+                .context("WASM custom section name is not UTF-8")?;
+            if name.starts_with(PLUGIN_DESCRIPTOR_CUSTOM_SECTION_PREFIX) {
+                if found.is_some() {
+                    bail!("plugin artifact contains multiple embedded descriptor sections");
+                }
+                found = Some((name, &wasm[name_end..section_end]));
+            }
+        }
+        offset = section_end;
+    }
+    Ok(found)
+}
+
+fn append_plugin_descriptor_custom_section(wasm: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
+    if payload.len() > PLUGIN_DESCRIPTOR_CUSTOM_SECTION_MAX_BYTES {
+        bail!(
+            "plugin descriptor exceeds the {} byte embedded metadata limit",
+            PLUGIN_DESCRIPTOR_CUSTOM_SECTION_MAX_BYTES
+        );
+    }
+    if let Some((name, _)) = descriptor_custom_section(wasm)? {
+        bail!("plugin artifact already contains reserved custom section '{name}'");
+    }
+
+    let name = PLUGIN_DESCRIPTOR_CUSTOM_SECTION_V1.as_bytes();
+    let mut body = Vec::with_capacity(name.len() + payload.len() + 5);
+    write_wasm_u32_leb(
+        u32::try_from(name.len()).context("descriptor section name is too large")?,
+        &mut body,
+    );
+    body.extend_from_slice(name);
+    body.extend_from_slice(payload);
+
+    let mut embedded = wasm.to_vec();
+    embedded.push(0);
+    write_wasm_u32_leb(
+        u32::try_from(body.len()).context("descriptor section is too large")?,
+        &mut embedded,
+    );
+    embedded.extend_from_slice(&body);
+    Ok(embedded)
+}
+
+fn embed_plugin_descriptor(wasm_path: &Path, descriptor: &PluginDescriptor) -> Result<()> {
+    let wasm =
+        fs::read(wasm_path).with_context(|| format!("failed to read {}", wasm_path.display()))?;
+    let command_model = matches!(descriptor.provider, ProviderDescriptor::ArchiveExtractor(_))
+        || subtitle_sync_uses_command_model(descriptor);
+    if command_model && contains_legacy_describe_marker(&wasm) {
+        bail!(
+            "{} contains the raw '{EXPORT_DESCRIBE}' byte sequence; older Scryer hosts would misclassify this command plugin as a legacy reactor",
+            wasm_path.display()
+        );
+    }
+
+    let descriptor_json = serialize_embedded_descriptor(descriptor)?;
+    let embedded = append_plugin_descriptor_custom_section(&wasm, &descriptor_json)?;
+    if command_model && contains_legacy_describe_marker(&embedded) {
+        bail!(
+            "embedding metadata introduced the raw '{EXPORT_DESCRIBE}' byte sequence into {}",
+            wasm_path.display()
+        );
+    }
+    fs::write(wasm_path, embedded)
+        .with_context(|| format!("failed to embed descriptor in {}", wasm_path.display()))
+}
+
+fn serialize_embedded_descriptor<T: Serialize>(descriptor: &T) -> Result<Vec<u8>> {
+    const ESCAPED_LEGACY_DESCRIBE_MARKER: &str = r"scryer\u005fdescribe";
+
+    Ok(serde_json::to_string(descriptor)?
+        .replace(EXPORT_DESCRIBE, ESCAPED_LEGACY_DESCRIBE_MARKER)
+        .into_bytes())
+}
+
+fn contains_legacy_describe_marker(bytes: &[u8]) -> bool {
+    bytes
+        .windows(EXPORT_DESCRIBE.len())
+        .any(|window| window == EXPORT_DESCRIBE.as_bytes())
 }
 
 fn github_release_asset_url(repo: &str, tag: &str, asset: &str) -> String {
@@ -5002,12 +5144,7 @@ fn prepare_official_release(
             build_prepared_plugin_variant(ctx, &plugin.plugin_dir, &dist, feature_set, lane)
         })
         .collect::<Result<Vec<_>>>()?;
-    let descriptor_variant = variants
-        .iter()
-        .find(|variant| variant.feature_set == primary_feature_set)
-        .ok_or_else(|| anyhow!("failed to locate primary prepared plugin variant"))?;
-    let descriptor = load_descriptor_from_wasm(&descriptor_variant.optimized_wasm)?;
-    validate_descriptor_contract(&descriptor)?;
+    let descriptor = prepared_variant_descriptor(&variants, &primary_feature_set)?;
     let version = args.version.unwrap_or_else(|| descriptor.version.clone());
     let baseline_variant = variants
         .iter()
@@ -5018,7 +5155,7 @@ fn prepare_official_release(
             plugin.plugin_id
         );
     }
-    let sdk_constraint = plugin_descriptor_sdk_constraint(&descriptor);
+    let sdk_constraint = plugin_descriptor_sdk_constraint(descriptor);
     let manifest = baseline_variant.map(|baseline_variant| PluginManifestV2 {
         schema_version: PLUGIN_MANIFEST_SCHEMA.to_string(),
         id: descriptor.id.clone(),
@@ -5522,7 +5659,7 @@ fn build_prepared_plugin_variant(
     lane: PluginArtifactLane,
 ) -> Result<PreparedPluginVariant> {
     let wasm = build_plugin_wasm(ctx, plugin_dir, feature_set)?;
-    let (optimized, compressed_zst_source, compressed_br_source) =
+    let (optimized, compressed_zst_source, compressed_br_source, descriptor) =
         optimize_and_compress_wasm(ctx, &wasm, dist, feature_set, lane)?;
     let (staged_zst, zst_digests) = if lane == PluginArtifactLane::V3 {
         let (path, digests) = stage_hashed_asset_copy(
@@ -5547,6 +5684,7 @@ fn build_prepared_plugin_variant(
 
     Ok(PreparedPluginVariant {
         feature_set: feature_set.clone(),
+        descriptor,
         bytes: fs::metadata(&optimized)
             .with_context(|| format!("failed to stat {}", optimized.display()))?
             .len(),
@@ -5563,6 +5701,27 @@ fn build_prepared_plugin_variant(
             digests: br_digests,
         },
     })
+}
+
+fn prepared_variant_descriptor<'a>(
+    variants: &'a [PreparedPluginVariant],
+    primary_feature_set: &WasmFeatureSet,
+) -> Result<&'a PluginDescriptor> {
+    let primary = variants
+        .iter()
+        .find(|variant| &variant.feature_set == primary_feature_set)
+        .ok_or_else(|| anyhow!("failed to locate primary prepared plugin variant"))?;
+    let primary_json = serde_json::to_value(&primary.descriptor)?;
+    for variant in variants {
+        if serde_json::to_value(&variant.descriptor)? != primary_json {
+            bail!(
+                "plugin descriptor differs between '{}' and '{}' feature variants",
+                primary.feature_set.slug(),
+                variant.feature_set.slug()
+            );
+        }
+    }
+    Ok(&primary.descriptor)
 }
 
 fn merge_catalog_v3_plugin_entries(
@@ -5783,16 +5942,11 @@ fn catalog_v3_entry_from_current_plugin_build(
             )
         })
         .collect::<Result<Vec<_>>>()?;
-    let descriptor_variant = variants
-        .iter()
-        .find(|variant| variant.feature_set == primary_feature_set)
-        .ok_or_else(|| anyhow!("failed to locate primary prepared plugin variant"))?;
-    let descriptor = load_descriptor_from_wasm(&descriptor_variant.optimized_wasm)?;
-    validate_descriptor_contract(&descriptor)?;
+    let descriptor = prepared_variant_descriptor(&variants, &primary_feature_set)?;
     let release = catalog_v3_release_from_prepared_assets(
         plugin,
         &descriptor.version,
-        &plugin_descriptor_sdk_constraint(&descriptor),
+        &plugin_descriptor_sdk_constraint(descriptor),
         plugin.min_scryer_version.as_deref(),
         &variants,
     )?;
@@ -8076,6 +8230,44 @@ mod tests {
         let file = tempfile::NamedTempFile::new().expect("create temp manifest");
         fs::write(file.path(), contents).expect("write temp manifest");
         file
+    }
+
+    #[test]
+    fn descriptor_custom_section_round_trips() {
+        let wasm = b"\0asm\x01\0\0\0";
+        let embedded = append_plugin_descriptor_custom_section(wasm, br#"{"id":"test"}"#)
+            .expect("embed descriptor");
+        let (name, payload) = descriptor_custom_section(&embedded)
+            .expect("parse module")
+            .expect("descriptor section");
+        assert_eq!(name, PLUGIN_DESCRIPTOR_CUSTOM_SECTION_V1);
+        assert_eq!(payload, br#"{"id":"test"}"#);
+    }
+
+    #[test]
+    fn embedded_descriptor_json_avoids_old_host_describe_collision() {
+        let descriptor = serde_json::json!({
+            "description": "mentions scryer_describe without changing its value"
+        });
+        let payload = serialize_embedded_descriptor(&descriptor).expect("serialize descriptor");
+        assert!(!contains_legacy_describe_marker(&payload));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&payload).expect("parse escaped JSON"),
+            descriptor
+        );
+
+        let embedded = append_plugin_descriptor_custom_section(b"\0asm\x01\0\0\0", &payload)
+            .expect("embed descriptor");
+        assert!(!contains_legacy_describe_marker(&embedded));
+    }
+
+    #[test]
+    fn descriptor_custom_section_cannot_be_reembedded() {
+        let wasm = append_plugin_descriptor_custom_section(b"\0asm\x01\0\0\0", br#"{"id":"test"}"#)
+            .expect("first embed");
+        let error = append_plugin_descriptor_custom_section(&wasm, br#"{"id":"test"}"#)
+            .expect_err("duplicate section should fail");
+        assert!(error.to_string().contains("reserved custom section"));
     }
 
     fn catalog_v3_test_release(

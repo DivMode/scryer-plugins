@@ -1,4 +1,3 @@
-use scryer_plugin_pdk::run_archive_plugin;
 use scryer_plugin_pdk::{
     ArchivePluginExtractedFile, ArchivePluginFormat, ArchivePluginOperation,
     ArchivePluginProcessRequest, ArchivePluginProcessResponse, ArchivePluginStatus,
@@ -30,18 +29,7 @@ const MAX_ARCHIVE_EXPANDED_BYTES: u64 = 2 * 1024 * 1024 * 1024 * 1024;
 /// for a command binary: the Extism `scryer_describe` export no longer exists,
 /// so a host runs the wasm as `<plugin> describe` and captures stdout.
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("describe") {
-        let json = serde_json::to_string(&build_descriptor())
-            .expect("descriptor serialization must not fail");
-        let mut stdout = io::stdout();
-        stdout
-            .write_all(json.as_bytes())
-            .expect("failed to write descriptor to stdout");
-        stdout.flush().expect("failed to flush descriptor");
-        return;
-    }
-
-    run_archive_plugin(handle_request);
+    scryer_plugin_pdk::run_archive_plugin_with_descriptor(build_descriptor, handle_request);
 }
 
 fn build_descriptor() -> PluginDescriptor {

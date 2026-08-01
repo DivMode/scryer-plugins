@@ -18,11 +18,15 @@
 //!
 //! ## Usage
 //!
-//! A plugin provides a typed request handler and hands it to the matching runner
-//! such as [`run_archive_plugin`] or [`run_subtitle_sync_plugin`]. Operational
-//! failures are reported *in-band* through the response type, never by exiting
-//! non-zero. A non-zero exit is reserved for protocol-level faults (malformed
-//! request, unwritable stdout) and guest panics.
+//! A plugin provides a descriptor factory and a typed request handler to the
+//! matching descriptor-aware runner, such as
+//! [`run_archive_plugin_with_descriptor`] or
+//! [`run_subtitle_sync_plugin_with_descriptor`]. The PDK owns the standardized
+//! `describe` command; release tooling invokes it and embeds the returned
+//! descriptor in the final Wasm artifact. Operational failures are reported
+//! *in-band* through the response type, never by exiting non-zero. A non-zero
+//! exit is reserved for protocol-level faults (malformed request, unwritable
+//! stdout) and guest panics.
 //!
 //! ```no_run
 //! use scryer_plugin_pdk::{
@@ -41,13 +45,11 @@
 //!     }
 //! }
 //!
-//! // Either the macro:
-//! // scryer_plugin_pdk::scryer_archive_plugin_main!(handle);
-//! //
-//! // ...or an explicit main:
-//! fn main() {
-//!     scryer_plugin_pdk::run_archive_plugin(handle);
-//! }
+//! # fn descriptor() -> scryer_plugin_pdk::sdk::PluginDescriptor { unimplemented!() }
+//! scryer_plugin_pdk::scryer_archive_plugin_main!(
+//!     descriptor = descriptor,
+//!     handler = handle,
+//! );
 //! ```
 //!
 //! ## Building the guest artifact
@@ -97,8 +99,9 @@ pub use scryer_plugin_sdk::{
     SubtitleSyncProbeResponse, SubtitleSyncSubtitleStreamMetadata, SubtitleTimingSpan,
 };
 
-/// Full access to the SDK for descriptor and other types the PDK does not wrap
-/// (e.g. `PluginDescriptor` used by a plugin's own describe path).
+/// Full access to descriptor and other SDK types that the PDK does not wrap.
+///
+/// Descriptor-aware runners accept a factory returning [`sdk::PluginDescriptor`].
 pub use scryer_plugin_sdk as sdk;
 
 use std::io::{self, Write};
@@ -152,6 +155,62 @@ where
     }
 }
 
+fn is_describe_command() -> bool {
+    std::env::args().nth(1).as_deref() == Some("describe")
+}
+
+fn write_descriptor_json<W, T>(mut output: W, descriptor: &T) -> Result<(), String>
+where
+    W: Write,
+    T: serde::Serialize,
+{
+    let json = serde_json::to_vec(descriptor)
+        .map_err(|error| format!("failed to serialize plugin descriptor: {error}"))?;
+    output
+        .write_all(&json)
+        .map_err(|error| format!("failed to write plugin descriptor: {error}"))?;
+    output
+        .flush()
+        .map_err(|error| format!("failed to flush plugin descriptor: {error}"))
+}
+
+fn run_descriptor_command<D>(descriptor: D) -> !
+where
+    D: FnOnce() -> sdk::PluginDescriptor,
+{
+    install_panic_hook();
+    let stdout = io::stdout();
+    match write_descriptor_json(stdout.lock(), &descriptor()) {
+        Ok(()) => process::exit(0),
+        Err(error) => {
+            let mut stderr = io::stderr();
+            let _ = writeln!(stderr, "scryer-plugin-pdk: {error}");
+            let _ = stderr.flush();
+            process::exit(2)
+        }
+    }
+}
+
+/// Run an archive plugin and own its standardized `describe` command.
+///
+/// When the first argument is `describe`, the PDK calls `descriptor` lazily,
+/// writes exactly one [`sdk::PluginDescriptor`] JSON document to stdout, and
+/// exits. Otherwise it dispatches one archive request to `handler` using the
+/// normal command protocol.
+///
+/// Release tooling is responsible for invoking `describe` and embedding the
+/// returned descriptor in the final Wasm artifact.
+pub fn run_archive_plugin_with_descriptor<D, H>(descriptor: D, handler: H) -> !
+where
+    D: FnOnce() -> sdk::PluginDescriptor,
+    H: Fn(ArchivePluginProcessRequest) -> ArchivePluginProcessResponse,
+{
+    if is_describe_command() {
+        run_descriptor_command(descriptor);
+    }
+    run_archive_plugin(handler)
+}
+
 /// Command entry glue for SDK 3.5 subtitle-sync plugins.
 ///
 /// Never returns.
@@ -178,15 +237,45 @@ where
     }
 }
 
-/// Define the command `main` for an archive plugin from a request handler.
+/// Run a subtitle-sync plugin and own its standardized `describe` command.
+///
+/// When the first argument is `describe`, the PDK calls `descriptor` lazily,
+/// writes exactly one [`sdk::PluginDescriptor`] JSON document to stdout, and
+/// exits. Otherwise it dispatches one subtitle-sync request to `handler` using
+/// the normal command protocol.
+///
+/// Release tooling is responsible for invoking `describe` and embedding the
+/// returned descriptor in the final Wasm artifact.
+pub fn run_subtitle_sync_plugin_with_descriptor<D, H>(descriptor: D, handler: H) -> !
+where
+    D: FnOnce() -> sdk::PluginDescriptor,
+    H: Fn(SubtitleSyncPluginProcessRequest) -> SubtitleSyncPluginProcessResponse,
+{
+    if is_describe_command() {
+        run_descriptor_command(descriptor);
+    }
+    run_subtitle_sync_plugin(handler)
+}
+
+/// Define the command `main` for an archive plugin from a descriptor factory
+/// and request handler.
 ///
 /// ```no_run
 /// use scryer_plugin_pdk::{ArchivePluginProcessRequest, ArchivePluginProcessResponse};
+/// # fn descriptor() -> scryer_plugin_pdk::sdk::PluginDescriptor { unimplemented!() }
 /// # fn handle(_: ArchivePluginProcessRequest) -> ArchivePluginProcessResponse { unimplemented!() }
-/// scryer_plugin_pdk::scryer_archive_plugin_main!(handle);
+/// scryer_plugin_pdk::scryer_archive_plugin_main!(
+///     descriptor = descriptor,
+///     handler = handle,
+/// );
 /// ```
 #[macro_export]
 macro_rules! scryer_archive_plugin_main {
+    (descriptor = $descriptor:expr, handler = $handler:expr $(,)?) => {
+        fn main() {
+            $crate::run_archive_plugin_with_descriptor($descriptor, $handler);
+        }
+    };
     ($handler:expr) => {
         fn main() {
             $crate::run_archive_plugin($handler);
@@ -194,12 +283,47 @@ macro_rules! scryer_archive_plugin_main {
     };
 }
 
-/// Define the command `main` for a subtitle-sync plugin from a request handler.
+/// Define the command `main` for a subtitle-sync plugin from a descriptor
+/// factory and request handler.
+///
+/// ```no_run
+/// use scryer_plugin_pdk::{
+///     SubtitleSyncPluginProcessRequest, SubtitleSyncPluginProcessResponse,
+/// };
+/// # fn descriptor() -> scryer_plugin_pdk::sdk::PluginDescriptor { unimplemented!() }
+/// # fn handle(_: SubtitleSyncPluginProcessRequest) -> SubtitleSyncPluginProcessResponse { unimplemented!() }
+/// scryer_plugin_pdk::scryer_subtitle_sync_plugin_main!(
+///     descriptor = descriptor,
+///     handler = handle,
+/// );
+/// ```
 #[macro_export]
 macro_rules! scryer_subtitle_sync_plugin_main {
+    (descriptor = $descriptor:expr, handler = $handler:expr $(,)?) => {
+        fn main() {
+            $crate::run_subtitle_sync_plugin_with_descriptor($descriptor, $handler);
+        }
+    };
     ($handler:expr) => {
         fn main() {
             $crate::run_subtitle_sync_plugin($handler);
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(serde::Serialize)]
+    struct TestDescriptor<'a> {
+        id: &'a str,
+    }
+
+    #[test]
+    fn descriptor_writer_emits_one_json_document() {
+        let mut output = Vec::new();
+        write_descriptor_json(&mut output, &TestDescriptor { id: "test" }).unwrap();
+        assert_eq!(output, br#"{"id":"test"}"#);
+    }
 }
