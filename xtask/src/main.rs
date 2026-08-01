@@ -210,6 +210,7 @@ enum Commands {
     Ffmpeg(FfmpegArgs),
     Vad(VadArgs),
     Sdk(SdkArgs),
+    Pdk(PdkArgs),
     Official(OfficialArgs),
     Catalog(CatalogArgs),
     Community(CommunityArgs),
@@ -341,6 +342,25 @@ struct SdkArgs {
 #[derive(Subcommand)]
 enum SdkCommand {
     Bump { version: String },
+}
+
+#[derive(Args)]
+struct PdkArgs {
+    #[command(subcommand)]
+    command: PdkCommand,
+}
+
+#[derive(Subcommand)]
+enum PdkCommand {
+    Release(PdkReleaseArgs),
+}
+
+#[derive(Args)]
+struct PdkReleaseArgs {
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    version: Option<String>,
 }
 
 #[derive(Args)]
@@ -1264,6 +1284,9 @@ fn main() -> Result<()> {
         },
         Commands::Sdk(args) => match args.command {
             SdkCommand::Bump { version } => run_sdk_bump(&ctx, &version),
+        },
+        Commands::Pdk(args) => match args.command {
+            PdkCommand::Release(args) => run_pdk_release(&ctx, args),
         },
         Commands::Official(args) => match args.command {
             OfficialCommand::Release(args) => run_official_release(&ctx, args),
@@ -4158,6 +4181,162 @@ fn run_sdk_bump(ctx: &TaskContext, version: &str) -> Result<()> {
     Ok(())
 }
 
+fn pdk_release_tag(version: &Version) -> String {
+    format!("scryer-plugin-pdk/v{version}")
+}
+
+fn pdk_version_is_published(ctx: &TaskContext, pdk_dir: &Path, version: &Version) -> Result<bool> {
+    let package = format!("scryer-plugin-pdk@{version}");
+    let mut command = repo_cargo_command_in(ctx, pdk_dir)?;
+    command.args(["info", "--registry", "crates-io", &package]);
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    Ok(run_status(&mut command)?.success())
+}
+
+fn run_pdk_release(ctx: &TaskContext, args: PdkReleaseArgs) -> Result<()> {
+    let manifest = ctx.path("pdk/scryer-plugin-pdk/Cargo.toml");
+    let pdk_dir = manifest
+        .parent()
+        .expect("PDK manifest must have a parent directory");
+    let version = version_from_manifest(&manifest)?;
+    if let Some(requested) = args.version.as_deref() {
+        let requested = Version::parse(requested.trim_start_matches('v'))
+            .with_context(|| format!("invalid PDK version {requested}"))?;
+        if requested != version {
+            bail!("requested PDK version {requested} does not match manifest version {version}");
+        }
+    }
+    let tag = pdk_release_tag(&version);
+
+    step(format!("Pre-flight checks for scryer-plugin-pdk {version}"));
+    let status = git_capture(ctx, &["status", "--porcelain"])?;
+    if !status.trim().is_empty() {
+        bail!("PDK release requires a clean working tree");
+    }
+    if local_sdk_override_path()?.is_some() {
+        bail!("{SDK_LOCAL_OVERRIDE_ENV} must be unset for a crates.io PDK release");
+    }
+    let branch = current_branch(ctx)?;
+    if branch == "HEAD" {
+        bail!("PDK release requires a named branch, not detached HEAD");
+    }
+    let head = git_capture(ctx, &["rev-parse", "HEAD"])?;
+    let head = head.trim();
+    let mut verify_commit = ctx.command_in("git", &ctx.repo_root);
+    verify_commit.args(["verify-commit", "HEAD"]);
+    run_checked(&mut verify_commit).context("PDK release requires a signed HEAD commit")?;
+
+    let remote_ref = format!("refs/tags/{tag}");
+    let remote_tag = git_capture(ctx, &["ls-remote", "--tags", "origin", &remote_ref])?;
+    if !remote_tag.trim().is_empty() {
+        bail!("remote tag {tag} already exists");
+    }
+
+    let local_tag = git_capture(ctx, &["tag", "--list", &tag])?;
+    let local_tag_exists = !local_tag.trim().is_empty();
+    if local_tag_exists {
+        let tag_commit = git_capture(ctx, &["rev-list", "-n", "1", &tag])?;
+        if tag_commit.trim() != head {
+            bail!("local tag {tag} does not point to current HEAD {head}");
+        }
+        let mut verify_tag = ctx.command_in("git", &ctx.repo_root);
+        verify_tag.args(["verify-tag", &tag]);
+        run_checked(&mut verify_tag).with_context(|| format!("local tag {tag} is not signed"))?;
+    }
+    ok(format!("Branch {branch}; signed HEAD {head}; tag {tag}"));
+
+    step("Checking PDK formatting");
+    let mut fmt = repo_cargo_command_in(ctx, pdk_dir)?;
+    fmt.args(["fmt", "--", "--check"]);
+    run_checked(&mut fmt)?;
+
+    step("Running PDK tests");
+    let mut test = repo_cargo_command_in(ctx, pdk_dir)?;
+    test.args(["test", "--locked"]);
+    run_checked(&mut test)?;
+
+    step("Running PDK clippy");
+    let mut clippy = repo_cargo_command_in(ctx, pdk_dir)?;
+    clippy.args([
+        "clippy",
+        "--locked",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ]);
+    run_checked(&mut clippy)?;
+
+    step("Building PDK documentation");
+    let mut doc = repo_cargo_command_in(ctx, pdk_dir)?;
+    doc.env("RUSTDOCFLAGS", "-D warnings");
+    doc.args(["doc", "--locked", "--no-deps"]);
+    run_checked(&mut doc)?;
+
+    step("Validating the crates.io package");
+    let mut publish_dry_run = repo_cargo_command_in(ctx, pdk_dir)?;
+    publish_dry_run.args(["publish", "--dry-run", "--locked"]);
+    run_checked(&mut publish_dry_run)?;
+    if args.dry_run {
+        println!(
+            "\n{YELLOW}{BOLD}PDK dry run complete — stopping before tag, publish, or push.{RESET}"
+        );
+        return Ok(());
+    }
+
+    let created_tag = if local_tag_exists {
+        ok(format!("Reusing verified local tag {tag}"));
+        false
+    } else {
+        step(format!("Creating signed tag {tag}"));
+        let mut create_tag = ctx.command_in("git", &ctx.repo_root);
+        create_tag.args([
+            "tag",
+            "-s",
+            &tag,
+            "-m",
+            &format!("scryer-plugin-pdk v{version}"),
+        ]);
+        run_checked(&mut create_tag)?;
+        let mut verify_tag = ctx.command_in("git", &ctx.repo_root);
+        verify_tag.args(["verify-tag", &tag]);
+        run_checked(&mut verify_tag).with_context(|| format!("created tag {tag} is not signed"))?;
+        true
+    };
+
+    if pdk_version_is_published(ctx, pdk_dir, &version)? {
+        ok(format!(
+            "scryer-plugin-pdk {version} is already on crates.io"
+        ));
+    } else {
+        step(format!(
+            "Publishing scryer-plugin-pdk {version} to crates.io"
+        ));
+        let mut publish = repo_cargo_command_in(ctx, pdk_dir)?;
+        publish.args(["publish", "--locked"]);
+        if let Err(error) = run_checked(&mut publish) {
+            if created_tag {
+                let mut delete_tag = ctx.command_in("git", &ctx.repo_root);
+                delete_tag.args(["tag", "-d", &tag]);
+                let _ = run_checked(&mut delete_tag);
+            }
+            return Err(error).context("PDK publish failed; no release refs were pushed");
+        }
+    }
+
+    step("Pushing PDK release refs to origin");
+    let mut push_branch = ctx.command_in("git", &ctx.repo_root);
+    push_branch.args(["push", "origin", &branch]);
+    run_checked(&mut push_branch)?;
+    let mut push_tag = ctx.command_in("git", &ctx.repo_root);
+    push_tag.args(["push", "origin", &tag]);
+    run_checked(&mut push_tag)?;
+
+    println!("\n{GREEN}{BOLD}Released scryer-plugin-pdk {version}{RESET}");
+    println!("   Tag: {tag}");
+    Ok(())
+}
+
 enum SdkDependency {
     Published(String),
     Git { reference: String, version: String },
@@ -4598,7 +4777,7 @@ fn write_wasm_u32_leb(mut value: u32, output: &mut Vec<u8>) {
     }
 }
 
-fn descriptor_custom_section<'a>(wasm: &'a [u8]) -> Result<Option<(&'a str, &'a [u8])>> {
+fn descriptor_custom_section(wasm: &[u8]) -> Result<Option<(&str, &[u8])>> {
     if !wasm.starts_with(b"\0asm\x01\0\0\0") {
         bail!("plugin artifact is not a core WebAssembly module");
     }
@@ -8414,6 +8593,21 @@ mod tests {
         assert!(!help.contains("prepare-v2"));
         assert!(!help.contains("publish-v2"));
         assert!(!help.contains("validate-v2"));
+    }
+
+    #[test]
+    fn pdk_release_is_exposed_through_xtask() {
+        let mut command = Cli::command();
+        let pdk = command
+            .find_subcommand_mut("pdk")
+            .expect("pdk command should exist");
+        let help = pdk.render_long_help().to_string();
+
+        assert!(help.contains("release"));
+        assert_eq!(
+            pdk_release_tag(&Version::parse("0.4.0").unwrap()),
+            "scryer-plugin-pdk/v0.4.0"
+        );
     }
 
     #[test]
