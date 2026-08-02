@@ -27,10 +27,14 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: scryer-plugin-pdk/v${{ inputs.version }}
 
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: "1.95.0"
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -38,21 +42,28 @@ jobs:
 
       - name: Verify PDK tag and metadata
         env:
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
+          expected_ref="scryer-plugin-pdk/v${VERSION}"
+          tag_object="$(git rev-parse "${expected_ref}^{tag}")"
+          tag_commit="$(git rev-parse "${expected_ref}^{commit}")"
+          checked_out_commit="$(git rev-parse HEAD)"
+          if [ "${checked_out_commit}" != "${tag_commit}" ]; then
+            echo "Checked out ${checked_out_commit}, expected ${tag_commit} from ${expected_ref}."
+            exit 1
+          fi
+          if [ "$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object}" --jq '.verification.verified')" != "true" ]; then
+            echo "GitHub does not report ${expected_ref} as a verified signed tag."
+            exit 1
+          fi
           python3 - <<'PY'
           import os
           import pathlib
           import tomllib
 
           expected = os.environ["VERSION"]
-          expected_ref = f"scryer-plugin-pdk/v{expected}"
-          actual_ref = os.environ["GITHUB_REF_NAME"]
-          if actual_ref != expected_ref:
-              raise SystemExit(
-                  f"workflow ref {actual_ref} does not match expected signed tag {expected_ref}"
-              )
           manifest = tomllib.loads(
               pathlib.Path("pdk/scryer-plugin-pdk/Cargo.toml").read_text()
           )
@@ -91,6 +102,8 @@ jobs:
       url: https://crates.io/crates/scryer-plugin-pdk
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: scryer-plugin-pdk/v${{ inputs.version }}
 
       - uses: dtolnay/rust-toolchain@v1
         with:

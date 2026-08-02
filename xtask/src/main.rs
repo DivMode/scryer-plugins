@@ -4220,20 +4220,53 @@ fn run_pdk_release(ctx: &TaskContext, args: PdkReleaseArgs) -> Result<()> {
 
     let remote_ref = format!("refs/tags/{tag}");
     let remote_tag = git_capture(ctx, &["ls-remote", "--tags", "origin", &remote_ref])?;
-    if !remote_tag.trim().is_empty() {
-        bail!("remote tag {tag} already exists");
+    let remote_tag_exists = !remote_tag.trim().is_empty();
+
+    let mut local_tag = git_capture(ctx, &["tag", "--list", &tag])?;
+    if remote_tag_exists && local_tag.trim().is_empty() {
+        let mut fetch_tag = ctx.command_in("git", &ctx.repo_root);
+        fetch_tag.args([
+            "fetch",
+            "--no-tags",
+            "origin",
+            &format!("{remote_ref}:{remote_ref}"),
+        ]);
+        run_checked(&mut fetch_tag)?;
+        local_tag = git_capture(ctx, &["tag", "--list", &tag])?;
     }
 
-    let local_tag = git_capture(ctx, &["tag", "--list", &tag])?;
     let local_tag_exists = !local_tag.trim().is_empty();
     if local_tag_exists {
         let tag_commit = git_capture(ctx, &["rev-list", "-n", "1", &tag])?;
-        if tag_commit.trim() != head {
+        if remote_tag_exists {
+            let remote_tag_object = remote_tag
+                .split_whitespace()
+                .next()
+                .context("remote PDK tag response did not contain an object ID")?;
+            let local_tag_object = git_capture(ctx, &["rev-parse", &format!("{tag}^{{tag}}")])?;
+            if local_tag_object.trim() != remote_tag_object {
+                bail!("local tag {tag} does not match the remote tag object");
+            }
+        } else if tag_commit.trim() != head {
             bail!("local tag {tag} does not point to current HEAD {head}");
         }
         let mut verify_tag = ctx.command_in("git", &ctx.repo_root);
         verify_tag.args(["verify-tag", &tag]);
         run_checked(&mut verify_tag).with_context(|| format!("local tag {tag} is not signed"))?;
+        if remote_tag_exists && tag_commit.trim() != head {
+            let pdk_changes = git_capture(
+                ctx,
+                &["diff", "--name-only", &tag, "--", "pdk/scryer-plugin-pdk"],
+            )?;
+            if !pdk_changes.trim().is_empty() {
+                bail!(
+                    "remote tag {tag} is not at HEAD and the PDK package changed:\n{pdk_changes}"
+                );
+            }
+            ok(format!(
+                "Reusing remote signed tag {tag}; PDK package is unchanged since the tag"
+            ));
+        }
     }
     ok(format!("Branch {branch}; signed HEAD {head}; tag {tag}"));
 
@@ -4298,13 +4331,19 @@ fn run_pdk_release(ctx: &TaskContext, args: PdkReleaseArgs) -> Result<()> {
     let mut push_branch = ctx.command_in("git", &ctx.repo_root);
     push_branch.args(["push", "origin", &branch]);
     run_checked(&mut push_branch)?;
-    let mut push_tag = ctx.command_in("git", &ctx.repo_root);
-    push_tag.args(["push", "origin", &tag]);
-    run_checked(&mut push_tag)?;
+    if remote_tag_exists {
+        ok(format!(
+            "Remote tag {tag} already exists; leaving it unchanged"
+        ));
+    } else {
+        let mut push_tag = ctx.command_in("git", &ctx.repo_root);
+        push_tag.args(["push", "origin", &tag]);
+        run_checked(&mut push_tag)?;
+    }
 
     println!("\n{GREEN}{BOLD}Prepared scryer-plugin-pdk {version} for publication{RESET}");
     println!("   Tag: {tag}");
-    println!("   Manually dispatch plugin-pdk.yml against {tag} with version={version}.");
+    println!("   Manually dispatch plugin-pdk.yml from main with version={version}.");
     println!("   Set dry_run=false; the protected publish job will request approval.");
     Ok(())
 }
