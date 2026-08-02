@@ -4185,14 +4185,6 @@ fn pdk_release_tag(version: &Version) -> String {
     format!("scryer-plugin-pdk/v{version}")
 }
 
-fn pdk_version_is_published(ctx: &TaskContext, pdk_dir: &Path, version: &Version) -> Result<bool> {
-    let package = format!("scryer-plugin-pdk@{version}");
-    let mut command = repo_cargo_command_in(ctx, pdk_dir)?;
-    command.args(["info", "--registry", "crates-io", &package]);
-    command.stdout(Stdio::null()).stderr(Stdio::null());
-    Ok(run_status(&mut command)?.success())
-}
-
 fn run_pdk_release(ctx: &TaskContext, args: PdkReleaseArgs) -> Result<()> {
     let manifest = ctx.path("pdk/scryer-plugin-pdk/Cargo.toml");
     let pdk_dir = manifest
@@ -4284,9 +4276,8 @@ fn run_pdk_release(ctx: &TaskContext, args: PdkReleaseArgs) -> Result<()> {
         return Ok(());
     }
 
-    let created_tag = if local_tag_exists {
+    if local_tag_exists {
         ok(format!("Reusing verified local tag {tag}"));
-        false
     } else {
         step(format!("Creating signed tag {tag}"));
         let mut create_tag = ctx.command_in("git", &ctx.repo_root);
@@ -4301,30 +4292,9 @@ fn run_pdk_release(ctx: &TaskContext, args: PdkReleaseArgs) -> Result<()> {
         let mut verify_tag = ctx.command_in("git", &ctx.repo_root);
         verify_tag.args(["verify-tag", &tag]);
         run_checked(&mut verify_tag).with_context(|| format!("created tag {tag} is not signed"))?;
-        true
-    };
-
-    if pdk_version_is_published(ctx, pdk_dir, &version)? {
-        ok(format!(
-            "scryer-plugin-pdk {version} is already on crates.io"
-        ));
-    } else {
-        step(format!(
-            "Publishing scryer-plugin-pdk {version} to crates.io"
-        ));
-        let mut publish = repo_cargo_command_in(ctx, pdk_dir)?;
-        publish.args(["publish", "--locked"]);
-        if let Err(error) = run_checked(&mut publish) {
-            if created_tag {
-                let mut delete_tag = ctx.command_in("git", &ctx.repo_root);
-                delete_tag.args(["tag", "-d", &tag]);
-                let _ = run_checked(&mut delete_tag);
-            }
-            return Err(error).context("PDK publish failed; no release refs were pushed");
-        }
     }
 
-    step("Pushing PDK release refs to origin");
+    step("Pushing PDK release refs for manual GitHub Actions publish");
     let mut push_branch = ctx.command_in("git", &ctx.repo_root);
     push_branch.args(["push", "origin", &branch]);
     run_checked(&mut push_branch)?;
@@ -4332,8 +4302,10 @@ fn run_pdk_release(ctx: &TaskContext, args: PdkReleaseArgs) -> Result<()> {
     push_tag.args(["push", "origin", &tag]);
     run_checked(&mut push_tag)?;
 
-    println!("\n{GREEN}{BOLD}Released scryer-plugin-pdk {version}{RESET}");
+    println!("\n{GREEN}{BOLD}Prepared scryer-plugin-pdk {version} for publication{RESET}");
     println!("   Tag: {tag}");
+    println!("   Manually dispatch plugin-pdk.yml against {tag} with version={version}.");
+    println!("   Set dry_run=false; the protected publish job will request approval.");
     Ok(())
 }
 

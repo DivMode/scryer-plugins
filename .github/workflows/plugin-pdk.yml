@@ -1,0 +1,108 @@
+name: plugin-pdk
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: PDK version to publish.
+        required: true
+        type: string
+      dry_run:
+        description: Run validation and packaging without publishing to crates.io.
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: plugin-pdk-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.95.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: true
+
+      - name: Verify PDK tag and metadata
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          expected = os.environ["VERSION"]
+          expected_ref = f"scryer-plugin-pdk/v{expected}"
+          actual_ref = os.environ["GITHUB_REF_NAME"]
+          if actual_ref != expected_ref:
+              raise SystemExit(
+                  f"workflow ref {actual_ref} does not match expected signed tag {expected_ref}"
+              )
+          manifest = tomllib.loads(
+              pathlib.Path("pdk/scryer-plugin-pdk/Cargo.toml").read_text()
+          )
+          package_version = manifest["package"]["version"]
+          if package_version != expected:
+              raise SystemExit(
+                  f"Cargo.toml version {package_version} does not match tag {expected}"
+              )
+          PY
+
+      - name: Check PDK formatting
+        run: cargo fmt --manifest-path pdk/scryer-plugin-pdk/Cargo.toml -- --check
+
+      - name: Test PDK
+        run: cargo test --locked --manifest-path pdk/scryer-plugin-pdk/Cargo.toml
+
+      - name: Lint PDK
+        run: cargo clippy --locked --manifest-path pdk/scryer-plugin-pdk/Cargo.toml --all-targets -- -D warnings
+
+      - name: Build PDK documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --manifest-path pdk/scryer-plugin-pdk/Cargo.toml --no-deps
+
+      - name: Package PDK
+        run: cargo package --locked --manifest-path pdk/scryer-plugin-pdk/Cargo.toml
+
+  publish:
+    name: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: validate
+    if: ${{ inputs.dry_run == false }}
+    environment:
+      name: crates-io-publish
+      url: https://crates.io/crates/scryer-plugin-pdk
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.95.0"
+
+      - name: Publish PDK
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "CARGO_REGISTRY_TOKEN is required to publish scryer-plugin-pdk."
+            exit 1
+          fi
+          cargo publish --locked --manifest-path pdk/scryer-plugin-pdk/Cargo.toml
