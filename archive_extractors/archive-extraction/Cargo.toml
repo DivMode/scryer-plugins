@@ -31,8 +31,8 @@ aws-lc-sys = "0.42"
 crc32fast = "1"
 sevenz-rust2 = { version = "0.21", default-features = false, features = ["compress"] }
 tempfile = "3"
-wasmtime = "43"
-wasmtime-wasi = "43"
+wasmtime = "46.0.2"
+wasmtime-wasi = "46.0.2"
 
 [profile.plugin-release]
 inherits = "release"
