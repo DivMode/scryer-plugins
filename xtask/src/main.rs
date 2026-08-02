@@ -4343,8 +4343,8 @@ fn run_pdk_release(ctx: &TaskContext, args: PdkReleaseArgs) -> Result<()> {
 
     println!("\n{GREEN}{BOLD}Prepared scryer-plugin-pdk {version} for publication{RESET}");
     println!("   Tag: {tag}");
-    println!("   Manually dispatch plugin-pdk.yml from main with version={version}.");
-    println!("   Set dry_run=false; the protected publish job will request approval.");
+    println!("   Pushing a new PDK tag triggers plugin-pdk.yml validation.");
+    println!("   Approve the protected publish job in GitHub to release the crate.");
     Ok(())
 }
 

@@ -1,17 +1,9 @@
 name: plugin-pdk
 
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: PDK version to publish.
-        required: true
-        type: string
-      dry_run:
-        description: Run validation and packaging without publishing to crates.io.
-        required: true
-        default: true
-        type: boolean
+  push:
+    tags:
+      - "scryer-plugin-pdk/v*"
 
 concurrency:
   group: plugin-pdk-${{ github.ref }}
@@ -29,7 +21,6 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          ref: scryer-plugin-pdk/v${{ inputs.version }}
 
       - uses: dtolnay/rust-toolchain@v1
         with:
@@ -43,10 +34,9 @@ jobs:
       - name: Verify PDK tag and metadata
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          expected_ref="scryer-plugin-pdk/v${VERSION}"
+          expected_ref="${GITHUB_REF_NAME}"
           tag_object="$(git rev-parse "${expected_ref}^{tag}")"
           tag_commit="$(git rev-parse "${expected_ref}^{commit}")"
           checked_out_commit="$(git rev-parse HEAD)"
@@ -63,14 +53,15 @@ jobs:
           import pathlib
           import tomllib
 
-          expected = os.environ["VERSION"]
           manifest = tomllib.loads(
               pathlib.Path("pdk/scryer-plugin-pdk/Cargo.toml").read_text()
           )
           package_version = manifest["package"]["version"]
-          if package_version != expected:
+          expected_ref = f"scryer-plugin-pdk/v{package_version}"
+          actual_ref = os.environ["GITHUB_REF_NAME"]
+          if actual_ref != expected_ref:
               raise SystemExit(
-                  f"Cargo.toml version {package_version} does not match tag {expected}"
+                  f"workflow ref {actual_ref} does not match manifest tag {expected_ref}"
               )
           PY
 
@@ -96,14 +87,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     needs: validate
-    if: ${{ inputs.dry_run == false }}
     environment:
       name: crates-io-publish
       url: https://crates.io/crates/scryer-plugin-pdk
     steps:
       - uses: actions/checkout@v6
-        with:
-          ref: scryer-plugin-pdk/v${{ inputs.version }}
 
       - uses: dtolnay/rust-toolchain@v1
         with:
