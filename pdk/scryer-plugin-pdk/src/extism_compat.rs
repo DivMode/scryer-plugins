@@ -70,12 +70,15 @@ impl HttpResponse {
 }
 
 pub mod config {
+    use super::FnResult;
+
     /// Return one descriptor-bound configuration value.
     ///
-    /// The previous Extism helper represented unavailable values as `None`; the
-    /// native bridge keeps that source shape for the first-party migration.
-    pub fn get(key: impl Into<String>) -> Option<String> {
-        super::host::config_get(key).ok().flatten()
+    /// This intentionally preserves Extism's `Result<Option<String>>` source
+    /// shape so callers can either propagate host failures or treat them as a
+    /// missing optional setting.
+    pub fn get(key: impl Into<String>) -> FnResult<Option<String>> {
+        Ok(super::host::config_get(key)?)
     }
 }
 
@@ -112,5 +115,10 @@ mod tests {
             .with_header("X-Test", "one");
         assert_eq!(request.method.as_deref(), Some("POST"));
         assert_eq!(request.headers.get("X-Test"), Some(&"one".to_string()));
+    }
+
+    #[test]
+    fn config_get_preserves_extism_result_shape() {
+        let _result: FnResult<Option<String>> = config::get("base_url");
     }
 }
