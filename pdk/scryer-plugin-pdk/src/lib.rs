@@ -77,9 +77,17 @@
 //! flavor to build until a toolchain emits them. See `README.md` for the full
 //! build matrix and rationale.
 
+mod download_client_bridge;
+mod extism_compat;
 mod framing;
+pub mod host;
 
-pub use framing::{FramingError, process, process_json};
+pub use download_client_bridge::{
+    LegacyDownloadClientFunctions, legacy_download_client_descriptor,
+    run_download_client_bridge_with_descriptor,
+};
+pub use extism_compat::{Error, FnResult, HttpRequest, HttpResponse, config, http};
+pub use framing::{FramingError, process, process_json, process_json_result};
 
 // One wire-protocol source of truth (RFC 123 §2.6): the protocol types live in
 // `scryer-plugin-sdk` and are re-exported here so a plugin can depend on the PDK
@@ -103,6 +111,19 @@ pub use scryer_plugin_sdk::{
 ///
 /// Descriptor-aware runners accept a factory returning [`sdk::PluginDescriptor`].
 pub use scryer_plugin_sdk as sdk;
+pub use scryer_plugin_sdk::command::{
+    PluginCommand, PluginCommandRequest, PluginCommandResponse, PluginCommandResult,
+    PluginDownloadClientCommand, PluginDownloadClientCommandResult,
+    PluginDownloadGetCompletedRequest, PluginIndexerCommand, PluginIndexerCommandResult,
+    PluginNotificationCommand, PluginNotificationCommandResult, PluginSubtitleCommand,
+    PluginSubtitleCommandResult,
+};
+pub use scryer_plugin_sdk::host::{
+    PluginConfigGetRequest, PluginConfigGetResponse, PluginHostRequest, PluginHostResponse,
+    PluginHttpRequest, PluginHttpResponse, PluginProcessExecRequest, PluginProcessExecResponse,
+    PluginStateDeleteRequest, PluginStateGetRequest, PluginStateGetResponse,
+    PluginStateMutationResponse, PluginStateSetRequest,
+};
 
 use std::io::{self, Write};
 use std::process;
@@ -257,6 +278,102 @@ where
     run_subtitle_sync_plugin(handler)
 }
 
+fn run_command_plugin<H>(handler: H) -> !
+where
+    H: Fn(PluginCommand) -> Result<PluginCommandResult, String>,
+{
+    install_panic_hook();
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let result = framing::process_json_result(
+        stdin.lock(),
+        stdout.lock(),
+        |request: PluginCommandRequest| {
+            if request.abi_version != sdk::command::COMMAND_ABI_VERSION {
+                return Err(FramingError::Dispatch(format!(
+                    "unsupported command ABI version {}",
+                    request.abi_version
+                )));
+            }
+            let response = handler(request.command).map_err(FramingError::Dispatch)?;
+            Ok(PluginCommandResponse::new(response))
+        },
+    );
+    let _ = io::stdout().flush();
+    match result {
+        Ok(()) => process::exit(0),
+        Err(error) => {
+            let mut stderr = io::stderr();
+            let _ = writeln!(stderr, "scryer-plugin-pdk: {error}");
+            let _ = stderr.flush();
+            process::exit(error.exit_code())
+        }
+    }
+}
+
+fn run_command_plugin_with_descriptor<D, H>(descriptor: D, handler: H) -> !
+where
+    D: FnOnce() -> sdk::PluginDescriptor,
+    H: Fn(PluginCommand) -> Result<PluginCommandResult, String>,
+{
+    if is_describe_command() {
+        run_descriptor_command(descriptor);
+    }
+    run_command_plugin(handler)
+}
+
+/// Run a native indexer command plugin.
+pub fn run_indexer_plugin_with_descriptor<D, H>(descriptor: D, handler: H) -> !
+where
+    D: FnOnce() -> sdk::PluginDescriptor,
+    H: Fn(PluginIndexerCommand) -> PluginIndexerCommandResult,
+{
+    run_command_plugin_with_descriptor(descriptor, move |command| match command {
+        PluginCommand::Indexer(command) => Ok(PluginCommandResult::Indexer(handler(command))),
+        _ => Err("indexer command runner received another plugin family".to_string()),
+    })
+}
+
+/// Run a native download-client command plugin.
+pub fn run_download_client_plugin_with_descriptor<D, H>(descriptor: D, handler: H) -> !
+where
+    D: FnOnce() -> sdk::PluginDescriptor,
+    H: Fn(PluginDownloadClientCommand) -> PluginDownloadClientCommandResult,
+{
+    run_command_plugin_with_descriptor(descriptor, move |command| match command {
+        PluginCommand::DownloadClient(command) => {
+            Ok(PluginCommandResult::DownloadClient(handler(command)))
+        }
+        _ => Err("download-client command runner received another plugin family".to_string()),
+    })
+}
+
+/// Run a native notification command plugin.
+pub fn run_notification_plugin_with_descriptor<D, H>(descriptor: D, handler: H) -> !
+where
+    D: FnOnce() -> sdk::PluginDescriptor,
+    H: Fn(PluginNotificationCommand) -> PluginNotificationCommandResult,
+{
+    run_command_plugin_with_descriptor(descriptor, move |command| match command {
+        PluginCommand::Notification(command) => {
+            Ok(PluginCommandResult::Notification(handler(command)))
+        }
+        _ => Err("notification command runner received another plugin family".to_string()),
+    })
+}
+
+/// Run a native catalog subtitle command plugin.
+pub fn run_subtitle_plugin_with_descriptor<D, H>(descriptor: D, handler: H) -> !
+where
+    D: FnOnce() -> sdk::PluginDescriptor,
+    H: Fn(PluginSubtitleCommand) -> PluginSubtitleCommandResult,
+{
+    run_command_plugin_with_descriptor(descriptor, move |command| match command {
+        PluginCommand::Subtitle(command) => Ok(PluginCommandResult::Subtitle(handler(command))),
+        _ => Err("subtitle command runner received another plugin family".to_string()),
+    })
+}
+
 /// Define the command `main` for an archive plugin from a descriptor factory
 /// and request handler.
 ///
@@ -307,6 +424,98 @@ macro_rules! scryer_subtitle_sync_plugin_main {
     ($handler:expr) => {
         fn main() {
             $crate::run_subtitle_sync_plugin($handler);
+        }
+    };
+}
+
+/// Emit the command-ABI marker used by Scryer to select the native command
+/// runtime. Each command macro expands this once in the guest artifact.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __scryer_command_abi_marker {
+    () => {
+        #[used]
+        #[unsafe(link_section = "scryer.plugin.command_abi")]
+        static SCRYER_PLUGIN_COMMAND_ABI_V1: [u8; 2] =
+            $crate::sdk::command::COMMAND_ABI_VERSION.to_le_bytes();
+    };
+}
+
+#[macro_export]
+macro_rules! scryer_indexer_plugin_main {
+    (descriptor = $descriptor:expr, handler = $handler:expr $(,)?) => {
+        $crate::__scryer_command_abi_marker!();
+        fn main() {
+            $crate::run_indexer_plugin_with_descriptor($descriptor, $handler);
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! scryer_download_client_plugin_main {
+    (descriptor = $descriptor:expr, handler = $handler:expr $(,)?) => {
+        $crate::__scryer_command_abi_marker!();
+        fn main() {
+            $crate::run_download_client_plugin_with_descriptor($descriptor, $handler);
+        }
+    };
+}
+
+/// Bridge the former first-party DLC JSON exports into the native command ABI.
+///
+/// This is intentionally a short-lived migration macro: it preserves each
+/// client's operation implementation while moving framing, descriptor handling,
+/// and exact completed-download lookup into PDK 0.5.
+#[macro_export]
+macro_rules! scryer_download_client_bridge_main {
+    (
+        describe = $describe:path,
+        add = $add:path,
+        list_queue = $list_queue:path,
+        list_history = $list_history:path,
+        list_completed = $list_completed:path,
+        list_recent_completed = $list_recent_completed:expr,
+        control = $control:path,
+        mark_imported = $mark_imported:path,
+        status = $status:path,
+        test_connection = $test_connection:path $(,)?
+    ) => {
+        $crate::__scryer_command_abi_marker!();
+        fn main() {
+            $crate::run_download_client_bridge_with_descriptor(
+                $crate::LegacyDownloadClientFunctions {
+                    describe: $describe,
+                    add: $add,
+                    list_queue: $list_queue,
+                    list_history: $list_history,
+                    list_completed: $list_completed,
+                    list_recent_completed: $list_recent_completed,
+                    control: $control,
+                    mark_imported: $mark_imported,
+                    status: $status,
+                    test_connection: $test_connection,
+                },
+            );
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! scryer_notification_plugin_main {
+    (descriptor = $descriptor:expr, handler = $handler:expr $(,)?) => {
+        $crate::__scryer_command_abi_marker!();
+        fn main() {
+            $crate::run_notification_plugin_with_descriptor($descriptor, $handler);
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! scryer_subtitle_plugin_main {
+    (descriptor = $descriptor:expr, handler = $handler:expr $(,)?) => {
+        $crate::__scryer_command_abi_marker!();
+        fn main() {
+            $crate::run_subtitle_plugin_with_descriptor($descriptor, $handler);
         }
     };
 }

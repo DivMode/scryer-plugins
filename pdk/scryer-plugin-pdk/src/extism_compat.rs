@@ -1,0 +1,116 @@
+//! Small source-compatibility layer for first-party Extism plugin migrations.
+//!
+//! This is not an Extism runtime. It preserves the narrow `Error`, config, and
+//! HTTP call shapes the first-party clients already use while routing each
+//! operation through the native `scryer:host/v1` service.
+
+use std::collections::BTreeMap;
+
+pub use anyhow::Error;
+
+use crate::PluginHttpRequest;
+use crate::host;
+
+pub type FnResult<T> = Result<T, Error>;
+
+#[derive(Debug, Clone)]
+pub struct HttpRequest {
+    url: String,
+    method: Option<String>,
+    headers: BTreeMap<String, String>,
+}
+
+impl HttpRequest {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            method: None,
+            headers: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_method(mut self, method: impl Into<String>) -> Self {
+        self.method = Some(method.into());
+        self
+    }
+
+    pub fn with_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(key.into(), value.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpResponse {
+    status: u16,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+}
+
+impl HttpResponse {
+    pub fn status_code(&self) -> u16 {
+        self.status
+    }
+
+    pub fn body(&self) -> Vec<u8> {
+        self.body.clone()
+    }
+
+    pub fn json<T: serde::de::DeserializeOwned>(&self) -> FnResult<T> {
+        Ok(serde_json::from_slice(&self.body)?)
+    }
+
+    pub fn headers(&self) -> &BTreeMap<String, String> {
+        &self.headers
+    }
+
+    pub fn header(&self, name: impl AsRef<str>) -> Option<&str> {
+        self.headers.get(name.as_ref()).map(String::as_str)
+    }
+}
+
+pub mod config {
+    /// Return one descriptor-bound configuration value.
+    ///
+    /// The previous Extism helper represented unavailable values as `None`; the
+    /// native bridge keeps that source shape for the first-party migration.
+    pub fn get(key: impl Into<String>) -> Option<String> {
+        super::host::config_get(key).ok().flatten()
+    }
+}
+
+pub mod http {
+    use super::{FnResult, HttpRequest, HttpResponse, PluginHttpRequest, host};
+
+    /// Execute an HTTP request through Scryer's descriptor-scoped egress host.
+    pub fn request<T: Into<Vec<u8>>>(
+        request: &HttpRequest,
+        body: Option<T>,
+    ) -> FnResult<HttpResponse> {
+        let response = host::http(PluginHttpRequest {
+            url: request.url.clone(),
+            method: request.method.clone(),
+            headers: request.headers.clone(),
+            body: body.map(Into::into).unwrap_or_default(),
+        })?;
+        Ok(HttpResponse {
+            status: response.status,
+            headers: response.headers,
+            body: response.body,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_builder_preserves_extism_source_shape() {
+        let request = HttpRequest::new("https://downloader.example/api")
+            .with_method("POST")
+            .with_header("X-Test", "one");
+        assert_eq!(request.method.as_deref(), Some("POST"));
+        assert_eq!(request.headers.get("X-Test"), Some(&"one".to_string()));
+    }
+}
