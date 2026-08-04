@@ -435,7 +435,10 @@ macro_rules! scryer_subtitle_sync_plugin_main {
 macro_rules! __scryer_command_abi_marker {
     () => {
         #[used]
-        #[unsafe(link_section = "scryer.plugin.command_abi")]
+        #[cfg_attr(
+            target_arch = "wasm32",
+            unsafe(link_section = "scryer.plugin.command_abi")
+        )]
         static SCRYER_PLUGIN_COMMAND_ABI_V1: [u8; 2] =
             $crate::sdk::command::COMMAND_ABI_VERSION.to_le_bytes();
     };
@@ -524,6 +527,8 @@ macro_rules! scryer_subtitle_plugin_main {
 mod tests {
     use super::*;
 
+    crate::__scryer_command_abi_marker!();
+
     #[derive(serde::Serialize)]
     struct TestDescriptor<'a> {
         id: &'a str,
@@ -534,5 +539,13 @@ mod tests {
         let mut output = Vec::new();
         write_descriptor_json(&mut output, &TestDescriptor { id: "test" }).unwrap();
         assert_eq!(output, br#"{"id":"test"}"#);
+    }
+
+    #[test]
+    fn command_abi_marker_compiles_on_host_targets() {
+        assert_eq!(
+            SCRYER_PLUGIN_COMMAND_ABI_V1,
+            sdk::command::COMMAND_ABI_VERSION.to_le_bytes()
+        );
     }
 }
