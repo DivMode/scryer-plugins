@@ -1,0 +1,29 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "dependencyDashboard": true,
+  "prConcurrentLimit": 5,
+  "packageRules": [
+    {
+      "matchManagers": ["cargo"],
+      "groupName": "Rust dependencies"
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions"
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["slsa-framework/slsa-github-generator"],
+      "enabled": false,
+      "description": "Keep the full release tag required by slsa-verifier; update after explicit compatibility review."
+    }
+  ],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 5am on monday"]
+  }
+}

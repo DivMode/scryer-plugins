@@ -1,0 +1,100 @@
+name: Backfill plugin release signature aliases
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Official plugins-v3 release tag or catalog/v3"
+        required: true
+        type: string
+
+permissions: read-all
+
+jobs:
+  backfill:
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out policy source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.2
+
+      - name: Verify existing signatures and create Scorecard aliases
+        run: |
+          set -euo pipefail
+          case "${RELEASE_TAG}" in
+            plugins-v3/*/v*|catalog/v3) ;;
+            *)
+              echo "Only official plugins-v3 releases and catalog/v3 may be backfilled." >&2
+              exit 1
+              ;;
+          esac
+
+          release_dir="release-assets"
+          rm -rf "${release_dir}"
+          mkdir -p "${release_dir}"
+          gh release download "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --dir "${release_dir}" \
+            --pattern '*'
+
+          identity_regexp="^https://github.com/${GITHUB_REPOSITORY}/\\.github/workflows/release-plugin(-v3)?\\.yml@refs/(heads|tags)/.*$"
+          aliases=()
+
+          while IFS= read -r -d '' compressed_bundle; do
+            artifact="${compressed_bundle%.bundle.zst}"
+            test -f "${artifact}"
+            bundle="$(mktemp)"
+            zstd -dc "${compressed_bundle}" > "${bundle}"
+            cosign verify-blob \
+              --bundle "${bundle}" \
+              --certificate-identity-regexp "${identity_regexp}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "${artifact}"
+            alias="${artifact}.sigstore.json"
+            cp "${bundle}" "${alias}"
+            rm -f "${bundle}"
+            aliases+=("${alias}")
+          done < <(find "${release_dir}" -type f -name '*.bundle.zst' -print0)
+
+          while IFS= read -r -d '' bundle; do
+            artifact="${bundle%.bundle}"
+            test -f "${artifact}"
+            cosign verify-blob \
+              --bundle "${bundle}" \
+              --certificate-identity-regexp "${identity_regexp}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "${artifact}"
+            alias="${artifact}.sigstore.json"
+            cp "${bundle}" "${alias}"
+            aliases+=("${alias}")
+          done < <(find "${release_dir}" -type f -name '*.bundle' -print0)
+
+          while IFS= read -r -d '' bundle; do
+            artifact="${bundle%.bundle.json}.json"
+            test -f "${artifact}"
+            cosign verify-blob \
+              --bundle "${bundle}" \
+              --certificate-identity-regexp "${identity_regexp}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "${artifact}"
+            alias="${artifact}.sigstore.json"
+            cp "${bundle}" "${alias}"
+            aliases+=("${alias}")
+          done < <(find "${release_dir}" -type f -name '*.bundle.json' -print0)
+
+          [ "${#aliases[@]}" -gt 0 ]
+          gh release upload "${RELEASE_TAG}" \
+            "${aliases[@]}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
