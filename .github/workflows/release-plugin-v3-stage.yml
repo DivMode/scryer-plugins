@@ -523,6 +523,7 @@ jobs:
     with:
       base64-subjects-as-file: ${{ needs.collect-release-provenance-subjects.outputs.subjects-file }}
       provenance-name: scryer-plugin-stage-artifacts.intoto.jsonl
+      compile-generator: true
 
   publish-release-provenance:
     needs: [plan-release, generate-release-provenance]
