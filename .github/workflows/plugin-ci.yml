@@ -96,6 +96,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
+      - name: Install Clippy for the active toolchain
+        run: rustup component add clippy --toolchain "$(rustup show active-toolchain | awk '{print $1}')"
+
       - name: Run strict clippy for xtask
         run: cargo clippy --all-targets --all-features --locked --manifest-path xtask/Cargo.toml -- -D warnings
 
@@ -160,6 +163,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         if: ${{ matrix.plugin_id != '' }}
+
+      - name: Prefetch plugin release dependencies
+        if: ${{ matrix.plugin_id != '' }}
+        run: cargo run --locked --manifest-path xtask/Cargo.toml -- official prefetch "${{ matrix.plugin_id }}"
 
       - name: Validate official plugins through the release Wasm path
         if: ${{ matrix.plugin_id != '' }}
