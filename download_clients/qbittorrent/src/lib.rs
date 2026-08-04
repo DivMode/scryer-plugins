@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose};
-use extism_pdk::*;
+use scryer_plugin_pdk::*;
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldOption, ConfigFieldType, DownloadClientCapabilities,
@@ -127,9 +127,8 @@ struct QbCategory {
     save_path: Option<String>,
 }
 
-#[plugin_fn]
 pub fn scryer_describe(_input: String) -> FnResult<String> {
-    Ok(build_descriptor_json()?)
+    build_descriptor_json()
 }
 
 fn build_descriptor_json() -> Result<String, Error> {
@@ -213,7 +212,6 @@ fn build_descriptor_json() -> Result<String, Error> {
     Ok(serde_json::to_string(&descriptor)?)
 }
 
-#[plugin_fn]
 pub fn scryer_download_add(input: String) -> FnResult<String> {
     let request: PluginDownloadClientAddRequest = serde_json::from_str(&input)?;
     let config = match QbittorrentConfig::from_extism() {
@@ -391,7 +389,6 @@ fn handle_download_add(
     Ok(PluginResult::Ok(response))
 }
 
-#[plugin_fn]
 pub fn scryer_download_list_queue(_input: String) -> FnResult<String> {
     let config = QbittorrentConfig::from_extism()?;
     let torrents = list_torrents(&config, Some("all"))?;
@@ -402,7 +399,6 @@ pub fn scryer_download_list_queue(_input: String) -> FnResult<String> {
     Ok(serde_json::to_string(&PluginResult::Ok(items))?)
 }
 
-#[plugin_fn]
 pub fn scryer_download_list_completed(_input: String) -> FnResult<String> {
     let config = QbittorrentConfig::from_extism()?;
     Ok(serde_json::to_string(&PluginResult::Ok(
@@ -459,7 +455,6 @@ where
     }))
 }
 
-#[plugin_fn]
 pub fn scryer_download_list_history(_input: String) -> FnResult<String> {
     let config = QbittorrentConfig::from_extism()?;
     Ok(serde_json::to_string(&PluginResult::Ok(
@@ -467,7 +462,6 @@ pub fn scryer_download_list_history(_input: String) -> FnResult<String> {
     ))?)
 }
 
-#[plugin_fn]
 pub fn scryer_download_control(input: String) -> FnResult<String> {
     let request: PluginDownloadClientControlRequest = serde_json::from_str(&input)?;
     Ok(serde_json::to_string(&handle_download_control(request)?)?)
@@ -524,7 +518,6 @@ fn handle_download_control(
     Ok(PluginResult::Ok(()))
 }
 
-#[plugin_fn]
 pub fn scryer_download_mark_imported(input: String) -> FnResult<String> {
     let request: PluginDownloadClientMarkImportedRequest = serde_json::from_str(&input)?;
     let hash = normalize_hash(
@@ -586,7 +579,6 @@ pub fn scryer_download_mark_imported(input: String) -> FnResult<String> {
     Ok(serde_json::to_string(&PluginResult::Ok(()))?)
 }
 
-#[plugin_fn]
 pub fn scryer_download_status(_input: String) -> FnResult<String> {
     let config = QbittorrentConfig::from_extism()?;
     let version = get_text(&config, "/app/version")?;
@@ -647,7 +639,6 @@ pub fn scryer_download_status(_input: String) -> FnResult<String> {
     Ok(serde_json::to_string(&PluginResult::Ok(status))?)
 }
 
-#[plugin_fn]
 pub fn scryer_download_test_connection(_input: String) -> FnResult<String> {
     let config = QbittorrentConfig::from_extism()?;
     var::remove(COOKIE_VAR_KEY)?;
@@ -2740,3 +2731,16 @@ mod tests {
         }
     }
 }
+
+scryer_plugin_pdk::scryer_download_client_bridge_main!(
+    describe = scryer_describe,
+    add = scryer_download_add,
+    list_queue = scryer_download_list_queue,
+    list_history = scryer_download_list_history,
+    list_completed = scryer_download_list_completed,
+    list_recent_completed = None,
+    control = scryer_download_control,
+    mark_imported = scryer_download_mark_imported,
+    status = scryer_download_status,
+    test_connection = scryer_download_test_connection,
+);

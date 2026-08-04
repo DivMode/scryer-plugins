@@ -1,5 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use extism_pdk::*;
+use scryer_plugin_pdk::*;
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldOption, ConfigFieldRole, ConfigFieldType,
@@ -112,7 +112,6 @@ fn plugin_error<T>(code: PluginErrorCode, public_message: impl Into<String>) -> 
     })
 }
 
-#[plugin_fn]
 pub fn scryer_describe(_input: String) -> FnResult<String> {
     let descriptor = PluginDescriptor {
         id: "transmission".to_string(),
@@ -191,7 +190,6 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
     Ok(serde_json::to_string(&descriptor)?)
 }
 
-#[plugin_fn]
 pub fn scryer_download_add(input: String) -> FnResult<String> {
     let request: PluginDownloadClientAddRequest = serde_json::from_str(&input)?;
     let config = TransmissionConfig::from_extism()?;
@@ -293,7 +291,6 @@ fn should_move_to_top(
     }
 }
 
-#[plugin_fn]
 pub fn scryer_download_list_queue(_input: String) -> FnResult<String> {
     let config = TransmissionConfig::from_extism()?;
     let session = session_get(&config)?;
@@ -306,7 +303,6 @@ pub fn scryer_download_list_queue(_input: String) -> FnResult<String> {
     Ok(serde_json::to_string(&PluginResult::Ok(items))?)
 }
 
-#[plugin_fn]
 pub fn scryer_download_list_history(_input: String) -> FnResult<String> {
     let config = TransmissionConfig::from_extism()?;
     let session = session_get(&config)?;
@@ -319,7 +315,6 @@ pub fn scryer_download_list_history(_input: String) -> FnResult<String> {
     Ok(serde_json::to_string(&PluginResult::Ok(items))?)
 }
 
-#[plugin_fn]
 pub fn scryer_download_list_completed(_input: String) -> FnResult<String> {
     let config = TransmissionConfig::from_extism()?;
     let downloads = list_torrents(&config)?
@@ -331,7 +326,6 @@ pub fn scryer_download_list_completed(_input: String) -> FnResult<String> {
     Ok(serde_json::to_string(&PluginResult::Ok(downloads))?)
 }
 
-#[plugin_fn]
 pub fn scryer_download_control(input: String) -> FnResult<String> {
     let request: PluginDownloadClientControlRequest = serde_json::from_str(&input)?;
     let config = TransmissionConfig::from_extism()?;
@@ -379,7 +373,6 @@ pub fn scryer_download_control(input: String) -> FnResult<String> {
     Ok(serde_json::to_string(&PluginResult::Ok(()))?)
 }
 
-#[plugin_fn]
 pub fn scryer_download_mark_imported(input: String) -> FnResult<String> {
     let request: PluginDownloadClientMarkImportedRequest = serde_json::from_str(&input)?;
     let config = TransmissionConfig::from_extism()?;
@@ -432,7 +425,6 @@ pub fn scryer_download_mark_imported(input: String) -> FnResult<String> {
     Ok(serde_json::to_string(&PluginResult::Ok(()))?)
 }
 
-#[plugin_fn]
 pub fn scryer_download_status(_input: String) -> FnResult<String> {
     let config = TransmissionConfig::from_extism()?;
     let session = session_get(&config)?;
@@ -455,7 +447,6 @@ pub fn scryer_download_status(_input: String) -> FnResult<String> {
     ))?)
 }
 
-#[plugin_fn]
 pub fn scryer_download_test_connection(_input: String) -> FnResult<String> {
     let config = TransmissionConfig::from_extism()?;
     var::remove(SESSION_VAR_KEY)?;
@@ -1225,3 +1216,16 @@ fn is_localhost_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     lower.contains("://localhost") || lower.contains("://127.0.0.1") || lower.contains("://[::1]")
 }
+
+scryer_plugin_pdk::scryer_download_client_bridge_main!(
+    describe = scryer_describe,
+    add = scryer_download_add,
+    list_queue = scryer_download_list_queue,
+    list_history = scryer_download_list_history,
+    list_completed = scryer_download_list_completed,
+    list_recent_completed = None,
+    control = scryer_download_control,
+    mark_imported = scryer_download_mark_imported,
+    status = scryer_download_status,
+    test_connection = scryer_download_test_connection,
+);

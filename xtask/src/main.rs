@@ -6,14 +6,17 @@ mod plugin_new;
 use scryer_plugin_sdk::{
     EXPORT_ARCHIVE_PROCESS, EXPORT_DESCRIBE, EXPORT_DOWNLOAD_ADD, EXPORT_DOWNLOAD_CONTROL,
     EXPORT_DOWNLOAD_LIST_COMPLETED, EXPORT_DOWNLOAD_LIST_HISTORY, EXPORT_DOWNLOAD_LIST_QUEUE,
-    EXPORT_DOWNLOAD_MARK_IMPORTED, EXPORT_DOWNLOAD_STATUS, EXPORT_DOWNLOAD_TEST_CONNECTION,
-    EXPORT_INDEXER_SEARCH, EXPORT_NOTIFICATION_SEND, EXPORT_SUBSYNC_ALIGN,
+    EXPORT_DOWNLOAD_LIST_RECENT_COMPLETED, EXPORT_DOWNLOAD_MARK_IMPORTED, EXPORT_DOWNLOAD_STATUS,
+    EXPORT_DOWNLOAD_TEST_CONNECTION, EXPORT_INDEXER_ACTION, EXPORT_INDEXER_SEARCH,
+    EXPORT_NOTIFICATION_ACTION, EXPORT_NOTIFICATION_SEND, EXPORT_SUBSYNC_ALIGN,
     EXPORT_SUBTITLE_DOWNLOAD, EXPORT_SUBTITLE_GENERATE, EXPORT_SUBTITLE_SEARCH,
     EXPORT_VALIDATE_CONFIG, PluginDescriptor, PluginResult, ProviderDescriptor, SDK_VERSION,
     SubtitleProviderMode, SubtitleSyncAlignRequest, SubtitleSyncAlignResponse,
-    SubtitleSyncInputSubtitle, SubtitleSyncReferenceSubtitle, host_version_matches_constraint,
-    plugin_descriptor_sdk_constraint, validate_plugin_descriptor_host_permissions,
-    validate_sdk_contract,
+    SubtitleSyncInputSubtitle, SubtitleSyncReferenceSubtitle,
+    command::{COMMAND_ABI_CUSTOM_SECTION, COMMAND_ABI_VERSION},
+    host::HOST_ABI_MODULE,
+    host_version_matches_constraint, plugin_descriptor_sdk_constraint,
+    validate_plugin_descriptor_host_permissions, validate_sdk_contract,
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -3028,6 +3031,7 @@ fn build_plugin_wasm(
     let cargo_toml = plugin_dir.join("Cargo.toml");
     validate_plugin_release_profile(&cargo_toml)?;
     let wasm_filename = wasm_filename_for_manifest(&cargo_toml)?;
+    let command_wasm_filename = crate_name_from_manifest(&cargo_toml)? + ".wasm";
 
     step(format!("Building {}", plugin_dir.display()));
     ensure_lockfile(ctx, plugin_dir)?;
@@ -3054,19 +3058,58 @@ fn build_plugin_wasm(
     ]);
     run_checked(&mut build)?;
 
-    let built_wasm = wasm_variant_target_dir(plugin_dir, feature_set)
+    let artifact_dir = wasm_variant_target_dir(plugin_dir, feature_set)
         .join(WASM_TARGET)
-        .join("plugin-release")
-        .join(wasm_filename);
-    if !built_wasm.is_file() {
-        bail!("expected WASM at {} but not found", built_wasm.display());
+        .join("plugin-release");
+    select_built_wasm(&artifact_dir, &wasm_filename, &command_wasm_filename)
+}
+
+fn select_built_wasm(
+    artifact_dir: &Path,
+    legacy_wasm_filename: &str,
+    command_wasm_filename: &str,
+) -> Result<PathBuf> {
+    let command_wasm = artifact_dir.join(command_wasm_filename);
+    if command_wasm.is_file() {
+        return Ok(command_wasm);
     }
-    Ok(built_wasm)
+    let built_wasm = artifact_dir.join(legacy_wasm_filename);
+    if built_wasm.is_file() {
+        return Ok(built_wasm);
+    }
+    bail!(
+        "expected WASM at {} or {} but neither was found",
+        built_wasm.display(),
+        command_wasm.display()
+    )
 }
 
 const COMMAND_MODEL_DESCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_MODEL_EPOCH_TICK: Duration = Duration::from_millis(100);
 const COMMAND_MODEL_DESCRIBE_MEMORY_CAP_BYTES: usize = 64 * 1024 * 1024;
+const COMMAND_WASI_IMPORT_MODULE: &str = "wasi_snapshot_preview1";
+const LEGACY_PLUGIN_EXPORTS: &[&str] = &[
+    EXPORT_DESCRIBE,
+    EXPORT_VALIDATE_CONFIG,
+    EXPORT_INDEXER_SEARCH,
+    EXPORT_INDEXER_ACTION,
+    EXPORT_DOWNLOAD_ADD,
+    EXPORT_DOWNLOAD_LIST_QUEUE,
+    EXPORT_DOWNLOAD_LIST_HISTORY,
+    EXPORT_DOWNLOAD_LIST_COMPLETED,
+    EXPORT_DOWNLOAD_LIST_RECENT_COMPLETED,
+    EXPORT_DOWNLOAD_CONTROL,
+    EXPORT_DOWNLOAD_MARK_IMPORTED,
+    EXPORT_DOWNLOAD_STATUS,
+    EXPORT_DOWNLOAD_TEST_CONNECTION,
+    EXPORT_NOTIFICATION_SEND,
+    EXPORT_NOTIFICATION_ACTION,
+    EXPORT_SUBTITLE_SEARCH,
+    EXPORT_SUBTITLE_DOWNLOAD,
+    EXPORT_SUBTITLE_GENERATE,
+    EXPORT_SUBSYNC_ALIGN,
+    EXPORT_ARCHIVE_PROCESS,
+];
 const COMMAND_MODEL_DESCRIBE_TABLE_ELEMENTS: usize = 100_000;
 const COMMAND_MODEL_STDOUT_LIMIT_BYTES: usize = 1024 * 1024;
 const COMMAND_MODEL_STDERR_LIMIT_BYTES: usize = 64 * 1024;
@@ -3154,6 +3197,7 @@ fn command_model_descriptor_from_wasm(
     wasm_path: &Path,
     wasm: &[u8],
 ) -> Result<Option<PluginDescriptor>> {
+    let command_abi_version = command_abi_version(wasm)?;
     let engine = command_model_engine();
     let module = match Module::from_binary(engine, wasm) {
         Ok(module) => module,
@@ -3172,7 +3216,27 @@ fn command_model_descriptor_from_wasm(
         }
     }
 
-    if !has_start || has_describe {
+    if let Some(abi_version) = command_abi_version {
+        if abi_version != COMMAND_ABI_VERSION {
+            bail!(
+                "{} declares unsupported command ABI version {abi_version}",
+                wasm_path.display()
+            );
+        }
+        validate_command_module_shape(wasm_path, &module)?;
+        if !has_start {
+            bail!(
+                "{} declares the command ABI but does not export _start",
+                wasm_path.display()
+            );
+        }
+        if has_describe {
+            bail!(
+                "{} declares the command ABI but still exports the legacy {EXPORT_DESCRIBE} operation",
+                wasm_path.display()
+            );
+        }
+    } else if !has_start || has_describe {
         return Ok(None);
     }
     if !has_memory {
@@ -3183,28 +3247,33 @@ fn command_model_descriptor_from_wasm(
     }
 
     let descriptor = run_command_model_describe(wasm_path, engine, &module)?;
-    let command_model_supported = match &descriptor.provider {
-        ProviderDescriptor::ArchiveExtractor(_) => true,
-        ProviderDescriptor::Subtitle(subtitle) => {
-            matches!(subtitle.capabilities.mode, SubtitleProviderMode::Sync)
-                && subtitle
-                    .capabilities
-                    .sync
-                    .as_ref()
-                    .is_some_and(|sync| sync.command_model)
-        }
-        _ => false,
-    };
-    if !command_model_supported {
-        bail!(
-            "{} described {} ({}), but command-model validation is only supported for archive_extractor and command-model subtitle sync plugins",
-            wasm_path.display(),
-            descriptor.id,
-            descriptor.plugin_type()
-        );
-    }
-
     Ok(Some(descriptor))
+}
+
+fn validate_command_module_shape(wasm_path: &Path, module: &Module) -> Result<()> {
+    for import in module.imports() {
+        if !matches!(
+            import.module(),
+            COMMAND_WASI_IMPORT_MODULE | HOST_ABI_MODULE
+        ) {
+            bail!(
+                "{} command module imports unsupported {}::{}",
+                wasm_path.display(),
+                import.module(),
+                import.name()
+            );
+        }
+    }
+    for export in module.exports() {
+        if LEGACY_PLUGIN_EXPORTS.contains(&export.name()) {
+            bail!(
+                "{} command module exports legacy operation {}",
+                wasm_path.display(),
+                export.name()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn run_command_model_describe(
@@ -3255,6 +3324,7 @@ fn run_command_model_describe(
         .map_err(|error| {
             anyhow!("failed to define scryer_crc32 for command-model describe: {error:#}")
         })?;
+    add_command_model_host_abi_to_linker(&mut linker)?;
     let stdout = MemoryOutputPipe::new(COMMAND_MODEL_STDOUT_LIMIT_BYTES);
     let stderr = MemoryOutputPipe::new(COMMAND_MODEL_STDERR_LIMIT_BYTES);
     let wasi = WasiCtxBuilder::new()
@@ -3360,6 +3430,86 @@ fn command_model_crc32_unsupported(
     _buf_len: i64,
 ) -> i64 {
     -1
+}
+
+/// Define fail-closed native host ABI imports so command modules can be
+/// instantiated for `describe` without gaining access to host services.
+fn add_command_model_host_abi_to_linker(
+    linker: &mut Linker<CommandModelDescribeCtx>,
+) -> Result<()> {
+    linker
+        .func_wrap(
+            HOST_ABI_MODULE,
+            "scryer_host_call",
+            command_model_host_call_unavailable,
+        )
+        .map_err(|error| {
+            anyhow!("failed to define native host call for command-model describe: {error:#}")
+        })?;
+    linker
+        .func_wrap(
+            HOST_ABI_MODULE,
+            "scryer_host_response_len",
+            command_model_host_response_len_unavailable,
+        )
+        .map_err(|error| {
+            anyhow!(
+                "failed to define native host response length for command-model describe: {error:#}"
+            )
+        })?;
+    linker
+        .func_wrap(
+            HOST_ABI_MODULE,
+            "scryer_host_response_read",
+            command_model_host_response_read_unavailable,
+        )
+        .map_err(|error| {
+            anyhow!(
+                "failed to define native host response read for command-model describe: {error:#}"
+            )
+        })?;
+    linker
+        .func_wrap(
+            HOST_ABI_MODULE,
+            "scryer_host_response_drop",
+            command_model_host_response_drop_unavailable,
+        )
+        .map_err(|error| {
+            anyhow!(
+                "failed to define native host response drop for command-model describe: {error:#}"
+            )
+        })?;
+    Ok(())
+}
+
+fn command_model_host_call_unavailable(
+    _caller: Caller<'_, CommandModelDescribeCtx>,
+    _request_ptr: i32,
+    _request_len: i32,
+) -> i32 {
+    0
+}
+
+fn command_model_host_response_len_unavailable(
+    _caller: Caller<'_, CommandModelDescribeCtx>,
+    _handle: i32,
+) -> i32 {
+    -1
+}
+
+fn command_model_host_response_read_unavailable(
+    _caller: Caller<'_, CommandModelDescribeCtx>,
+    _handle: i32,
+    _destination_ptr: i32,
+    _destination_len: i32,
+) -> i32 {
+    -1
+}
+
+fn command_model_host_response_drop_unavailable(
+    _caller: Caller<'_, CommandModelDescribeCtx>,
+    _handle: i32,
+) {
 }
 
 fn required_exports_for_descriptor(descriptor: &PluginDescriptor) -> Vec<&'static str> {
@@ -4788,6 +4938,47 @@ fn write_wasm_u32_leb(mut value: u32, output: &mut Vec<u8>) {
     }
 }
 
+fn command_abi_version(wasm: &[u8]) -> Result<Option<u16>> {
+    if !wasm.starts_with(b"\0asm\x01\0\0\0") {
+        bail!("plugin artifact is not a core WebAssembly module");
+    }
+    let mut offset = 8usize;
+    let mut found = None;
+    while offset < wasm.len() {
+        let section_id = wasm[offset];
+        offset += 1;
+        let section_len = read_wasm_u32_leb(wasm, &mut offset)? as usize;
+        let section_end = offset
+            .checked_add(section_len)
+            .filter(|end| *end <= wasm.len())
+            .ok_or_else(|| anyhow!("truncated WASM section payload"))?;
+        if section_id == 0 {
+            let mut custom_offset = offset;
+            let name_len = read_wasm_u32_leb(wasm, &mut custom_offset)? as usize;
+            let name_end = custom_offset
+                .checked_add(name_len)
+                .filter(|end| *end <= section_end)
+                .ok_or_else(|| anyhow!("truncated WASM custom section name"))?;
+            let name = std::str::from_utf8(&wasm[custom_offset..name_end])
+                .context("WASM custom section name is not UTF-8")?;
+            if name == COMMAND_ABI_CUSTOM_SECTION {
+                if found.is_some() {
+                    bail!("plugin artifact contains multiple command ABI markers");
+                }
+                let payload = &wasm[name_end..section_end];
+                let bytes: [u8; 2] = payload.try_into().map_err(|_| {
+                    anyhow!(
+                        "plugin command ABI marker must contain a two-byte little-endian version"
+                    )
+                })?;
+                found = Some(u16::from_le_bytes(bytes));
+            }
+        }
+        offset = section_end;
+    }
+    Ok(found)
+}
+
 fn descriptor_custom_section(wasm: &[u8]) -> Result<Option<(&str, &[u8])>> {
     if !wasm.starts_with(b"\0asm\x01\0\0\0") {
         bail!("plugin artifact is not a core WebAssembly module");
@@ -4856,7 +5047,8 @@ fn append_plugin_descriptor_custom_section(wasm: &[u8], payload: &[u8]) -> Resul
 fn embed_plugin_descriptor(wasm_path: &Path, descriptor: &PluginDescriptor) -> Result<()> {
     let wasm =
         fs::read(wasm_path).with_context(|| format!("failed to read {}", wasm_path.display()))?;
-    let command_model = matches!(descriptor.provider, ProviderDescriptor::ArchiveExtractor(_))
+    let command_model = command_abi_version(&wasm)?.is_some()
+        || matches!(descriptor.provider, ProviderDescriptor::ArchiveExtractor(_))
         || subtitle_sync_uses_command_model(descriptor);
     if command_model && contains_legacy_describe_marker(&wasm) {
         bail!(
@@ -8432,6 +8624,47 @@ mod tests {
             .expect("descriptor section");
         assert_eq!(name, PLUGIN_DESCRIPTOR_CUSTOM_SECTION_V1);
         assert_eq!(payload, br#"{"id":"test"}"#);
+    }
+
+    #[test]
+    fn command_abi_marker_round_trips() {
+        let name = COMMAND_ABI_CUSTOM_SECTION.as_bytes();
+        let payload = COMMAND_ABI_VERSION.to_le_bytes();
+        let mut body = Vec::new();
+        write_wasm_u32_leb(
+            name.len().try_into().expect("section name length"),
+            &mut body,
+        );
+        body.extend_from_slice(name);
+        body.extend_from_slice(&payload);
+
+        let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+        wasm.push(0);
+        write_wasm_u32_leb(
+            body.len().try_into().expect("section body length"),
+            &mut wasm,
+        );
+        wasm.extend_from_slice(&body);
+
+        assert_eq!(
+            command_abi_version(&wasm).expect("parse command ABI marker"),
+            Some(COMMAND_ABI_VERSION)
+        );
+    }
+
+    #[test]
+    fn command_artifact_precedes_a_stale_legacy_artifact() {
+        let directory = tempfile::tempdir().expect("create artifact directory");
+        let legacy = directory.path().join("plugin_name.wasm");
+        let command = directory.path().join("plugin-name.wasm");
+        fs::write(&legacy, b"legacy").expect("write legacy artifact");
+        fs::write(&command, b"command").expect("write command artifact");
+
+        assert_eq!(
+            select_built_wasm(directory.path(), "plugin_name.wasm", "plugin-name.wasm")
+                .expect("select artifact"),
+            command
+        );
     }
 
     #[test]
