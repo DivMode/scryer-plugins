@@ -20,6 +20,7 @@ jobs:
     outputs:
       mode: ${{ steps.scope.outputs.mode }}
       plugin_ids: ${{ steps.scope.outputs.plugin_ids }}
+      plugin_matrix: ${{ steps.scope.outputs.plugin_matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -30,8 +31,7 @@ jobs:
         shell: bash
         run: |
           if [[ "${{ github.event_name }}" == "push" ]]; then
-            echo "mode=full" >> "$GITHUB_OUTPUT"
-            echo "plugin_ids=" >> "$GITHUB_OUTPUT"
+            python3 .github/scripts/plan-plugin-ci.py --full >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -56,38 +56,48 @@ jobs:
 
   clippy:
     needs: plan
+    name: clippy (${{ matrix.plugin_id || 'not-needed' }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.plugin_matrix) }}
     steps:
       - name: No Rust changes require clippy
-        if: ${{ needs.plan.outputs.mode == 'none' }}
+        if: ${{ matrix.plugin_id == '' }}
         run: echo "No plugin or shared Rust changes detected."
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ needs.plan.outputs.mode != 'none' }}
+        if: ${{ matrix.plugin_id != '' }}
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        if: ${{ needs.plan.outputs.mode != 'none' }}
+        if: ${{ matrix.plugin_id != '' }}
         with:
           components: clippy
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        if: ${{ needs.plan.outputs.mode != 'none' }}
+        if: ${{ matrix.plugin_id != '' }}
 
       - name: Run strict clippy
-        if: ${{ needs.plan.outputs.mode != 'none' }}
-        env:
-          CI_SCOPE: ${{ needs.plan.outputs.mode }}
-          CI_PLUGIN_IDS: ${{ needs.plan.outputs.plugin_ids }}
-        run: |
-          scope_args=()
-          if [[ "$CI_SCOPE" == "scoped" ]]; then
-            IFS=',' read -r -a plugin_ids <<< "$CI_PLUGIN_IDS"
-            for plugin_id in "${plugin_ids[@]}"; do
-              scope_args+=(--plugin-id "$plugin_id")
-            done
-          fi
-          cargo run --locked --manifest-path xtask/Cargo.toml -- ci clippy "${scope_args[@]}"
+        if: ${{ matrix.plugin_id != '' }}
+        run: cargo run --locked --manifest-path xtask/Cargo.toml -- ci clippy --plugin-id "${{ matrix.plugin_id }}"
+
+  clippy-xtask:
+    needs: plan
+    if: ${{ needs.plan.outputs.mode == 'full' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Run strict clippy for xtask
+        run: cargo clippy --all-targets --all-features --locked --manifest-path xtask/Cargo.toml -- -D warnings
 
   audit:
     needs: plan
@@ -129,47 +139,28 @@ jobs:
 
   wasm-validate:
     needs: plan
+    name: wasm-validate (${{ matrix.plugin_id || 'not-needed' }})
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.plugin_matrix) }}
     steps:
       - name: No Rust changes require Wasm validation
-        if: ${{ needs.plan.outputs.mode == 'none' }}
+        if: ${{ matrix.plugin_id == '' }}
         run: echo "No plugin or shared Rust changes detected."
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ needs.plan.outputs.mode != 'none' }}
+        if: ${{ matrix.plugin_id != '' }}
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        if: ${{ needs.plan.outputs.mode != 'none' }}
+        if: ${{ matrix.plugin_id != '' }}
         with:
           targets: wasm32-wasip1
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        if: ${{ needs.plan.outputs.mode != 'none' }}
-
-      - name: Prefetch official plugin dependencies
-        if: ${{ needs.plan.outputs.mode != 'none' }}
-        env:
-          CI_SCOPE: ${{ needs.plan.outputs.mode }}
-          CI_PLUGIN_IDS: ${{ needs.plan.outputs.plugin_ids }}
-        run: |
-          plugin_ids=()
-          if [[ "$CI_SCOPE" == "scoped" ]]; then
-            IFS=',' read -r -a plugin_ids <<< "$CI_PLUGIN_IDS"
-          fi
-          cargo run --locked --manifest-path xtask/Cargo.toml -- official prefetch "${plugin_ids[@]}"
+        if: ${{ matrix.plugin_id != '' }}
 
       - name: Validate official plugins through the release Wasm path
-        if: ${{ needs.plan.outputs.mode != 'none' }}
-        env:
-          CI_SCOPE: ${{ needs.plan.outputs.mode }}
-          CI_PLUGIN_IDS: ${{ needs.plan.outputs.plugin_ids }}
-        run: |
-          scope_args=()
-          if [[ "$CI_SCOPE" == "scoped" ]]; then
-            IFS=',' read -r -a plugin_ids <<< "$CI_PLUGIN_IDS"
-            for plugin_id in "${plugin_ids[@]}"; do
-              scope_args+=(--plugin-id "$plugin_id")
-            done
-          fi
-          cargo run --locked --manifest-path xtask/Cargo.toml -- plugin validate-all "${scope_args[@]}"
+        if: ${{ matrix.plugin_id != '' }}
+        run: cargo run --locked --manifest-path xtask/Cargo.toml -- plugin validate-all --plugin-id "${{ matrix.plugin_id }}"

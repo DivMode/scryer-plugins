@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import tomllib
 from pathlib import Path, PurePosixPath
 
@@ -51,20 +52,44 @@ def scope_for_changes(
     return "none", []
 
 
+def plugin_matrix(
+    mode: str, plugin_ids: list[str], plugins: dict[str, PurePosixPath]
+) -> str:
+    if mode == "full":
+        selected = sorted(plugins)
+    elif mode == "scoped":
+        selected = plugin_ids
+    else:
+        selected = []
+
+    entries = [{"plugin_id": plugin_id} for plugin_id in selected]
+    if not entries:
+        entries = [{"plugin_id": ""}]
+    return json.dumps({"include": entries}, separators=(",", ":"))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--changed-files", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--changed-files", type=Path)
+    source.add_argument("--full", action="store_true")
     args = parser.parse_args()
 
     root = Path.cwd()
-    changed_paths = [
-        line.strip()
-        for line in args.changed_files.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    mode, plugin_ids = scope_for_changes(changed_paths, official_plugins(root))
+    plugins = official_plugins(root)
+    if args.full:
+        mode, plugin_ids = "full", []
+    else:
+        assert args.changed_files is not None
+        changed_paths = [
+            line.strip()
+            for line in args.changed_files.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        mode, plugin_ids = scope_for_changes(changed_paths, plugins)
     print(f"mode={mode}")
     print(f"plugin_ids={','.join(plugin_ids)}")
+    print(f"plugin_matrix={plugin_matrix(mode, plugin_ids, plugins)}")
 
 
 if __name__ == "__main__":
