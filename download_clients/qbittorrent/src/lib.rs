@@ -128,7 +128,7 @@ struct QbCategory {
 }
 
 pub fn scryer_describe(_input: String) -> FnResult<String> {
-    Ok(build_descriptor_json()?)
+    build_descriptor_json()
 }
 
 fn build_descriptor_json() -> Result<String, Error> {

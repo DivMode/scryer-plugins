@@ -191,7 +191,7 @@ pub fn scryer_download_add(input: String) -> FnResult<String> {
     );
     let response = call_document(&config, method, &args)?;
     if int_response(&response)? != 0 {
-        return Err(Error::msg("rTorrent did not accept the torrent").into());
+        return Err(Error::msg("rTorrent did not accept the torrent"));
     }
     let hash = request
         .release
@@ -258,7 +258,7 @@ pub fn scryer_download_control(input: String) -> FnResult<String> {
                 &[XmlValue::String(normalize_hash(&request.client_item_id))],
             )?;
             if int_response(&response)? != 0 {
-                return Err(Error::msg("rTorrent did not remove the torrent").into());
+                return Err(Error::msg("rTorrent did not remove the torrent"));
             }
         }
         DownloadControlAction::Pause
