@@ -551,13 +551,14 @@ jobs:
             -print0 \
             | sort -z \
             | xargs -0 sha256sum > release-subjects.sha256
-          test -s release-subjects.sha256
+          base64 -w0 release-subjects.sha256 > release-subjects.sha256.base64
+          test -s release-subjects.sha256.base64
 
       - name: Share release subject list with the SLSA generator
         id: subjects
         uses: slsa-framework/slsa-github-generator/actions/generator/generic/create-base64-subjects-from-file@v2.1.0
         with:
-          path: release-subjects.sha256
+          path: release-subjects.sha256.base64
 
   generate-release-provenance:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.catalog_repair_specs == '' }}
