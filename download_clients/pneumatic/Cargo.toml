@@ -2,6 +2,7 @@
 name = "pneumatic-download-client"
 version = "0.1.2"
 edition = "2024"
+rust-version = "1.97"
 autolib = false
 license = "GPL-3.0-only"
 description = "Pneumatic usenet download client plugin"

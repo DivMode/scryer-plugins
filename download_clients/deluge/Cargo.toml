@@ -2,6 +2,7 @@
 name = "deluge-download-client"
 version = "0.1.3"
 edition = "2024"
+rust-version = "1.97"
 autolib = false
 license = "GPL-3.0-only"
 description = "Deluge JSON-RPC torrent download client plugin"
