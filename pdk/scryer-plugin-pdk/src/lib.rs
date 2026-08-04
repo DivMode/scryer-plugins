@@ -86,7 +86,7 @@ pub use download_client_bridge::{
     LegacyDownloadClientFunctions, legacy_download_client_descriptor,
     run_download_client_bridge_with_descriptor,
 };
-pub use extism_compat::{Error, FnResult, HttpRequest, HttpResponse, config, http};
+pub use extism_compat::{Error, FnResult, HttpRequest, HttpResponse, config, http, var};
 pub use framing::{FramingError, process, process_json, process_json_result};
 
 // One wire-protocol source of truth (RFC 123 §2.6): the protocol types live in

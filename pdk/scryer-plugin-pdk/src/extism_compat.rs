@@ -82,6 +82,34 @@ pub mod config {
     }
 }
 
+/// Typed persistent state compatible with Extism's small `var` helper.
+pub mod var {
+    use super::{FnResult, host};
+
+    pub fn get<T>(key: impl Into<String>) -> FnResult<Option<T>>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        host::state_get(key)?
+            .map(|value| serde_json::from_slice(&value).map_err(anyhow::Error::from))
+            .transpose()
+    }
+
+    pub fn set<T>(key: impl Into<String>, value: T) -> FnResult<()>
+    where
+        T: serde::Serialize,
+    {
+        let value = serde_json::to_vec(&value)?;
+        let _ = host::state_set(key, value)?;
+        Ok(())
+    }
+
+    pub fn remove(key: impl Into<String>) -> FnResult<()> {
+        let _ = host::state_delete(key)?;
+        Ok(())
+    }
+}
+
 pub mod http {
     use super::{FnResult, HttpRequest, HttpResponse, PluginHttpRequest, host};
 
@@ -120,5 +148,12 @@ mod tests {
     #[test]
     fn config_get_preserves_extism_result_shape() {
         let _result: FnResult<Option<String>> = config::get("base_url");
+    }
+
+    #[test]
+    fn var_preserves_extism_result_shapes() {
+        let _get: FnResult<Option<String>> = var::get("key");
+        let _set: FnResult<()> = var::set("key", "value");
+        let _remove: FnResult<()> = var::remove("key");
     }
 }
