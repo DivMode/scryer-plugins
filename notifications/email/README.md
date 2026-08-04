@@ -22,3 +22,9 @@ Official Scryer notification plugin for sending plaintext email through SMTP.
 - `tls`: connects with TLS from the start with certificate validation, default port `465`.
 
 TLS verification is mandatory. The plugin does not support insecure certificate bypasses.
+
+## Message behavior
+
+The plugin sends a plaintext RFC 5322 email for each Scryer event. The notification title becomes the subject, optionally prefixed with **subject_prefix**; the summary becomes the body. Recipients may be separated by commas or newlines.
+
+Authentication is attempted only when both **username** and **password** are supplied. This plugin has no HTML templates, attachments, OAuth, or delivery queue of its own.
