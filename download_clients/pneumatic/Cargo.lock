@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "pneumatic-download-client"
-version = "0.1.2"
+version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "scryer-plugin-pdk",
@@ -419,9 +419,9 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scryer-plugin-pdk"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fafc239767476c93a89a226975462ff96dc284fb2006a1fe9398fae6a01f9b26"
+checksum = "0f2ad2b9bc18ccebe6284c9f5a4785b307ae998b87a906b032f03adf44f4a19e"
 dependencies = [
  "anyhow",
  "postcard",
