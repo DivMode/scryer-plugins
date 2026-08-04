@@ -28,6 +28,8 @@ pub enum FramingError {
     SerializeResponse(serde_json::Error),
     /// Writing the response document to the output transport failed.
     WriteResponse(io::Error),
+    /// The command targeted a different plugin family or ABI revision.
+    Dispatch(String),
 }
 
 impl FramingError {
@@ -54,6 +56,7 @@ impl fmt::Display for FramingError {
             FramingError::WriteResponse(error) => {
                 write!(f, "failed to write response to stdout: {error}")
             }
+            FramingError::Dispatch(error) => write!(f, "invalid command dispatch: {error}"),
         }
     }
 }
@@ -65,6 +68,7 @@ impl std::error::Error for FramingError {
             FramingError::ParseRequest(error) | FramingError::SerializeResponse(error) => {
                 Some(error)
             }
+            FramingError::Dispatch(_) => None,
         }
     }
 }
@@ -118,6 +122,33 @@ where
     // Explicit flush: `proc_exit`/WASI abort does not flush libc/std buffers.
     output.flush().map_err(FramingError::WriteResponse)?;
     Ok(())
+}
+
+/// Variant of [`process_json`] for protocol dispatch that can reject a valid
+/// JSON request before it reaches a family handler.
+pub fn process_json_result<R, W, H, Request, Response>(
+    mut input: R,
+    mut output: W,
+    handler: H,
+) -> Result<(), FramingError>
+where
+    R: Read,
+    W: Write,
+    H: FnOnce(Request) -> Result<Response, FramingError>,
+    Request: DeserializeOwned,
+    Response: Serialize,
+{
+    let mut buffer = Vec::new();
+    input
+        .read_to_end(&mut buffer)
+        .map_err(FramingError::ReadRequest)?;
+    let request = serde_json::from_slice(&buffer).map_err(FramingError::ParseRequest)?;
+    let response = handler(request)?;
+    let encoded = serde_json::to_vec(&response).map_err(FramingError::SerializeResponse)?;
+    output
+        .write_all(&encoded)
+        .map_err(FramingError::WriteResponse)?;
+    output.flush().map_err(FramingError::WriteResponse)
 }
 
 #[cfg(test)]

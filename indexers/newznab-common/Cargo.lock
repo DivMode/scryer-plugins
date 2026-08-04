@@ -323,7 +323,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "newznab-common"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "extism-pdk",
  "http",
@@ -496,12 +496,11 @@ dependencies = [
 
 [[package]]
 name = "scryer-plugin-sdk"
-version = "3.2.0"
+version = "3.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3584598d65a7d47fbbc7b5218aa4cebb9a3f5b8339e576a0c7ded4462dcb02c6"
+checksum = "33b069cc903ab6b23a38ea2142ccc21664b8d102b1891f0afe952d1b85a6fa79"
 dependencies = [
  "base64",
- "extism-manifest",
  "extism-pdk",
  "schemars",
  "semver",

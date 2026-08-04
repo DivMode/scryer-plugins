@@ -1,5 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use extism_pdk::*;
+use scryer_plugin_pdk::*;
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldType, DownloadClientCapabilities, DownloadClientDescriptor,
@@ -35,7 +35,6 @@ fn plugin_error<T>(code: PluginErrorCode, public_message: impl Into<String>) -> 
     })
 }
 
-#[plugin_fn]
 pub fn scryer_describe(_input: String) -> FnResult<String> {
     let descriptor = PluginDescriptor {
         id: "torrent-blackhole".to_string(),
@@ -105,7 +104,6 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
     Ok(serde_json::to_string(&descriptor)?)
 }
 
-#[plugin_fn]
 pub fn scryer_download_add(input: String) -> FnResult<String> {
     let request: PluginDownloadClientAddRequest = serde_json::from_str(&input)?;
     let config = BlackholeConfig::from_extism()?;
@@ -177,7 +175,6 @@ pub fn scryer_download_add(input: String) -> FnResult<String> {
     ))?)
 }
 
-#[plugin_fn]
 pub fn scryer_download_list_queue(_input: String) -> FnResult<String> {
     let config = BlackholeConfig::from_extism()?;
     let items = scan_watch_folder(&config)
@@ -187,7 +184,6 @@ pub fn scryer_download_list_queue(_input: String) -> FnResult<String> {
     Ok(serde_json::to_string(&PluginResult::Ok(items))?)
 }
 
-#[plugin_fn]
 pub fn scryer_download_list_history(_input: String) -> FnResult<String> {
     scryer_download_list_queue_inner()
 }
@@ -201,7 +197,6 @@ fn scryer_download_list_queue_inner() -> FnResult<String> {
     Ok(serde_json::to_string(&PluginResult::Ok(items))?)
 }
 
-#[plugin_fn]
 pub fn scryer_download_list_completed(_input: String) -> FnResult<String> {
     let config = BlackholeConfig::from_extism()?;
     let downloads = scan_watch_folder(&config)
@@ -212,7 +207,6 @@ pub fn scryer_download_list_completed(_input: String) -> FnResult<String> {
     Ok(serde_json::to_string(&PluginResult::Ok(downloads))?)
 }
 
-#[plugin_fn]
 pub fn scryer_download_control(input: String) -> FnResult<String> {
     let request: PluginDownloadClientControlRequest = serde_json::from_str(&input)?;
     let config = BlackholeConfig::from_extism()?;
@@ -251,13 +245,11 @@ pub fn scryer_download_control(input: String) -> FnResult<String> {
     Ok(serde_json::to_string(&PluginResult::Ok(()))?)
 }
 
-#[plugin_fn]
 pub fn scryer_download_mark_imported(_input: String) -> FnResult<String> {
     let _request: PluginDownloadClientMarkImportedRequest = serde_json::from_str(&_input)?;
     Ok(serde_json::to_string(&PluginResult::Ok(()))?)
 }
 
-#[plugin_fn]
 pub fn scryer_download_status(_input: String) -> FnResult<String> {
     let config = BlackholeConfig::from_extism()?;
     Ok(serde_json::to_string(&PluginResult::Ok(
@@ -276,7 +268,6 @@ pub fn scryer_download_status(_input: String) -> FnResult<String> {
     ))?)
 }
 
-#[plugin_fn]
 pub fn scryer_download_test_connection(_input: String) -> FnResult<String> {
     let config = BlackholeConfig::from_extism()?;
     ensure_directory(&config.torrent_folder, "Torrent Folder")?;
@@ -641,3 +632,16 @@ fn field(
         help_text: help_text.map(str::to_string),
     }
 }
+
+scryer_plugin_pdk::scryer_download_client_bridge_main!(
+    describe = scryer_describe,
+    add = scryer_download_add,
+    list_queue = scryer_download_list_queue,
+    list_history = scryer_download_list_history,
+    list_completed = scryer_download_list_completed,
+    list_recent_completed = None,
+    control = scryer_download_control,
+    mark_imported = scryer_download_mark_imported,
+    status = scryer_download_status,
+    test_connection = scryer_download_test_connection,
+);

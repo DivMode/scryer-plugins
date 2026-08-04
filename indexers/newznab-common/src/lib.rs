@@ -1944,7 +1944,9 @@ fn classify_and_format_error(code: &str, description: &str) -> Error {
 
 /// Extract standard Newznab attributes that are always captured regardless
 /// of the provider-specific MetadataExtractor. These are applied AFTER the
-/// custom extractor runs.
+/// custom extractor runs. Response ids (`tvdbid`/`tmdbid`/`imdb`) and the
+/// per-item category set feed Scryer's identity-disambiguation and
+/// category-veto lanes.
 fn apply_standard_attrs(
     pairs: &[(String, String)],
     result: &mut SearchResult,
@@ -1966,6 +1968,29 @@ fn apply_standard_attrs(
                     "response_tvdbid".to_string(),
                     serde_json::Value::from(value.as_str()),
                 );
+            }
+            "tmdbid" if !value.is_empty() && value != "0" => {
+                result.provider_extra.insert(
+                    "response_tmdbid".to_string(),
+                    serde_json::Value::from(value.as_str()),
+                );
+            }
+            // Newznab items repeat `attr name="category"` once per category id
+            // (e.g. 5000 + 5070 for a dual-categorized item). Scryer's plugin
+            // adapter reads `provider_categories` as the indexer-asserted
+            // category set for the identity veto lane, so every value is kept
+            // in indexer order, deduped.
+            "category" if !value.is_empty() => {
+                let categories = result
+                    .provider_extra
+                    .entry("provider_categories".to_string())
+                    .or_insert_with(|| serde_json::Value::Array(vec![]));
+                if let serde_json::Value::Array(ref mut arr) = categories {
+                    let candidate = serde_json::Value::from(value.as_str());
+                    if !arr.contains(&candidate) {
+                        arr.push(candidate);
+                    }
+                }
             }
             "imdb" | "imdbid" if !value.is_empty() && value != "0" => {
                 result.provider_extra.insert(
@@ -4023,6 +4048,43 @@ mod tests {
         assert_eq!(
             result.provider_extra.get("response_imdbid"),
             Some(&serde_json::Value::from("1234567"))
+        );
+    }
+
+    #[test]
+    fn attrs_tmdbid() {
+        let pairs = vec![("tmdbid".into(), "980477".into())];
+        let mut result = make_result();
+        let mut usenet_date = None;
+        apply_standard_attrs(&pairs, &mut result, &mut usenet_date);
+        assert_eq!(
+            result.provider_extra.get("response_tmdbid"),
+            Some(&serde_json::Value::from("980477"))
+        );
+    }
+
+    #[test]
+    fn attrs_zero_tmdbid_is_absence() {
+        let pairs = vec![("tmdbid".into(), "0".into())];
+        let mut result = make_result();
+        let mut usenet_date = None;
+        apply_standard_attrs(&pairs, &mut result, &mut usenet_date);
+        assert!(result.provider_extra.get("response_tmdbid").is_none());
+    }
+
+    #[test]
+    fn attrs_categories_collect_in_order_and_dedupe() {
+        let pairs = vec![
+            ("category".into(), "5000".into()),
+            ("category".into(), "5070".into()),
+            ("category".into(), "5000".into()),
+        ];
+        let mut result = make_result();
+        let mut usenet_date = None;
+        apply_standard_attrs(&pairs, &mut result, &mut usenet_date);
+        assert_eq!(
+            result.provider_extra.get("provider_categories"),
+            Some(&serde_json::json!(["5000", "5070"]))
         );
     }
 
