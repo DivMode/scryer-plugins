@@ -17,7 +17,7 @@ pub type FnResult<T> = Result<T, Error>;
 pub struct HttpRequest {
     url: String,
     method: Option<String>,
-    headers: BTreeMap<String, String>,
+    pub headers: BTreeMap<String, String>,
 }
 
 impl HttpRequest {
