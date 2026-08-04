@@ -6,10 +6,39 @@ on:
     branches:
       - main
 
+concurrency:
+  group: plugin-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      mode: ${{ steps.scope.outputs.mode }}
+      plugin_ids: ${{ steps.scope.outputs.plugin_ids }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - name: Determine CI scope
+        id: scope
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "mode=full" >> "$GITHUB_OUTPUT"
+            echo "plugin_ids=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git diff --name-only "${{ github.event.pull_request.base.sha }}" "$GITHUB_SHA" > "$RUNNER_TEMP/changed-files.txt"
+          python3 .github/scripts/plan-plugin-ci.py \
+            --changed-files "$RUNNER_TEMP/changed-files.txt" >> "$GITHUB_OUTPUT"
+
   fmt:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -26,51 +55,121 @@ jobs:
         run: cargo run --locked --manifest-path xtask/Cargo.toml -- ci fmt
 
   clippy:
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: No Rust changes require clippy
+        if: ${{ needs.plan.outputs.mode == 'none' }}
+        run: echo "No plugin or shared Rust changes detected."
+
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        if: ${{ needs.plan.outputs.mode != 'none' }}
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        if: ${{ needs.plan.outputs.mode != 'none' }}
         with:
           components: clippy
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        if: ${{ needs.plan.outputs.mode != 'none' }}
 
       - name: Run strict clippy
-        run: cargo run --locked --manifest-path xtask/Cargo.toml -- ci clippy
+        if: ${{ needs.plan.outputs.mode != 'none' }}
+        env:
+          CI_SCOPE: ${{ needs.plan.outputs.mode }}
+          CI_PLUGIN_IDS: ${{ needs.plan.outputs.plugin_ids }}
+        run: |
+          scope_args=()
+          if [[ "$CI_SCOPE" == "scoped" ]]; then
+            IFS=',' read -r -a plugin_ids <<< "$CI_PLUGIN_IDS"
+            for plugin_id in "${plugin_ids[@]}"; do
+              scope_args+=(--plugin-id "$plugin_id")
+            done
+          fi
+          cargo run --locked --manifest-path xtask/Cargo.toml -- ci clippy "${scope_args[@]}"
 
   audit:
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      - name: No Rust changes require an audit
+        if: ${{ needs.plan.outputs.mode == 'none' }}
+        run: echo "No plugin or shared Rust changes detected."
+
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        if: ${{ needs.plan.outputs.mode != 'none' }}
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        if: ${{ needs.plan.outputs.mode != 'none' }}
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        if: ${{ needs.plan.outputs.mode != 'none' }}
 
       - uses: taiki-e/install-action@15449e3094499af05d8d964a1c884208e4b8b595 # v2.81.11
+        if: ${{ needs.plan.outputs.mode != 'none' }}
         with:
           tool: cargo-audit
 
       - name: Run cargo audit
-        run: cargo run --locked --manifest-path xtask/Cargo.toml -- ci audit
+        if: ${{ needs.plan.outputs.mode != 'none' }}
+        env:
+          CI_SCOPE: ${{ needs.plan.outputs.mode }}
+          CI_PLUGIN_IDS: ${{ needs.plan.outputs.plugin_ids }}
+        run: |
+          scope_args=()
+          if [[ "$CI_SCOPE" == "scoped" ]]; then
+            IFS=',' read -r -a plugin_ids <<< "$CI_PLUGIN_IDS"
+            for plugin_id in "${plugin_ids[@]}"; do
+              scope_args+=(--plugin-id "$plugin_id")
+            done
+          fi
+          cargo run --locked --manifest-path xtask/Cargo.toml -- ci audit "${scope_args[@]}"
 
   wasm-validate:
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
+      - name: No Rust changes require Wasm validation
+        if: ${{ needs.plan.outputs.mode == 'none' }}
+        run: echo "No plugin or shared Rust changes detected."
+
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        if: ${{ needs.plan.outputs.mode != 'none' }}
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        if: ${{ needs.plan.outputs.mode != 'none' }}
         with:
           targets: wasm32-wasip1
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        if: ${{ needs.plan.outputs.mode != 'none' }}
 
       - name: Prefetch official plugin dependencies
-        run: cargo run --locked --manifest-path xtask/Cargo.toml -- official prefetch
+        if: ${{ needs.plan.outputs.mode != 'none' }}
+        env:
+          CI_SCOPE: ${{ needs.plan.outputs.mode }}
+          CI_PLUGIN_IDS: ${{ needs.plan.outputs.plugin_ids }}
+        run: |
+          plugin_ids=()
+          if [[ "$CI_SCOPE" == "scoped" ]]; then
+            IFS=',' read -r -a plugin_ids <<< "$CI_PLUGIN_IDS"
+          fi
+          cargo run --locked --manifest-path xtask/Cargo.toml -- official prefetch "${plugin_ids[@]}"
 
       - name: Validate official plugins through the release Wasm path
-        run: cargo run --locked --manifest-path xtask/Cargo.toml -- plugin validate-all
+        if: ${{ needs.plan.outputs.mode != 'none' }}
+        env:
+          CI_SCOPE: ${{ needs.plan.outputs.mode }}
+          CI_PLUGIN_IDS: ${{ needs.plan.outputs.plugin_ids }}
+        run: |
+          scope_args=()
+          if [[ "$CI_SCOPE" == "scoped" ]]; then
+            IFS=',' read -r -a plugin_ids <<< "$CI_PLUGIN_IDS"
+            for plugin_id in "${plugin_ids[@]}"; do
+              scope_args+=(--plugin-id "$plugin_id")
+            done
+          fi
+          cargo run --locked --manifest-path xtask/Cargo.toml -- plugin validate-all "${scope_args[@]}"

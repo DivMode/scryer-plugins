@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Classify a change set for the plugin CI workflow."""
+
+from __future__ import annotations
+
+import argparse
+import tomllib
+from pathlib import Path, PurePosixPath
+
+
+def official_plugins(root: Path) -> dict[str, PurePosixPath]:
+    plugins: dict[str, PurePosixPath] = {}
+    for manifest in sorted(root.glob("*/*/Cargo.toml")):
+        with manifest.open("rb") as source:
+            document = tomllib.load(source)
+        metadata = document.get("package", {}).get("metadata", {}).get("scryer", {})
+        if metadata.get("official") is not True:
+            continue
+        plugin_id = metadata.get("plugin_id")
+        if not isinstance(plugin_id, str) or not plugin_id:
+            raise ValueError(f"official plugin is missing plugin_id: {manifest}")
+        plugin_dir = PurePosixPath(manifest.parent.relative_to(root).as_posix())
+        if plugin_id in plugins:
+            raise ValueError(f"duplicate official plugin_id: {plugin_id}")
+        plugins[plugin_id] = plugin_dir
+    return plugins
+
+
+def documentation_only(path: PurePosixPath) -> bool:
+    return path.suffix.lower() in {".md", ".mdx"} or path.name in {"LICENSE", "NOTICE"}
+
+
+def scope_for_changes(
+    changed_paths: list[str], plugins: dict[str, PurePosixPath]
+) -> tuple[str, list[str]]:
+    selected: set[str] = set()
+    for raw_path in changed_paths:
+        path = PurePosixPath(raw_path)
+        if path.is_absolute() or ".." in path.parts:
+            return "full", []
+        if documentation_only(path):
+            continue
+        for plugin_id, plugin_dir in plugins.items():
+            if path == plugin_dir or plugin_dir in path.parents:
+                selected.add(plugin_id)
+                break
+        else:
+            return "full", []
+    if selected:
+        return "scoped", sorted(selected)
+    return "none", []
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--changed-files", type=Path, required=True)
+    args = parser.parse_args()
+
+    root = Path.cwd()
+    changed_paths = [
+        line.strip()
+        for line in args.changed_files.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    mode, plugin_ids = scope_for_changes(changed_paths, official_plugins(root))
+    print(f"mode={mode}")
+    print(f"plugin_ids={','.join(plugin_ids)}")
+
+
+if __name__ == "__main__":
+    main()

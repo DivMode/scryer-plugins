@@ -284,7 +284,7 @@ enum PluginCommand {
     New(PluginNewArgs),
     Validate(PluginValidateArgs),
     BuildAll,
-    ValidateAll,
+    ValidateAll(CiScopeArgs),
 }
 
 #[derive(Args)]
@@ -1277,7 +1277,7 @@ fn main() -> Result<()> {
             PluginCommand::New(args) => plugin_new::run_plugin_new(&ctx, args),
             PluginCommand::Validate(args) => run_plugin_validate(&ctx, args),
             PluginCommand::BuildAll => run_plugin_build_all(&ctx),
-            PluginCommand::ValidateAll => run_plugin_validate_all(&ctx),
+            PluginCommand::ValidateAll(args) => run_plugin_validate_all(&ctx, &args),
         },
         Commands::Ffmpeg(args) => match args.command {
             FfmpegCommand::Revendor(args) => run_ffmpeg_revendor(&ctx, args),
@@ -4121,7 +4121,7 @@ fn run_ci_fmt_check(ctx: &TaskContext, scope: &CiScopeArgs) -> Result<()> {
     if scope.plugin_ids.is_empty() {
         step("Checking cargo fmt across plugin crates and xtask");
     } else {
-        step("Checking cargo fmt for selected plugin crates and xtask");
+        step("Checking cargo fmt for selected plugin crates");
     }
     if let Some(rustup_toolchain) = configured_rustup_toolchain(ctx)? {
         ensure_rustup_component(&rustup_toolchain, "rustfmt")?;
@@ -4142,7 +4142,7 @@ fn run_ci_strict_clippy(ctx: &TaskContext, scope: &CiScopeArgs) -> Result<()> {
     if scope.plugin_ids.is_empty() {
         step("Running strict clippy across plugin crates and xtask");
     } else {
-        step("Running strict clippy for selected plugin crates and xtask");
+        step("Running strict clippy for selected plugin crates");
     }
     if let Some(rustup_toolchain) = configured_rustup_toolchain(ctx)? {
         ensure_rustup_component(&rustup_toolchain, "clippy")?;
@@ -4170,7 +4170,7 @@ fn run_ci_audit(ctx: &TaskContext, scope: &CiScopeArgs) -> Result<()> {
     if scope.plugin_ids.is_empty() {
         step("Running cargo audit across plugin crates and xtask");
     } else {
-        step("Running cargo audit for selected plugin crates and xtask");
+        step("Running cargo audit for selected plugin crates");
     }
     ensure_cargo_audit(ctx)?;
     warn(format!(
@@ -4301,10 +4301,18 @@ fn run_plugin_build_all(ctx: &TaskContext) -> Result<()> {
     Ok(())
 }
 
-fn run_plugin_validate_all(ctx: &TaskContext) -> Result<()> {
-    step("Validating all plugin crates");
+fn run_plugin_validate_all(ctx: &TaskContext, scope: &CiScopeArgs) -> Result<()> {
+    if scope.plugin_ids.is_empty() {
+        step("Validating all plugin crates");
+    } else {
+        step("Validating selected official plugin crates");
+    }
     ensure_current_sdk_dependency_is_published(ctx)?;
-    let plugin_dirs = plugin_crate_dirs(ctx)?;
+    let plugin_dirs = if scope.plugin_ids.is_empty() {
+        plugin_crate_dirs(ctx)?
+    } else {
+        scoped_ci_project_dirs(ctx, scope)?
+    };
     run_bounded(plugin_dirs, |dir| {
         run_plugin_validate(ctx, PluginValidateArgs { path: dir })?;
         Ok(())
