@@ -296,7 +296,6 @@ mod tests {
                 sort_title: None,
                 background_url: None,
                 poster_url: None,
-                genres: Vec::new(),
                 tags: Vec::new(),
                 aliases: Vec::new(),
                 original_language: None,

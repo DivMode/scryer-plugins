@@ -563,6 +563,7 @@ fn smtp_failure(error: SmtpError) -> EmailFailure {
         {
             PluginErrorCode::Unsupported
         }
+        SmtpError::Policy(_) => PluginErrorCode::Permanent,
         SmtpError::Protocol(_) => PluginErrorCode::Permanent,
     };
     EmailFailure::new(code, error.to_string())
@@ -831,7 +832,6 @@ mod tests {
                 sort_title: None,
                 background_url: None,
                 poster_url: None,
-                genres: Vec::new(),
                 tags: Vec::new(),
                 aliases: Vec::new(),
                 original_language: None,

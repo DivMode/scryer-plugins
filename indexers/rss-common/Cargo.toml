@@ -5,7 +5,7 @@ edition = "2024"
 license = "GPL-3.0-only"
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 extism-pdk = "1.4"
 quick-xml = "0.41"
 regex = "1"

@@ -1,4 +1,4 @@
-use chardetng::EncodingDetector;
+use chardetng::{EncodingDetector, Iso2022JpDetection, Utf8Detection};
 use encoding_rs::{Encoding, UTF_8, WINDOWS_1252};
 
 use super::simd;
@@ -170,9 +170,9 @@ fn decode_subtitle(
         .or_else(|| Encoding::for_bom(bytes).map(|(encoding, _)| encoding))
         .or_else(|| std::str::from_utf8(bytes).ok().map(|_| UTF_8))
         .unwrap_or_else(|| {
-            let mut detector = EncodingDetector::new();
+            let mut detector = EncodingDetector::new(Iso2022JpDetection::Allow);
             detector.feed(bytes, true);
-            detector.guess(None, true)
+            detector.guess(None, Utf8Detection::Allow)
         });
 
     let (decoded, actual_encoding, had_errors) = encoding.decode(bytes);

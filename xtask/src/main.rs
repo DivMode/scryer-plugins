@@ -4590,17 +4590,13 @@ fn blake3_file(path: &Path) -> Result<String> {
 }
 
 fn shake256_file(path: &Path) -> Result<String> {
-    use sha3::{
-        Shake256,
-        digest::{ExtendableOutput, Update, XofReader},
-    };
+    use tiny_keccak::{Hasher, Shake};
 
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let mut hasher = Shake256::default();
+    let mut hasher = Shake::v256();
     hasher.update(&bytes);
-    let mut reader = hasher.finalize_xof();
     let mut output = [0_u8; 32];
-    XofReader::read(&mut reader, &mut output);
+    hasher.finalize(&mut output);
     Ok(format!(
         "shake256:{}",
         output

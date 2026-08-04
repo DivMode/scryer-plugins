@@ -22,13 +22,13 @@ name = "nzbvortex-download-client"
 path = "src/lib.rs"
 
 [dependencies]
-base64 = "0.22"
-getrandom = "0.2"
+base64 = "0.23"
+getrandom = "0.4"
 scryer-plugin-sdk = "3.7.0"
 scryer-plugin-pdk = "0.5.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 urlencoding = "2"
 
 [profile.plugin-release]

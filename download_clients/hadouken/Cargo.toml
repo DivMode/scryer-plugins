@@ -22,7 +22,7 @@ name = "hadouken-download-client"
 path = "src/lib.rs"
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 scryer-plugin-sdk = "3.7.0"
 scryer-plugin-pdk = "0.5.6"
 serde = { version = "1", features = ["derive"] }
