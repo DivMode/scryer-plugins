@@ -126,8 +126,8 @@ const LIBFVAD_VENDOR_PATHS: &[&str] = &[
     "src",
 ];
 const AUDIT_IGNORE_ADVISORIES: &[&str] = &[
-    // Extism currently pins wasmtime 41.x upstream, so these remain blocked on
-    // the runtime stack moving onto a patched line.
+    // Extism 1.30.0 pins Wasmtime 43.0.2 upstream. Legacy Extism plugin
+    // compatibility requires that runtime until Extism moves to a patched line.
     "RUSTSEC-2026-0085",
     "RUSTSEC-2026-0086",
     "RUSTSEC-2026-0087",
@@ -140,6 +140,7 @@ const AUDIT_IGNORE_ADVISORIES: &[&str] = &[
     "RUSTSEC-2026-0095",
     "RUSTSEC-2026-0096",
     "RUSTSEC-2026-0114",
+    "RUSTSEC-2026-0222",
 ];
 
 host_fn!(socket_unsupported(_state: (); _input: String) -> String {
