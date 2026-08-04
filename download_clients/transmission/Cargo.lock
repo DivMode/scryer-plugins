@@ -408,9 +408,9 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scryer-plugin-pdk"
-version = "0.5.5"
+version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "102d59d747cb225576bdbd94d42dbbac1479d19f66700e99c776393619bfe1ec"
+checksum = "83ccd0737eeb93e4e64a50929315b2b024baf1317a64ff09f9b1ffc664d91891"
 dependencies = [
  "anyhow",
  "postcard",
