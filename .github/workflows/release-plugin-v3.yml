@@ -293,7 +293,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y python3-pip zstd
-          python3 -m pip install --user awscli
+          python3 -m pip install --user --require-hashes -r .github/awscli-requirements.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           case "$(uname -m)" in
             x86_64) binaryen_archive="binaryen-${BINARYEN_RELEASE_TAG}-x86_64-linux.tar.gz" ;;
@@ -556,7 +556,7 @@ jobs:
 
       - name: Share release subject list with the SLSA generator
         id: subjects
-        uses: slsa-framework/slsa-github-generator/actions/generator/generic/create-base64-subjects-from-file@v2.1.0
+        uses: slsa-framework/slsa-github-generator/actions/generator/generic/create-base64-subjects-from-file@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
         with:
           path: release-subjects.sha256.base64
 
@@ -567,7 +567,7 @@ jobs:
       actions: read
       contents: write
       id-token: write
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
     with:
       base64-subjects-as-file: ${{ needs.collect-release-provenance-subjects.outputs.subjects-file }}
       provenance-name: scryer-plugin-artifacts.intoto.jsonl
@@ -633,7 +633,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-pip zstd
-          python3 -m pip install --user awscli
+          python3 -m pip install --user --require-hashes -r .github/awscli-requirements.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Download xtask artifact
@@ -801,7 +801,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-pip zstd
-          python3 -m pip install --user awscli
+          python3 -m pip install --user --require-hashes -r .github/awscli-requirements.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Build xtask
