@@ -1,9 +1,9 @@
 use aes::Aes256;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use cbc::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+use cbc::cipher::{BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
 use extism_pdk::*;
 use flate2::{Compression, write::GzEncoder};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use notify_common::*;
 use sha2::Sha256;
 use std::io::Write;
@@ -207,11 +207,11 @@ fn encryption_key() -> Result<[u8; 32], String> {
 fn encrypt_field(plaintext: &str, key: &[u8; 32]) -> Result<String, String> {
     let compressed = gzip_compress(plaintext.as_bytes())?;
     let mut iv = [0u8; 16];
-    getrandom::getrandom(&mut iv)
+    getrandom::fill(&mut iv)
         .map_err(|err| format!("failed to generate pushover encryption IV: {err}"))?;
 
     let ciphertext = cbc::Encryptor::<Aes256>::new(key.into(), (&iv).into())
-        .encrypt_padded_vec_mut::<Pkcs7>(&compressed);
+        .encrypt_padded_vec::<Pkcs7>(&compressed);
 
     let mut iv_and_ciphertext = Vec::with_capacity(iv.len() + ciphertext.len());
     iv_and_ciphertext.extend_from_slice(&iv);

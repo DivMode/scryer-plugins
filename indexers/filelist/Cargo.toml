@@ -19,7 +19,7 @@ source_repo = "https://github.com/scryer-media/scryer-plugins/tree/main/indexers
 crate-type = ["cdylib"]
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 extism-pdk = "1.4"
 scryer-plugin-sdk = "3.2.0"
 serde = { version = "1", features = ["derive"] }

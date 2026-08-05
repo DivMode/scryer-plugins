@@ -1,6 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use extism_pdk::*;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use notify_common::*;
 use sha1::Sha1;
 use std::collections::BTreeMap;

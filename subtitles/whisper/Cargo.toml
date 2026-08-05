@@ -13,7 +13,7 @@ feature_sets = [{ required_features = [] }, { required_features = ["simd128", "r
 crate-type = ["cdylib"]
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 extism-pdk = "1.4"
 scryer-plugin-sdk = "3.2.0"
 serde = { version = "1", features = ["derive"] }

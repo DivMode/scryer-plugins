@@ -832,7 +832,7 @@ fn api_url(config: &NzbVortexConfig, path: &str, params: &[(String, String)]) ->
 
 fn random_hex(byte_len: usize) -> Result<String, Error> {
     let mut bytes = vec![0u8; byte_len];
-    getrandom::getrandom(&mut bytes)
+    getrandom::fill(&mut bytes)
         .map_err(|error| Error::msg(format!("failed to generate NZBVortex cnonce: {error}")))?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }

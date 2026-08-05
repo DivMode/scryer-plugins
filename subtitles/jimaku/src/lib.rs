@@ -183,6 +183,7 @@ fn descriptor() -> PluginDescriptor {
                 supports_ai_translated: true,
                 supports_machine_translated: false,
                 supported_languages: vec!["jpn".to_string(), "eng".to_string()],
+                sync: None,
             },
         }),
     }

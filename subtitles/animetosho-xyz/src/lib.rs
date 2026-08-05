@@ -179,6 +179,7 @@ fn descriptor() -> PluginDescriptor {
                     "spa".to_string(),
                     "zho".to_string(),
                 ],
+                sync: None,
             },
         }),
     }

@@ -311,6 +311,7 @@ fn descriptor() -> PluginDescriptor {
                 supports_ai_translated: true,
                 supports_machine_translated: true,
                 supported_languages: vec![],
+                sync: None,
             },
         }),
     }

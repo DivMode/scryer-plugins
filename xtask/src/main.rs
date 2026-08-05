@@ -126,8 +126,8 @@ const LIBFVAD_VENDOR_PATHS: &[&str] = &[
     "src",
 ];
 const AUDIT_IGNORE_ADVISORIES: &[&str] = &[
-    // Extism currently pins wasmtime 41.x upstream, so these remain blocked on
-    // the runtime stack moving onto a patched line.
+    // Extism 1.30.0 pins Wasmtime 43.0.2 upstream. Legacy Extism plugin
+    // compatibility requires that runtime until Extism moves to a patched line.
     "RUSTSEC-2026-0085",
     "RUSTSEC-2026-0086",
     "RUSTSEC-2026-0087",
@@ -140,6 +140,7 @@ const AUDIT_IGNORE_ADVISORIES: &[&str] = &[
     "RUSTSEC-2026-0095",
     "RUSTSEC-2026-0096",
     "RUSTSEC-2026-0114",
+    "RUSTSEC-2026-0222",
 ];
 
 host_fn!(socket_unsupported(_state: (); _input: String) -> String {
@@ -284,7 +285,7 @@ enum PluginCommand {
     New(PluginNewArgs),
     Validate(PluginValidateArgs),
     BuildAll,
-    ValidateAll,
+    ValidateAll(CiScopeArgs),
 }
 
 #[derive(Args)]
@@ -1277,7 +1278,7 @@ fn main() -> Result<()> {
             PluginCommand::New(args) => plugin_new::run_plugin_new(&ctx, args),
             PluginCommand::Validate(args) => run_plugin_validate(&ctx, args),
             PluginCommand::BuildAll => run_plugin_build_all(&ctx),
-            PluginCommand::ValidateAll => run_plugin_validate_all(&ctx),
+            PluginCommand::ValidateAll(args) => run_plugin_validate_all(&ctx, &args),
         },
         Commands::Ffmpeg(args) => match args.command {
             FfmpegCommand::Revendor(args) => run_ffmpeg_revendor(&ctx, args),
@@ -4121,7 +4122,7 @@ fn run_ci_fmt_check(ctx: &TaskContext, scope: &CiScopeArgs) -> Result<()> {
     if scope.plugin_ids.is_empty() {
         step("Checking cargo fmt across plugin crates and xtask");
     } else {
-        step("Checking cargo fmt for selected plugin crates and xtask");
+        step("Checking cargo fmt for selected plugin crates");
     }
     if let Some(rustup_toolchain) = configured_rustup_toolchain(ctx)? {
         ensure_rustup_component(&rustup_toolchain, "rustfmt")?;
@@ -4142,7 +4143,7 @@ fn run_ci_strict_clippy(ctx: &TaskContext, scope: &CiScopeArgs) -> Result<()> {
     if scope.plugin_ids.is_empty() {
         step("Running strict clippy across plugin crates and xtask");
     } else {
-        step("Running strict clippy for selected plugin crates and xtask");
+        step("Running strict clippy for selected plugin crates");
     }
     if let Some(rustup_toolchain) = configured_rustup_toolchain(ctx)? {
         ensure_rustup_component(&rustup_toolchain, "clippy")?;
@@ -4170,7 +4171,7 @@ fn run_ci_audit(ctx: &TaskContext, scope: &CiScopeArgs) -> Result<()> {
     if scope.plugin_ids.is_empty() {
         step("Running cargo audit across plugin crates and xtask");
     } else {
-        step("Running cargo audit for selected plugin crates and xtask");
+        step("Running cargo audit for selected plugin crates");
     }
     ensure_cargo_audit(ctx)?;
     warn(format!(
@@ -4301,10 +4302,18 @@ fn run_plugin_build_all(ctx: &TaskContext) -> Result<()> {
     Ok(())
 }
 
-fn run_plugin_validate_all(ctx: &TaskContext) -> Result<()> {
-    step("Validating all plugin crates");
+fn run_plugin_validate_all(ctx: &TaskContext, scope: &CiScopeArgs) -> Result<()> {
+    if scope.plugin_ids.is_empty() {
+        step("Validating all plugin crates");
+    } else {
+        step("Validating selected official plugin crates");
+    }
     ensure_current_sdk_dependency_is_published(ctx)?;
-    let plugin_dirs = plugin_crate_dirs(ctx)?;
+    let plugin_dirs = if scope.plugin_ids.is_empty() {
+        plugin_crate_dirs(ctx)?
+    } else {
+        scoped_ci_project_dirs(ctx, scope)?
+    };
     run_bounded(plugin_dirs, |dir| {
         run_plugin_validate(ctx, PluginValidateArgs { path: dir })?;
         Ok(())
@@ -4582,17 +4591,13 @@ fn blake3_file(path: &Path) -> Result<String> {
 }
 
 fn shake256_file(path: &Path) -> Result<String> {
-    use sha3::{
-        Shake256,
-        digest::{ExtendableOutput, Update, XofReader},
-    };
+    use tiny_keccak::{Hasher, Shake};
 
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let mut hasher = Shake256::default();
+    let mut hasher = Shake::v256();
     hasher.update(&bytes);
-    let mut reader = hasher.finalize_xof();
     let mut output = [0_u8; 32];
-    XofReader::read(&mut reader, &mut output);
+    hasher.finalize(&mut output);
     Ok(format!(
         "shake256:{}",
         output

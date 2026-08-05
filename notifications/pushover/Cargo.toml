@@ -19,16 +19,16 @@ source_repo = "https://github.com/scryer-media/scryer-plugins/tree/main/notifica
 crate-type = ["cdylib"]
 
 [dependencies]
-aes = "0.8"
-base64 = "0.22"
-cbc = { version = "0.1", features = ["alloc"] }
+aes = "0.9"
+base64 = "0.23"
+cbc = { version = "0.2", features = ["alloc"] }
 extism-pdk = "1.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-getrandom = "0.2"
-hmac = "0.12"
+getrandom = "0.4"
+hmac = "0.13"
 notify-common = { path = "../notify-common" }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 scryer-plugin-sdk = "3.2.0"
 
 [profile.plugin-release]

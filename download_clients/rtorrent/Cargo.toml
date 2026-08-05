@@ -1,6 +1,6 @@
 [package]
 name = "rtorrent-download-client"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.97.1"
 autolib = false
@@ -22,11 +22,11 @@ name = "rtorrent-download-client"
 path = "src/lib.rs"
 
 [dependencies]
-base64 = "0.22"
-roxmltree = "0.20"
+base64 = "0.23"
+roxmltree = "0.21"
 serde = { version = "1", features = ["derive"] }
 scryer-plugin-sdk = "3.7.0"
-scryer-plugin-pdk = "0.5.5"
+scryer-plugin-pdk = "0.5.6"
 serde_json = "1"
 urlencoding = "2"
 

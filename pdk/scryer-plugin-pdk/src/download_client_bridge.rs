@@ -52,7 +52,7 @@ fn bridge_download_client_command(
             PluginDownloadClientCommandResult::ListQueue(call(functions.list_queue, ()))
         }
         PluginDownloadClientCommand::ListHistory => {
-            PluginDownloadClientCommandResult::ListHistory(call(functions.list_history, ()))
+            PluginDownloadClientCommandResult::ListHistory(call(functions.list_completed, ()))
         }
         PluginDownloadClientCommand::ListCompleted => {
             PluginDownloadClientCommandResult::ListCompleted(call(functions.list_completed, ()))
@@ -131,6 +131,58 @@ fn bridge_error<T>(message: String) -> sdk::PluginResult<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unexpected_legacy_history_call(_input: String) -> FnResult<String> {
+        panic!("command ListHistory must not call the legacy list_history export")
+    }
+
+    fn completed_downloads(_input: String) -> FnResult<String> {
+        Ok(serde_json::to_string(&sdk::PluginResult::Ok(vec![
+            sdk::PluginCompletedDownload {
+                client_item_id: "completed-item".to_string(),
+                download_id: None,
+                info_hash: None,
+                name: "completed item".to_string(),
+                dest_dir: "/downloads".to_string(),
+                category: None,
+                output_kind: None,
+                content_paths: Vec::new(),
+                size_bytes: None,
+                completed_at: None,
+                parameters: Vec::new(),
+            },
+        ]))?)
+    }
+
+    fn unused(_input: String) -> FnResult<String> {
+        unreachable!("unused bridge function")
+    }
+
+    #[test]
+    fn list_history_uses_completed_download_shape() {
+        let functions = LegacyDownloadClientFunctions {
+            describe: unused,
+            add: unused,
+            list_queue: unused,
+            list_history: unexpected_legacy_history_call,
+            list_completed: completed_downloads,
+            list_recent_completed: None,
+            control: unused,
+            mark_imported: unused,
+            status: unused,
+            test_connection: unused,
+        };
+
+        let result =
+            bridge_download_client_command(&functions, PluginDownloadClientCommand::ListHistory);
+
+        assert!(matches!(
+            result,
+            PluginDownloadClientCommandResult::ListHistory(sdk::PluginResult::Ok(downloads))
+                if downloads.len() == 1
+                    && downloads[0].client_item_id == "completed-item"
+        ));
+    }
 
     #[test]
     fn exact_lookup_returns_only_the_requested_completed_download() {
