@@ -164,6 +164,33 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         if: ${{ matrix.plugin_id != '' }}
 
+      - name: Install WASI SDK for enhanced subtitle sync
+        if: ${{ matrix.plugin_id == 'enhanced-subtitle-sync' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly wasi_sdk_version='33.0'
+          readonly wasi_sdk_archive="wasi-sdk-${wasi_sdk_version}-x86_64-linux.tar.gz"
+          readonly wasi_sdk_sha256='0ba8b5bfaeb2adf3f29bab5841d76cf5318ab8e1642ea195f88baba1abd47bce'
+          readonly wasi_sdk_root="${RUNNER_TEMP}/wasi-sdk-${wasi_sdk_version}"
+          readonly wasi_sdk_url="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/${wasi_sdk_archive}"
+          curl -fsSL "$wasi_sdk_url" -o "${RUNNER_TEMP}/${wasi_sdk_archive}"
+          printf '%s  %s\n' "$wasi_sdk_sha256" "${RUNNER_TEMP}/${wasi_sdk_archive}" | sha256sum --check --strict
+          mkdir "$wasi_sdk_root"
+          tar -xzf "${RUNNER_TEMP}/${wasi_sdk_archive}" -C "$wasi_sdk_root" --strip-components=1
+          test -x "$wasi_sdk_root/bin/clang"
+          test -d "$wasi_sdk_root/share/wasi-sysroot"
+          echo "$wasi_sdk_root/bin" >> "$GITHUB_PATH"
+          {
+            echo "WASI_SYSROOT=$wasi_sdk_root/share/wasi-sysroot"
+            echo "FFMPEG_WASI_SYSROOT=$wasi_sdk_root/share/wasi-sysroot"
+            echo "CLANG=$wasi_sdk_root/bin/clang"
+            echo "LLVM_AR=$wasi_sdk_root/bin/llvm-ar"
+            echo "LLVM_NM=$wasi_sdk_root/bin/llvm-nm"
+            echo "LLVM_RANLIB=$wasi_sdk_root/bin/llvm-ranlib"
+            echo "LLVM_STRIP=$wasi_sdk_root/bin/llvm-strip"
+          } >> "$GITHUB_ENV"
+
       - name: Prefetch plugin release dependencies
         if: ${{ matrix.plugin_id != '' }}
         run: cargo run --locked --manifest-path xtask/Cargo.toml -- official prefetch "${{ matrix.plugin_id }}"
