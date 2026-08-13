@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use weaver_unrar::{ExtractOptions, RarArchive, RarError};
+use unrar_rs::{ExtractOptions, RarArchive, RarError};
 
 const MAX_ARCHIVE_ENTRIES: usize = 20_000;
 const MAX_ARCHIVE_EXPANDED_BYTES: u64 = 2 * 1024 * 1024 * 1024 * 1024;

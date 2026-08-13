@@ -770,7 +770,7 @@ fn host_call_counts() -> HostCallCounts {
 ///
 /// Serves both the current `host_*` ABI and the pre-rename `scryer_*` aliases.
 /// The latter remain a compatibility path for already-published archive plugin
-/// artifacts while current builds use weaver-unrar's `host-abi-extism` feature.
+/// artifacts while current builds use unrar-rs's `host-abi-extism` feature.
 fn register_crypto_host(linker: &mut Linker<WasiP1Ctx>) {
     linker
         .func_wrap(

@@ -8,7 +8,7 @@ Current support:
 
 - ZIP extraction for stored/deflated archives
 - 7z extraction for LZMA/LZMA2, AES, BZip2, Deflate, PPMD, and Copy methods
-- RAR extraction through `weaver-unrar` using Scryer's host AES/CRC imports
+- RAR extraction through `unrar-rs` using Scryer's host AES/CRC imports
 
 Zstandard-compressed 7z archives are not supported yet.
 

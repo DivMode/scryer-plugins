@@ -2,7 +2,7 @@
 
 The archive-extraction plugin is licensed under GPL-3.0-or-later, with the
 additional UnRAR source-code restriction below for RAR extraction and recovery
-code carried through its `weaver-unrar` dependency.
+code carried through its `unrar-rs` dependency.
 
 ## UnRAR Source-Code Restriction
 
