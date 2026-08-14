@@ -171,6 +171,7 @@ fn default_descriptor() -> PluginDescriptor {
     );
 
     if let ProviderDescriptor::Notification(notification) = &mut descriptor.provider {
+        notification.provider_aliases = vec!["mediabrowser".to_string()];
         notification.capabilities.supports_batch = true;
         notification.capabilities.supports_coalescing = true;
         notification.capabilities.supported_events = media_refresh_events();
@@ -880,7 +881,7 @@ mod tests {
             panic!("expected notification descriptor");
         };
         assert_eq!(notification.provider_type, "emby");
-        assert!(notification.provider_aliases.is_empty());
+        assert_eq!(notification.provider_aliases, vec!["mediabrowser"]);
         assert_eq!(
             notification.capabilities.delivery_modes,
             vec![NotificationDeliveryMode::MediaServerUpdate]
