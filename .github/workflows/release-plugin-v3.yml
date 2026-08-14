@@ -701,7 +701,7 @@ jobs:
             --certificate-identity-regexp "${identity_regexp}" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             "${existing_dir}/catalog-v3.redirect.json"
-          catalog_asset="$(python3 -c 'import json, sys; from pathlib import Path; redirect = json.loads(Path("existing-central-catalog-v3/catalog-v3.redirect.json").read_text()); artifacts = redirect.get("artifacts") or []; sys.exit("catalog-v3 redirect does not contain any artifacts") if not artifacts else None; print(artifacts[0]["url"].rsplit("/", 1)[-1])')"
+          catalog_asset="$(python3 -c 'import json, sys; from pathlib import Path; redirect = json.loads(Path("existing-central-catalog-v3/catalog-v3.redirect.json").read_text()); artifacts = redirect.get("artifacts") or []; sys.exit("catalog-v3 redirect does not contain any artifacts") if not artifacts else None; print(artifacts[-1]["url"].rsplit("/", 1)[-1])')"
           gh release download "catalog/v3" \
             --repo "${GITHUB_REPOSITORY}" \
             --pattern "${catalog_asset}" \
@@ -860,7 +860,7 @@ jobs:
             --certificate-identity-regexp "${identity_regexp}" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             "${existing_dir}/catalog-v3.redirect.json"
-          catalog_asset="$(python3 -c 'import json, sys; from pathlib import Path; redirect = json.loads(Path("existing-central-catalog-v3/catalog-v3.redirect.json").read_text()); artifacts = redirect.get("artifacts") or []; sys.exit("catalog-v3 redirect does not contain any artifacts") if not artifacts else None; print(artifacts[0]["url"].rsplit("/", 1)[-1])')"
+          catalog_asset="$(python3 -c 'import json, sys; from pathlib import Path; redirect = json.loads(Path("existing-central-catalog-v3/catalog-v3.redirect.json").read_text()); artifacts = redirect.get("artifacts") or []; sys.exit("catalog-v3 redirect does not contain any artifacts") if not artifacts else None; print(artifacts[-1]["url"].rsplit("/", 1)[-1])')"
           gh release download "catalog/v3" \
             --repo "${GITHUB_REPOSITORY}" \
             --pattern "${catalog_asset}" \
