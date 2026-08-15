@@ -1,0 +1,9 @@
+{
+  "release_constraints": [
+    {
+      "plugin_id": "mediabrowser",
+      "version": "0.1.2",
+      "max_scryer_version": "0.18.11"
+    }
+  ]
+}

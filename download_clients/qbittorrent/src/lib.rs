@@ -1915,16 +1915,9 @@ fn derive_completed_dest_dir(torrent: &QbTorrent) -> Option<String> {
     let content_path = normalize_non_empty(torrent.content_path.clone());
     let save_path = normalize_non_empty(torrent.save_path.clone());
     match (content_path, save_path) {
-        (Some(content_path), Some(save_path)) => {
-            if path_looks_like_file(&content_path) {
-                Some(save_path)
-            } else {
-                Some(content_path)
-            }
-        }
-        (Some(content_path), None) => Some(content_path),
-        (None, Some(save_path)) => Some(save_path),
-        (None, None) => None,
+        (Some(content_path), Some(save_path)) if content_path == save_path => None,
+        (Some(content_path), _) => Some(content_path),
+        (None, save_path) => save_path,
     }
 }
 
@@ -2218,7 +2211,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_dest_dir_prefers_save_path_for_single_file() {
+    fn completed_dest_dir_uses_content_path_for_single_file() {
         let torrent = QbTorrent {
             name: "Movie".to_string(),
             save_path: Some("/downloads/movies".to_string()),
@@ -2227,8 +2220,36 @@ mod tests {
         };
         assert_eq!(
             derive_completed_dest_dir(&torrent).as_deref(),
+            Some("/downloads/movies/Movie.mkv")
+        );
+    }
+
+    #[test]
+    fn completed_dest_dir_falls_back_to_save_path_without_content_path() {
+        let torrent = QbTorrent {
+            name: "Movie".to_string(),
+            save_path: Some("/downloads/movies".to_string()),
+            content_path: None,
+            ..QbTorrent::default()
+        };
+        assert_eq!(
+            derive_completed_dest_dir(&torrent).as_deref(),
             Some("/downloads/movies")
         );
+    }
+
+    #[test]
+    fn completed_dest_dir_rejects_content_path_equal_to_shared_save_path() {
+        let torrent = QbTorrent {
+            hash: "shared-root-pack".to_string(),
+            name: "Show Season 1".to_string(),
+            save_path: Some("/downloads/series".to_string()),
+            content_path: Some("/downloads/series".to_string()),
+            ..QbTorrent::default()
+        };
+
+        assert_eq!(derive_completed_dest_dir(&torrent), None);
+        assert!(torrent_to_completed_download(torrent).is_none());
     }
 
     #[test]

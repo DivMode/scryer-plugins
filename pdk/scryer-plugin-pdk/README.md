@@ -61,7 +61,7 @@ The plugin is a **command** binary: it needs a `main` (the macro provides one)
 and is built for a `wasm32-wasip1` target with `panic = "abort"`. The resulting
 module exports `_start` and `memory`. For the archive plugin it imports exactly
 the two host crypto functions (`host_aes_cbc_decrypt`, `host_crc32`; RFC 123
-§5). `weaver-unrar` defaults those imports to the neutral `host` namespace;
+§5). `unrar-rs` defaults those imports to the neutral `host` namespace;
 Scryer builds it with `host-abi-extism` to route them through
 `extism:host/user`. The namespace is compatibility routing only: the guest has
 no Extism dependency.

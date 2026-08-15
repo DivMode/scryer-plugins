@@ -77,6 +77,7 @@ const CATALOG_MINIFIED_ZST: &str = "catalog-v2.min.json.zst";
 const CATALOG_V3_SNIPPET_JSON: &str = "catalog-v3.json";
 const CATALOG_V3_MINIFIED_JSON: &str = "catalog-v3.min.json";
 const CATALOG_V3_MINIFIED_ZST: &str = "catalog-v3.min.json.zst";
+const CATALOG_V3_RELEASE_CONSTRAINTS: &str = "catalog-v3-release-constraints.json";
 const CATALOG_V3_REDIRECT_JSON: &str = "catalog-v3.redirect.json";
 const R2_ACCOUNT_ID_ENV: &str = "CF_ACCOUNT_ID";
 const R2_ACCOUNT_ID_ENV_LEGACY: &str = "CF_R2_ACCOUNT_ID";
@@ -592,6 +593,7 @@ struct LocalPluginInfo {
     catalog_versions: BTreeSet<CatalogVersion>,
     feature_sets: Vec<WasmFeatureSet>,
     min_scryer_version: Option<String>,
+    max_scryer_version: Option<String>,
     docs_url: String,
     plugin_dir: PathBuf,
     cargo_toml: PathBuf,
@@ -611,6 +613,7 @@ struct PluginManifestMetadata {
     catalog_versions: BTreeSet<CatalogVersion>,
     feature_sets: Vec<WasmFeatureSet>,
     min_scryer_version: Option<String>,
+    max_scryer_version: Option<String>,
     docs_url: Option<String>,
     source_repo: Option<String>,
     distribution_base_url: Option<String>,
@@ -1181,7 +1184,23 @@ struct CatalogV3Release {
     sdk_constraint: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     min_scryer_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_scryer_version: Option<String>,
     artifacts: Vec<CatalogV3PluginArtifact>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogV3ReleaseConstraints {
+    release_constraints: Vec<CatalogV3ReleaseConstraint>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogV3ReleaseConstraint {
+    plugin_id: String,
+    version: String,
+    max_scryer_version: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2057,6 +2076,33 @@ fn plugin_manifest_metadata(manifest_path: &Path) -> Result<PluginManifestMetada
             )
         })?;
     }
+    let max_scryer_version = scryer_metadata
+        .and_then(|scryer| scryer.get("max_scryer_version"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if let Some(value) = max_scryer_version.as_deref() {
+        Version::parse(value).with_context(|| {
+            format!(
+                "{} package.metadata.scryer.max_scryer_version must be a valid semver version",
+                manifest_path.display()
+            )
+        })?;
+    }
+    if min_scryer_version
+        .as_deref()
+        .zip(max_scryer_version.as_deref())
+        .is_some_and(|(min, max)| {
+            Version::parse(min).expect("validated min version")
+                > Version::parse(max).expect("validated max version")
+        })
+    {
+        bail!(
+            "{} package.metadata.scryer.min_scryer_version must not exceed max_scryer_version",
+            manifest_path.display()
+        );
+    }
     let docs_url = scryer_metadata
         .and_then(|scryer| scryer.get("docs_url"))
         .and_then(|value| value.as_str())
@@ -2099,6 +2145,7 @@ fn plugin_manifest_metadata(manifest_path: &Path) -> Result<PluginManifestMetada
         catalog_versions,
         feature_sets,
         min_scryer_version,
+        max_scryer_version,
         docs_url,
         source_repo,
         distribution_base_url,
@@ -2326,6 +2373,7 @@ fn discover_local_plugin(ctx: &TaskContext, plugin_dir: &Path) -> Result<LocalPl
         catalog_versions: manifest_metadata.catalog_versions,
         feature_sets: manifest_metadata.feature_sets,
         min_scryer_version: manifest_metadata.min_scryer_version,
+        max_scryer_version: manifest_metadata.max_scryer_version,
         docs_url,
         plugin_dir: plugin_dir.to_path_buf(),
         cargo_toml,
@@ -5238,6 +5286,101 @@ fn write_catalog_v3_assets(
     Ok(paths)
 }
 
+fn legacy_catalog_v3_projection(catalog: &CatalogV3) -> CatalogV3 {
+    let mut legacy = catalog.clone();
+    for plugin in &mut legacy.plugins {
+        for release in &mut plugin.releases {
+            release.max_scryer_version = None;
+        }
+    }
+    legacy
+}
+
+fn apply_catalog_v3_release_constraints(
+    ctx: &TaskContext,
+    plugins: &mut [CatalogV3PluginEntry],
+) -> Result<()> {
+    let path = ctx.repo_root.join(CATALOG_V3_RELEASE_CONSTRAINTS);
+    let constraints: CatalogV3ReleaseConstraints = serde_json::from_slice(&fs::read(&path)?)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let mut seen = BTreeSet::new();
+    for constraint in constraints.release_constraints {
+        let plugin_id = constraint.plugin_id.trim();
+        let version = constraint.version.trim();
+        let max_scryer_version = constraint.max_scryer_version.trim();
+        if plugin_id.is_empty() || version.is_empty() || max_scryer_version.is_empty() {
+            bail!(
+                "{} release constraints require non-empty plugin_id, version, and max_scryer_version",
+                path.display()
+            );
+        }
+        Version::parse(version).with_context(|| {
+            format!(
+                "{} has invalid release version '{}' for plugin '{}'",
+                path.display(),
+                version,
+                plugin_id
+            )
+        })?;
+        let max_scryer_version = Version::parse(max_scryer_version).with_context(|| {
+            format!(
+                "{} has invalid max_scryer_version for {}@{}",
+                path.display(),
+                plugin_id,
+                version
+            )
+        })?;
+        if !seen.insert((plugin_id.to_string(), version.to_string())) {
+            bail!(
+                "{} contains duplicate release constraint for {}@{}",
+                path.display(),
+                plugin_id,
+                version
+            );
+        }
+        let plugin = plugins
+            .iter_mut()
+            .find(|plugin| plugin.id == plugin_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} release constraint references missing plugin '{}'",
+                    path.display(),
+                    plugin_id
+                )
+            })?;
+        let release = plugin
+            .releases
+            .iter_mut()
+            .find(|release| release.version == version)
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} release constraint references missing release {}@{}",
+                    path.display(),
+                    plugin_id,
+                    version
+                )
+            })?;
+        if release
+            .min_scryer_version
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(Version::parse)
+            .transpose()?
+            .is_some_and(|min_scryer_version| min_scryer_version > max_scryer_version)
+        {
+            bail!(
+                "{} release constraint makes min_scryer_version exceed max_scryer_version for {}@{}",
+                path.display(),
+                plugin_id,
+                version
+            );
+        }
+        release.max_scryer_version = Some(max_scryer_version.to_string());
+    }
+    Ok(())
+}
+
 fn write_catalog_v3_redirect(locator: &CatalogV3Redirect, path: &Path) -> Result<PathBuf> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -5603,6 +5746,7 @@ fn prepare_official_release(
             &version,
             &sdk_constraint,
             plugin.min_scryer_version.as_deref(),
+            plugin.max_scryer_version.as_deref(),
             &variants,
         )?;
         Some(write_catalog_v3_snippet(
@@ -6249,6 +6393,7 @@ fn catalog_v3_release_from_prepared_assets(
     version: &str,
     sdk_constraint: &str,
     min_scryer_version: Option<&str>,
+    max_scryer_version: Option<&str>,
     variants: &[PreparedPluginVariant],
 ) -> Result<CatalogV3Release> {
     let mut artifacts = Vec::new();
@@ -6286,6 +6431,7 @@ fn catalog_v3_release_from_prepared_assets(
         version: version.to_string(),
         sdk_constraint: sdk_constraint.to_string(),
         min_scryer_version: min_scryer_version.map(str::to_string),
+        max_scryer_version: max_scryer_version.map(str::to_string),
         artifacts,
     })
 }
@@ -6335,6 +6481,7 @@ fn catalog_v3_entry_from_current_plugin_build(
         &descriptor.version,
         &plugin_descriptor_sdk_constraint(descriptor),
         plugin.min_scryer_version.as_deref(),
+        plugin.max_scryer_version.as_deref(),
         &variants,
     )?;
     Ok(catalog_v3_plugin_entry(plugin, vec![release]))
@@ -6653,7 +6800,7 @@ fn run_catalog_prepare_v3(ctx: &TaskContext, args: CatalogPrepareV3Args) -> Resu
         .as_ref()
         .map(|catalog| catalog.catalog_version.max(1) + 1)
         .unwrap_or(1);
-    let plugins = if args.plugin_ids.is_empty() {
+    let mut plugins = if args.plugin_ids.is_empty() {
         step("Preparing catalog-v3 assets from current official plugin builds");
         let mut entries = Vec::new();
         for plugin in discover_local_plugins(ctx)? {
@@ -6714,6 +6861,7 @@ fn run_catalog_prepare_v3(ctx: &TaskContext, args: CatalogPrepareV3Args) -> Resu
             .unwrap_or_default();
         merge_catalog_v3_plugin_entries(base_plugins, updates)
     };
+    apply_catalog_v3_release_constraints(ctx, &mut plugins)?;
 
     let catalog = CatalogV3 {
         schema_version: CATALOG_V3_SCHEMA.to_string(),
@@ -6734,8 +6882,29 @@ fn run_catalog_prepare_v3(ctx: &TaskContext, args: CatalogPrepareV3Args) -> Resu
         )?;
     }
     let central_paths = write_catalog_v3_assets(ctx, &catalog, &dist)?;
-    let staged_central_artifacts =
-        stage_hashed_central_catalog_v3_artifacts(&central_paths, &dist, catalog_version)?;
+    let has_release_ceiling = catalog.plugins.iter().any(|plugin| {
+        plugin
+            .releases
+            .iter()
+            .any(|release| release.max_scryer_version.is_some())
+    });
+    let mut staged_central_artifacts = Vec::new();
+    if has_release_ceiling {
+        let legacy_catalog = legacy_catalog_v3_projection(&catalog);
+        validate_catalog_v3(&legacy_catalog)?;
+        let legacy_paths =
+            write_catalog_v3_assets(ctx, &legacy_catalog, &dist.join("legacy-projection"))?;
+        staged_central_artifacts.extend(stage_hashed_central_catalog_v3_artifacts(
+            &legacy_paths,
+            &dist,
+            catalog_version,
+        )?);
+    }
+    staged_central_artifacts.extend(stage_hashed_central_catalog_v3_artifacts(
+        &central_paths,
+        &dist,
+        catalog_version,
+    )?);
     let redirect_path = write_catalog_v3_redirects(
         &CatalogV3Redirect {
             schema_version: CATALOG_V3_REDIRECT_SCHEMA.to_string(),
@@ -7052,6 +7221,7 @@ fn run_community_scaffold(_ctx: &TaskContext, plugin_id: &str, output_dir: &Path
                 version: "0.1.0".to_string(),
                 sdk_constraint: format!("^{SDK_VERSION}"),
                 min_scryer_version: None,
+                max_scryer_version: None,
                 artifacts: vec![CatalogV3PluginArtifact {
                     runtime: WASM_TARGET.to_string(),
                     required_features: Vec::new(),
@@ -7459,13 +7629,41 @@ fn validate_catalog_v3_plugin_entry(plugin: &CatalogV3PluginEntry) -> Result<()>
                 plugin.id, release.version, release.sdk_constraint
             )
         })?;
-        if let Some(min_scryer_version) = release.min_scryer_version.as_deref() {
-            Version::parse(min_scryer_version.trim()).with_context(|| {
+        let min_scryer_version = release
+            .min_scryer_version
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(Version::parse)
+            .transpose()
+            .with_context(|| {
                 format!(
-                    "{} {}: invalid min_scryer_version {}",
-                    plugin.id, release.version, min_scryer_version
+                    "{} {}: invalid min_scryer_version",
+                    plugin.id, release.version
                 )
             })?;
+        let max_scryer_version = release
+            .max_scryer_version
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(Version::parse)
+            .transpose()
+            .with_context(|| {
+                format!(
+                    "{} {}: invalid max_scryer_version",
+                    plugin.id, release.version
+                )
+            })?;
+        if min_scryer_version
+            .zip(max_scryer_version)
+            .is_some_and(|(min, max)| min > max)
+        {
+            bail!(
+                "{} {}: min_scryer_version must not exceed max_scryer_version",
+                plugin.id,
+                release.version
+            );
         }
         if !versions.insert(release.version.clone()) {
             bail!(
@@ -8708,6 +8906,7 @@ mod tests {
             version: version.to_string(),
             sdk_constraint: sdk_constraint.to_string(),
             min_scryer_version: min_scryer_version.map(str::to_string),
+            max_scryer_version: None,
             artifacts: vec![CatalogV3PluginArtifact {
                 runtime: WASM_TARGET.to_string(),
                 required_features: Vec::new(),
@@ -8888,6 +9087,7 @@ mod tests {
             catalog_versions: default_catalog_versions(),
             feature_sets: default_feature_sets(),
             min_scryer_version: None,
+            max_scryer_version: None,
             docs_url:
                 "https://github.com/scryer-media/scryer-plugins/tree/main/notifications/email"
                     .to_string(),
@@ -9168,6 +9368,7 @@ support_tier = "verified_community"
                 version: version.to_string(),
                 sdk_constraint: sdk_constraint.to_string(),
                 min_scryer_version: None,
+                max_scryer_version: None,
                 artifacts: vec![CatalogV3PluginArtifact {
                     runtime: WASM_TARGET.to_string(),
                     required_features: Vec::new(),
@@ -9265,6 +9466,78 @@ support_tier = "verified_community"
                 .collect::<Vec<_>>(),
             vec!["0.2.0", "0.1.0"]
         );
+    }
+
+    #[test]
+    fn catalog_v3_release_constraints_apply_a_generic_maximum_version() {
+        let (_dir, ctx) = temp_task_context();
+        fs::write(
+            ctx.path(CATALOG_V3_RELEASE_CONSTRAINTS),
+            r#"{
+  "release_constraints": [
+    {
+      "plugin_id": "mediabrowser",
+      "version": "0.1.2",
+      "max_scryer_version": "0.18.11"
+    }
+  ]
+}"#,
+        )
+        .expect("write release constraints");
+        let mut plugins = vec![catalog_v3_test_entry(
+            "mediabrowser",
+            PluginCatalogStatus::Beta,
+            vec![catalog_v3_test_release(
+                "mediabrowser",
+                "0.1.2",
+                ">=3.0.0, <4.0.0",
+                Some("0.17.0"),
+            )],
+        )];
+
+        apply_catalog_v3_release_constraints(&ctx, &mut plugins).expect("constraint should apply");
+
+        assert_eq!(
+            plugins[0].releases[0].max_scryer_version.as_deref(),
+            Some("0.18.11")
+        );
+    }
+
+    #[test]
+    fn legacy_catalog_v3_projection_strips_only_release_ceilings() {
+        let mut release =
+            catalog_v3_test_release("mediabrowser", "0.1.2", ">=3.0.0, <4.0.0", Some("0.17.0"));
+        release.max_scryer_version = Some("0.18.11".to_string());
+        let catalog = catalog_v3_test_catalog(vec![catalog_v3_test_entry(
+            "mediabrowser",
+            PluginCatalogStatus::Beta,
+            vec![release],
+        )]);
+
+        let legacy = legacy_catalog_v3_projection(&catalog);
+
+        assert_eq!(
+            legacy.plugins[0].releases[0].min_scryer_version.as_deref(),
+            Some("0.17.0")
+        );
+        assert_eq!(legacy.plugins[0].releases[0].max_scryer_version, None);
+        assert_eq!(
+            catalog.plugins[0].releases[0].max_scryer_version.as_deref(),
+            Some("0.18.11")
+        );
+    }
+
+    #[test]
+    fn catalog_v3_validation_rejects_an_inverted_scryer_version_range() {
+        let mut release =
+            catalog_v3_test_release("mediabrowser", "0.1.2", ">=3.0.0, <4.0.0", Some("0.18.12"));
+        release.max_scryer_version = Some("0.18.11".to_string());
+        let entry = catalog_v3_test_entry("mediabrowser", PluginCatalogStatus::Beta, vec![release]);
+
+        let error = validate_catalog_v3_plugin_entry(&entry)
+            .expect_err("inverted version range should fail");
+
+        assert!(error.to_string().contains("must not exceed"));
     }
 
     #[test]
@@ -9399,6 +9672,7 @@ support_tier = "verified_community"
                 version: "0.1.0".to_string(),
                 sdk_constraint: "^1.6.0".to_string(),
                 min_scryer_version: None,
+                max_scryer_version: None,
                 artifacts: vec![CatalogV3PluginArtifact {
                     runtime: WASM_TARGET.to_string(),
                     required_features: Vec::new(),
