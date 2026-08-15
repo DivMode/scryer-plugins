@@ -5,6 +5,8 @@
 //! protocol. It is intentionally PDK-owned so every migrated client has the
 //! same exact completed-download lookup and no one reintroduces a raw path API.
 
+use std::collections::HashMap;
+
 use crate::sdk;
 use crate::{
     FnResult, PluginDownloadClientCommand, PluginDownloadClientCommandResult,
@@ -49,7 +51,7 @@ fn bridge_download_client_command(
             PluginDownloadClientCommandResult::Add(call(functions.add, request))
         }
         PluginDownloadClientCommand::ListQueue => {
-            PluginDownloadClientCommandResult::ListQueue(call(functions.list_queue, ()))
+            PluginDownloadClientCommandResult::ListQueue(list_queue_with_failed_history(functions))
         }
         PluginDownloadClientCommand::ListHistory => {
             PluginDownloadClientCommandResult::ListHistory(call(functions.list_completed, ()))
@@ -95,6 +97,45 @@ fn bridge_download_client_command(
             PluginDownloadClientCommandResult::TestConnection(call(functions.test_connection, ()))
         }
     }
+}
+
+fn list_queue_with_failed_history(
+    functions: &LegacyDownloadClientFunctions,
+) -> sdk::PluginResult<Vec<sdk::PluginDownloadItem>> {
+    let queue: Vec<sdk::PluginDownloadItem> = match call(functions.list_queue, ()) {
+        sdk::PluginResult::Ok(items) => items,
+        sdk::PluginResult::Err(error) => return sdk::PluginResult::Err(error),
+    };
+    let failed_history: Vec<sdk::PluginDownloadItem> = match call(functions.list_history, ()) {
+        sdk::PluginResult::Ok(items) => items,
+        sdk::PluginResult::Err(_) => return sdk::PluginResult::Ok(queue),
+    };
+
+    let mut items = Vec::with_capacity(queue.len() + failed_history.len());
+    let mut positions = HashMap::new();
+    for item in queue {
+        if let Some(position) = positions.get(&item.client_item_id).copied() {
+            items[position] = item;
+        } else {
+            positions.insert(item.client_item_id.clone(), items.len());
+            items.push(item);
+        }
+    }
+    for item in failed_history.into_iter().filter(|item| {
+        matches!(
+            item.state,
+            sdk::DownloadItemState::Failed | sdk::DownloadItemState::Error
+        )
+    }) {
+        if let Some(position) = positions.get(&item.client_item_id).copied() {
+            items[position] = item;
+        } else {
+            positions.insert(item.client_item_id.clone(), items.len());
+            items.push(item);
+        }
+    }
+
+    sdk::PluginResult::Ok(items)
 }
 
 fn call<Request, Response>(
@@ -156,6 +197,98 @@ mod tests {
 
     fn unused(_input: String) -> FnResult<String> {
         unreachable!("unused bridge function")
+    }
+
+    fn download_item(
+        client_item_id: &str,
+        state: sdk::DownloadItemState,
+        message: Option<&str>,
+    ) -> sdk::PluginDownloadItem {
+        sdk::PluginDownloadItem {
+            client_item_id: client_item_id.to_string(),
+            download_id: None,
+            info_hash: None,
+            title: client_item_id.to_string(),
+            state,
+            message: message.map(str::to_string),
+            category: None,
+            remote_output_path: None,
+            torrent: None,
+            total_size_bytes: None,
+            remaining_size_bytes: None,
+            eta_seconds: None,
+            progress_percent: None,
+            can_move_files: None,
+            can_remove: None,
+            removed: None,
+            raw_state: None,
+            completed_at: None,
+        }
+    }
+
+    fn queue_items(_input: String) -> FnResult<String> {
+        Ok(serde_json::to_string(&sdk::PluginResult::Ok(vec![
+            download_item("failed-item", sdk::DownloadItemState::Downloading, None),
+            download_item("active-item", sdk::DownloadItemState::Downloading, None),
+        ]))?)
+    }
+
+    fn history_items(_input: String) -> FnResult<String> {
+        Ok(serde_json::to_string(&sdk::PluginResult::Ok(vec![
+            download_item(
+                "failed-item",
+                sdk::DownloadItemState::Failed,
+                Some("terminal reason"),
+            ),
+            download_item(
+                "error-item",
+                sdk::DownloadItemState::Error,
+                Some("error reason"),
+            ),
+            download_item("completed-item", sdk::DownloadItemState::Completed, None),
+        ]))?)
+    }
+
+    #[test]
+    fn list_queue_merges_failed_history_with_terminal_state_precedence() {
+        let functions = LegacyDownloadClientFunctions {
+            describe: unused,
+            add: unused,
+            list_queue: queue_items,
+            list_history: history_items,
+            list_completed: completed_downloads,
+            list_recent_completed: None,
+            control: unused,
+            mark_imported: unused,
+            status: unused,
+            test_connection: unused,
+        };
+
+        let result =
+            bridge_download_client_command(&functions, PluginDownloadClientCommand::ListQueue);
+        let PluginDownloadClientCommandResult::ListQueue(sdk::PluginResult::Ok(items)) = result
+        else {
+            panic!("expected successful list queue result");
+        };
+
+        assert_eq!(items.len(), 3);
+        assert!(items.iter().any(|item| {
+            item.client_item_id == "failed-item"
+                && item.state == sdk::DownloadItemState::Failed
+                && item.message.as_deref() == Some("terminal reason")
+        }));
+        assert!(items.iter().any(|item| {
+            item.client_item_id == "error-item" && item.state == sdk::DownloadItemState::Error
+        }));
+        assert!(items.iter().any(|item| {
+            item.client_item_id == "active-item"
+                && item.state == sdk::DownloadItemState::Downloading
+        }));
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.client_item_id == "completed-item")
+        );
     }
 
     #[test]
