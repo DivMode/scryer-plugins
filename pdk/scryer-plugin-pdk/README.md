@@ -29,6 +29,13 @@ Protocol-level faults (malformed request, unwritable stdout) go to stderr and
 exit non-zero. Operational outcomes are reported **in-band** through the
 protocol response, never by exiting non-zero.
 
+For download-client command ABI v1, `ListQueue` is the live state snapshot and
+may include `failed` or `error` items so the host can trigger failure handling.
+`ListHistory` remains the completed-download shape used for imports. The
+first-party compatibility bridge merges failed/error entries from the legacy
+history function into `ListQueue`, with terminal history data taking precedence
+when the same client item is present in both sources.
+
 The stdin/stdout transport is isolated in one module (`framing`). If a host
 spike shows stdin/stdout capture misbehaves under `wasmtime-wasi`, the
 documented fallback (request/response files in a dedicated rw control preopen,
