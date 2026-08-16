@@ -186,8 +186,10 @@ pub fn scryer_download_add(input: String) -> FnResult<String> {
         STANDARD
             .decode(bytes)
             .map_err(|error| Error::msg(format!("invalid torrent_bytes_base64: {error}")))?
-    } else if let Some(source) = source_url(&request) {
-        source.into_bytes()
+    } else if let Some(magnet) = magnet_source(&request) {
+        magnet.into_bytes()
+    } else if let Some(url) = http_source(&request) {
+        resolve_remote_source(&url)?
     } else {
         return Ok(serde_json::to_string(&plugin_error::<
             PluginDownloadClientAddResponse,
@@ -646,23 +648,114 @@ fn map_state(stats: &TorrentStats) -> DownloadItemState {
     }
 }
 
-fn source_url(request: &PluginDownloadClientAddRequest) -> Option<String> {
-    match request.source.kind {
-        DownloadInputKind::MagnetUri => request
-            .source
-            .magnet_uri
-            .clone()
-            .or_else(|| request.source.download_url.clone()),
-        DownloadInputKind::TorrentUrl
-        | DownloadInputKind::TorrentFile
-        | DownloadInputKind::TorrentBytes => request
-            .source
-            .torrent_url
-            .clone()
-            .or_else(|| request.source.download_url.clone())
-            .or_else(|| request.source.magnet_uri.clone()),
-        DownloadInputKind::Nzb | DownloadInputKind::NzbUrl => None,
+fn magnet_source(request: &PluginDownloadClientAddRequest) -> Option<String> {
+    request
+        .source
+        .magnet_uri
+        .clone()
+        .or_else(|| request.source.download_url.clone())
+        .or_else(|| request.source.torrent_url.clone())
+        .filter(|value| value.trim_start().starts_with("magnet:"))
+}
+
+fn http_source(request: &PluginDownloadClientAddRequest) -> Option<String> {
+    if matches!(
+        request.source.kind,
+        DownloadInputKind::Nzb | DownloadInputKind::NzbUrl
+    ) {
+        return None;
     }
+
+    request
+        .source
+        .torrent_url
+        .clone()
+        .or_else(|| request.source.download_url.clone())
+        .filter(|value| {
+            let trimmed = value.trim_start();
+            trimmed.starts_with("http://") || trimmed.starts_with("https://")
+        })
+}
+
+fn resolve_remote_source(url: &str) -> Result<Vec<u8>, Error> {
+    let mut current = url.trim().to_string();
+    for _ in 0..5 {
+        let request = HttpRequest::new(current.as_str())
+            .with_method("GET")
+            .with_header("User-Agent", "scryer-rqbit-plugin/0.1");
+        let response = http::request::<Vec<u8>>(&request, None).map_err(|error| {
+            Error::msg(format!("download source request failed: {error}"))
+        })?;
+        let status = response.status_code();
+        let body = response.body();
+        if let Some(location) = response_header(&response, "location") {
+            let location = location.trim();
+            if location.starts_with("magnet:") {
+                return Ok(location.as_bytes().to_vec());
+            }
+            if (300..400).contains(&status)
+                && (location.starts_with("http://") || location.starts_with("https://"))
+            {
+                current = location.to_string();
+                continue;
+            }
+        }
+        if status >= 400 {
+            return Err(Error::msg(format!(
+                "download source returned HTTP {status}: {}",
+                String::from_utf8_lossy(&body)
+            )));
+        }
+        if looks_like_magnet(&body) {
+            return Ok(trim_ascii(&body).to_vec());
+        }
+        if looks_like_torrent(&body) {
+            return Ok(body);
+        }
+        if body.is_empty() {
+            return Err(Error::msg("download source returned an empty response"));
+        }
+        return Err(Error::msg(
+            "download source was not a magnet or torrent file",
+        ));
+    }
+    Err(Error::msg("download source redirected too many times"))
+}
+
+fn response_header<'a>(response: &'a HttpResponse, name: &str) -> Option<&'a str> {
+    response
+        .headers()
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn looks_like_magnet(bytes: &[u8]) -> bool {
+    trim_ascii(bytes).starts_with(b"magnet:")
+}
+
+fn looks_like_torrent(bytes: &[u8]) -> bool {
+    let body = trim_ascii(bytes);
+    body.first().copied() == Some(b'd')
+        && (contains_slice(body, b"announce") || contains_slice(body, b"info"))
+}
+
+fn contains_slice(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn trim_ascii(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    &bytes[start..end]
 }
 
 fn normalize_hash(value: &str) -> String {
@@ -836,6 +929,61 @@ mod tests {
             "/downloads/Show.S01E02.mkv"
         );
         let _ = torrent_to_item(parsed.torrents.swap_remove(0));
+    }
+
+    #[test]
+    fn classifies_magnet_http_and_torrent_payloads() {
+        assert!(looks_like_magnet(b"  magnet:?xt=urn:btih:abc"));
+        assert!(!looks_like_magnet(b"http://prowlarr:9696/3/download"));
+        assert!(looks_like_torrent(
+            b"d8:announce23:http://tracker.exampleee"
+        ));
+        assert!(!looks_like_torrent(b"magnet:?xt=urn:btih:abc"));
+        assert!(
+            magnet_source(&add_request(
+                DownloadInputKind::MagnetUri,
+                Some("http://prowlarr:9696/3/download"),
+                Some("magnet:?xt=urn:btih:abc"),
+            ))
+            .unwrap()
+            .starts_with("magnet:")
+        );
+        assert_eq!(
+            http_source(&add_request(
+                DownloadInputKind::MagnetUri,
+                Some("http://prowlarr:9696/3/download"),
+                None,
+            ))
+            .as_deref(),
+            Some("http://prowlarr:9696/3/download")
+        );
+        assert!(magnet_source(&add_request(
+            DownloadInputKind::MagnetUri,
+            Some("http://prowlarr:9696/3/download"),
+            None,
+        ))
+        .is_none());
+    }
+
+    fn add_request(
+        kind: DownloadInputKind,
+        download_url: Option<&str>,
+        magnet_uri: Option<&str>,
+    ) -> PluginDownloadClientAddRequest {
+        serde_json::from_value(serde_json::json!({
+            "source": {
+                "kind": kind,
+                "download_url": download_url,
+                "magnet_uri": magnet_uri
+            },
+            "release": {},
+            "title": {
+                "title_name": "fixture",
+                "media_facet": "movie"
+            },
+            "routing": {}
+        }))
+        .expect("add request fixture")
     }
 
     #[test]
