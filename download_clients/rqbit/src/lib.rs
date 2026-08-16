@@ -10,7 +10,7 @@ use scryer_plugin_sdk::{
     PluginDownloadOutputKind, PluginError, PluginErrorCode, PluginResult, PluginTorrentItem,
     ProviderDescriptor, SDK_VERSION,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const FINISHED_AT_VAR_PREFIX: &str = "rqbit.finished_at.";
@@ -60,8 +60,8 @@ struct TorrentWithStats {
 
 #[derive(Default, Deserialize)]
 struct TorrentStats {
-    #[serde(default)]
-    state: i64,
+    #[serde(default, deserialize_with = "deserialize_state")]
+    state: String,
     #[serde(default)]
     error: Option<String>,
     #[serde(default, rename = "progress_bytes")]
@@ -341,7 +341,18 @@ impl RqbitConfig {
 
 impl TorrentWithStats {
     fn output_path(&self) -> String {
-        format!("{}{}", self.output_folder, self.name)
+        let folder = self.output_folder.trim_end_matches('/');
+        let name = self.name.trim_start_matches('/');
+        if name.is_empty() {
+            return folder.to_string();
+        }
+        if folder.rsplit('/').next() == Some(name) {
+            return folder.to_string();
+        }
+        if folder.is_empty() {
+            return name.to_string();
+        }
+        format!("{folder}/{name}")
     }
 }
 
@@ -600,14 +611,38 @@ fn now_unix_seconds() -> i64 {
         .as_secs() as i64
 }
 
+fn deserialize_state<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(state) => state.to_ascii_lowercase(),
+        serde_json::Value::Number(number) => match number.as_i64() {
+            Some(0) => "initializing".to_string(),
+            Some(1) => "live".to_string(),
+            Some(2) => "paused".to_string(),
+            Some(3) => "error".to_string(),
+            Some(other) => other.to_string(),
+            None => number.to_string(),
+        },
+        other => {
+            return Err(serde::de::Error::custom(format!(
+                "unexpected rqbit torrent state {other}"
+            )));
+        }
+    })
+}
+
 fn map_state(stats: &TorrentStats) -> DownloadItemState {
     if stats.finished {
-        DownloadItemState::Completed
-    } else {
-        match stats.state {
-            0 | 2 => DownloadItemState::Downloading,
-            _ => DownloadItemState::Paused,
-        }
+        return DownloadItemState::Completed;
+    }
+    match stats.state.as_str() {
+        "live" | "initializing" | "0" | "1" => DownloadItemState::Downloading,
+        "error" | "3" => DownloadItemState::Failed,
+        _ => DownloadItemState::Paused,
     }
 }
 
@@ -734,6 +769,95 @@ fn connection_field(
 fn is_localhost_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     lower.contains("://localhost") || lower.contains("://127.0.0.1") || lower.contains("://[::1]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_list(json: &str) -> ListTorrentsResponse {
+        serde_json::from_str(json).expect("rqbit list JSON should parse")
+    }
+
+    #[test]
+    fn parses_rqbit9_string_states() {
+        let parsed = parse_list(
+            r#"{
+              "torrents": [
+                {
+                  "id": 0,
+                  "info_hash": "360dbb57c0cc8a36e4e8e711374d45b8811df212",
+                  "name": "Show s02e01-02",
+                  "output_folder": "/downloads/Show s02e01-02",
+                  "stats": {
+                    "state": "paused",
+                    "error": null,
+                    "progress_bytes": 10,
+                    "uploaded_bytes": 0,
+                    "total_bytes": 10,
+                    "finished": true,
+                    "live": null
+                  }
+                },
+                {
+                  "id": 4,
+                  "info_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "name": "Show.S01E02.mkv",
+                  "output_folder": "/downloads",
+                  "stats": {
+                    "state": "live",
+                    "error": null,
+                    "progress_bytes": 100,
+                    "uploaded_bytes": 0,
+                    "total_bytes": 1000,
+                    "finished": false,
+                    "live": { "download_speed": { "mbps": 35.5 } }
+                  }
+                }
+              ]
+            }"#,
+        );
+        assert_eq!(parsed.torrents[0].stats.state, "paused");
+        assert_eq!(
+            map_state(&parsed.torrents[0].stats),
+            DownloadItemState::Completed
+        );
+        assert_eq!(
+            parsed.torrents[0].output_path(),
+            "/downloads/Show s02e01-02"
+        );
+        assert_eq!(parsed.torrents[1].stats.state, "live");
+        assert_eq!(
+            map_state(&parsed.torrents[1].stats),
+            DownloadItemState::Downloading
+        );
+        assert_eq!(
+            parsed.torrents[1].output_path(),
+            "/downloads/Show.S01E02.mkv"
+        );
+    }
+
+    #[test]
+    fn parses_legacy_integer_states() {
+        let parsed = parse_list(
+            r#"{
+              "torrents": [
+                {
+                  "id": 1,
+                  "info_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "name": "legacy",
+                  "output_folder": "/downloads/",
+                  "stats": { "state": 1, "finished": false, "progress_bytes": 1, "total_bytes": 2, "uploaded_bytes": 0 }
+                }
+              ]
+            }"#,
+        );
+        assert_eq!(parsed.torrents[0].stats.state, "live");
+        assert_eq!(
+            map_state(&parsed.torrents[0].stats),
+            DownloadItemState::Downloading
+        );
+    }
 }
 
 scryer_plugin_pdk::scryer_download_client_bridge_main!(
