@@ -488,7 +488,7 @@ fn torrent_to_item(torrent: TorrentWithStats) -> PluginDownloadItem {
         }),
         total_size_bytes: Some(torrent.stats.total_bytes),
         remaining_size_bytes: Some(remaining),
-        eta_seconds: (down_rate > 0).then_some(remaining / down_rate),
+        eta_seconds: (down_rate > 0).then(|| remaining / down_rate),
         progress_percent,
         can_move_files: Some(can_remove),
         can_remove: Some(can_remove),
@@ -781,7 +781,7 @@ mod tests {
 
     #[test]
     fn parses_rqbit9_string_states() {
-        let parsed = parse_list(
+        let mut parsed = parse_list(
             r#"{
               "torrents": [
                 {
@@ -835,6 +835,7 @@ mod tests {
             parsed.torrents[1].output_path(),
             "/downloads/Show.S01E02.mkv"
         );
+        let _ = torrent_to_item(parsed.torrents.swap_remove(0));
     }
 
     #[test]
