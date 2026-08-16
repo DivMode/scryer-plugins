@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use extism_pdk::*;
 use newznab_common::{
@@ -17,7 +17,10 @@ const ANINZB_API_BASE_URL: &str = "https://api.aninzb.moe/";
 const ANINZB_API_HOST: &str = "api.aninzb.moe";
 const API_MAX_RESULTS: usize = 50;
 const MAX_API_RESPONSE_BYTES: usize = 20 * 1024 * 1024;
-const REQUEST_DELAY_SECONDS: u64 = 3;
+const API_REQUESTS_PER_SECOND: u32 = 2;
+const API_REQUEST_INTERVAL: Duration =
+    Duration::from_millis(1_000 / API_REQUESTS_PER_SECOND as u64);
+const API_REQUEST_PACING_VAR: &str = "aninzb.api_request_pacing";
 const DEFAULT_HOURLY_HIT_CAP: u32 = 500;
 const DEFAULT_DAILY_HIT_CAP: u32 = 3000;
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
@@ -83,7 +86,7 @@ fn migrate_legacy_config(_legacy: LegacyAniNzbConfig) -> AniNzbConfig {
         http_behavior: NewznabHttpBehavior {
             plugin_id: "aninzb".to_string(),
             user_agent: USER_AGENT.to_string(),
-            pre_request_delay: Duration::from_secs(REQUEST_DELAY_SECONDS),
+            pre_request_delay: Duration::ZERO,
             retry_total_budget: Duration::from_secs(300),
             retry_default_delay: Duration::from_secs(60),
             retry_max_delay: Duration::from_secs(300),
@@ -199,7 +202,7 @@ fn build_descriptor() -> PluginDescriptor {
                     page_size: Some(API_MAX_RESULTS as u32),
                     max_page_size: Some(API_MAX_RESULTS as u32),
                     max_pages: Some(1),
-                    rate_limit_hint_seconds: Some(REQUEST_DELAY_SECONDS as u32),
+                    rate_limit_hint_seconds: None,
                     ..IndexerLimitCapabilities::default()
                 }),
                 torrent: None,
@@ -212,7 +215,7 @@ fn build_descriptor() -> PluginDescriptor {
             scoring_policies: vec![],
             config_fields: vec![],
             allowed_hosts: vec![ANINZB_API_HOST.to_string()],
-            rate_limit_seconds: Some(REQUEST_DELAY_SECONDS as i64),
+            rate_limit_seconds: None,
         }),
     }
 }
@@ -240,6 +243,7 @@ fn execute_api_search(
     request: &SearchRequest,
 ) -> Result<SearchResponse, Error> {
     let url = build_api_search_url(config, request)?;
+    wait_for_api_request_slot()?;
     let (status, body) =
         polite_http_get(&url, "application/json, */*;q=0.8", &config.http_behavior)?;
     if !(200..300).contains(&status) {
@@ -273,6 +277,56 @@ fn validate_api_response_size(response_bytes: usize) -> Result<(), Error> {
         )));
     }
     Ok(())
+}
+
+fn wait_for_api_request_slot() -> Result<(), Error> {
+    let prior_request_millis = var::get::<String>(API_REQUEST_PACING_VAR)
+        .map_err(|error| {
+            Error::msg(format!(
+                "failed to read AniNZB request pacing state: {error}"
+            ))
+        })?
+        .map(|value| {
+            value.parse::<u64>().map_err(|error| {
+                Error::msg(format!(
+                    "failed to parse AniNZB request pacing state: {error}"
+                ))
+            })
+        })
+        .transpose()?;
+
+    let delay = api_request_delay(prior_request_millis, current_epoch_millis());
+    if !delay.is_zero() {
+        std::thread::sleep(delay);
+    }
+
+    var::set(API_REQUEST_PACING_VAR, current_epoch_millis().to_string()).map_err(|error| {
+        Error::msg(format!(
+            "failed to store AniNZB request pacing state: {error}"
+        ))
+    })
+}
+
+fn api_request_delay(prior_request_millis: Option<u64>, now_millis: u64) -> Duration {
+    let Some(prior_request_millis) = prior_request_millis else {
+        return Duration::ZERO;
+    };
+    let interval_millis = API_REQUEST_INTERVAL
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    Duration::from_millis(
+        interval_millis.saturating_sub(now_millis.saturating_sub(prior_request_millis)),
+    )
+}
+
+fn current_epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn build_api_search_url(config: &AniNzbConfig, request: &SearchRequest) -> Result<String, Error> {
@@ -521,6 +575,7 @@ mod tests {
 
         assert!(indexer.config_fields.is_empty());
         assert_eq!(indexer.allowed_hosts, vec![ANINZB_API_HOST.to_string()]);
+        assert_eq!(indexer.rate_limit_seconds, None);
         assert_eq!(indexer.capabilities.query_param.as_deref(), Some("name"));
         assert_eq!(indexer.capabilities.season_param.as_deref(), Some("season"));
         assert_eq!(
@@ -531,10 +586,7 @@ mod tests {
         assert_eq!(limits.page_size, Some(API_MAX_RESULTS as u32));
         assert_eq!(limits.max_page_size, Some(API_MAX_RESULTS as u32));
         assert_eq!(limits.max_pages, Some(1));
-        assert_eq!(
-            limits.rate_limit_hint_seconds,
-            Some(REQUEST_DELAY_SECONDS as u32)
-        );
+        assert_eq!(limits.rate_limit_hint_seconds, None);
         assert!(!limits.api_quota_supported);
         let features = indexer
             .capabilities
@@ -558,14 +610,27 @@ mod tests {
                 .chars()
                 .all(|character| !matches!(character, '\r' | '\n' | '\\'))
         );
-        assert_eq!(
-            config.http_behavior.pre_request_delay,
-            Duration::from_secs(REQUEST_DELAY_SECONDS)
-        );
+        assert_eq!(config.http_behavior.pre_request_delay, Duration::ZERO);
+        assert_eq!(API_REQUESTS_PER_SECOND, 2);
+        assert_eq!(API_REQUEST_INTERVAL, Duration::from_millis(500));
         assert_eq!(config.http_behavior.max_search_pages, 1);
         let budget = config.http_behavior.hit_budget.expect("hit budget");
         assert_eq!(budget.hourly_limit, DEFAULT_HOURLY_HIT_CAP);
         assert_eq!(budget.daily_limit, DEFAULT_DAILY_HIT_CAP);
+    }
+
+    #[test]
+    fn api_request_pacing_has_no_initial_delay_and_caps_at_two_per_second() {
+        assert_eq!(api_request_delay(None, 10_000), Duration::ZERO);
+        assert_eq!(
+            api_request_delay(Some(10_000), 10_000),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            api_request_delay(Some(10_000), 10_250),
+            Duration::from_millis(250)
+        );
+        assert_eq!(api_request_delay(Some(10_000), 10_500), Duration::ZERO);
     }
 
     #[test]
