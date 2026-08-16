@@ -123,7 +123,7 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
             provider_aliases: vec!["rqbit-web".to_string()],
             config_fields: config_fields(),
             default_base_url: None,
-            allowed_hosts: vec![],
+            allowed_hosts: vec!["prowlarr".to_string()],
             accepted_inputs: vec![
                 DownloadInputKind::MagnetUri,
                 DownloadInputKind::TorrentUrl,
@@ -684,7 +684,9 @@ fn resolve_remote_source(url: &str) -> Result<Vec<u8>, Error> {
             .with_method("GET")
             .with_header("User-Agent", "scryer-rqbit-plugin/0.1");
         let response = http::request::<Vec<u8>>(&request, None).map_err(|error| {
-            Error::msg(format!("download source request failed: {error}"))
+            Error::msg(format!(
+                "download source request failed for {current}: {error}"
+            ))
         })?;
         let status = response.status_code();
         let body = response.body();
