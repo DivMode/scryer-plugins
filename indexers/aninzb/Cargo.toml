@@ -3,7 +3,7 @@ name = "aninzb-indexer"
 version = "0.1.6"
 edition = "2024"
 license = "GPL-3.0-only"
-description = "AniNZB-specific Newznab indexer for anime Usenet releases"
+description = "AniNZB public API indexer for anime Usenet releases"
 
 [package.metadata.scryer]
 official = true
@@ -24,7 +24,6 @@ newznab-common = { path = "../newznab-common" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 scryer-plugin-sdk = "3.2.0"
-html-escape = "0.2"
 url = "2"
 
 [profile.plugin-release]
