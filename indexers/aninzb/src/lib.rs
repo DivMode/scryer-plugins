@@ -360,16 +360,11 @@ fn build_api_search_url(config: &AniNzbConfig, request: &SearchRequest) -> Resul
     let tvdb_id = request_id(request, "tvdb_id");
     let name = search_name(request);
     let episode = request.episode.or(request.absolute_episode);
-    if anidb_id.is_none()
-        && tvdb_id.is_none()
-        && name.is_none()
-        && request.season.is_none()
-        && episode.is_none()
-    {
-        return Ok(url.to_string());
-    }
     {
         let mut query = url.query_pairs_mut();
+        if !has_api_search_filter(request) {
+            query.append_pair("source", "release");
+        }
         if let Some(anidb_id) = anidb_id.as_deref() {
             query.append_pair("anidb", anidb_id);
         }
@@ -387,6 +382,14 @@ fn build_api_search_url(config: &AniNzbConfig, request: &SearchRequest) -> Resul
         }
     }
     Ok(url.to_string())
+}
+
+fn has_api_search_filter(request: &SearchRequest) -> bool {
+    request_id(request, "anidb_id").is_some()
+        || request_id(request, "tvdb_id").is_some()
+        || search_name(request).is_some()
+        || request.season.is_some()
+        || request.episode.or(request.absolute_episode).is_some()
 }
 
 fn result_limit(request_limit: usize) -> usize {
@@ -609,6 +612,16 @@ mod tests {
             indexer.capabilities.episode_param.as_deref(),
             Some("episode")
         );
+        assert!(indexer.capabilities.rss);
+        assert_eq!(
+            indexer.capabilities.feed_modes,
+            vec![
+                IndexerFeedMode::Recent,
+                IndexerFeedMode::Rss,
+                IndexerFeedMode::AutomaticSearch,
+                IndexerFeedMode::InteractiveSearch,
+            ]
+        );
         let limits = indexer.capabilities.limits.expect("limits");
         assert_eq!(limits.page_size, Some(API_MAX_RESULTS as u32));
         assert_eq!(limits.max_page_size, Some(API_MAX_RESULTS as u32));
@@ -693,11 +706,15 @@ mod tests {
     }
 
     #[test]
-    fn api_url_for_recent_search_has_no_query() {
+    fn api_url_for_recent_search_uses_newest_release_source() {
         let config = migrate_legacy_config(LegacyAniNzbConfig::default());
+        let url =
+            Url::parse(&build_api_search_url(&config, &SearchRequest::default()).unwrap()).unwrap();
+        let query = url.query_pairs().collect::<HashMap<_, _>>();
+
         assert_eq!(
-            build_api_search_url(&config, &SearchRequest::default()).unwrap(),
-            ANINZB_API_BASE_URL
+            query.get("source").map(|value| value.as_ref()),
+            Some("release")
         );
     }
 

@@ -8,6 +8,6 @@ AniNZB exposes only a legacy **Base URL** field so it remains installable on old
 
 ## Behavior and limits
 
-AniNZB is deliberately not a movie source: movie-shaped requests return an empty result set. Each search makes one API request and returns at most 50 results. The first request is sent immediately; later requests are locally paced to no more than two per second. The plugin uses bounded retries for provider throttling and stops querying when its fixed local request budget is exhausted.
+AniNZB is deliberately not a movie source: movie-shaped requests return an empty result set. Recent and RSS feeds use the documented `source=release` search, whose results are newest first. Each search makes one API request and returns at most 50 results. The first request is sent immediately; later requests are locally paced to no more than two per second. The plugin uses bounded retries for provider throttling and stops querying when its fixed local request budget is exhausted.
 
 The API may return nullable metadata. Usable entries are normalized as Usenet releases when they include both a filename and NZB URL. Source, series aliases, poster, subtitle, screenshot, and thumbnail links are preserved as provider metadata; selection, scoring, and submission to a download client remain Scryer's responsibility.
