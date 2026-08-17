@@ -61,7 +61,7 @@ struct TorrentWithStats {
 #[derive(Default, Deserialize)]
 struct TorrentStats {
     #[serde(default)]
-    state: i64,
+    state: String,
     #[serde(default)]
     error: Option<String>,
     #[serde(default, rename = "progress_bytes")]
@@ -341,7 +341,18 @@ impl RqbitConfig {
 
 impl TorrentWithStats {
     fn output_path(&self) -> String {
-        format!("{}{}", self.output_folder, self.name)
+        let folder = self.output_folder.trim_end_matches('/');
+        let name = self.name.trim_start_matches('/');
+        if name.is_empty() {
+            return folder.to_string();
+        }
+        if folder.rsplit('/').next() == Some(name) {
+            return folder.to_string();
+        }
+        if folder.is_empty() {
+            return name.to_string();
+        }
+        format!("{folder}/{name}")
     }
 }
 
@@ -471,18 +482,18 @@ fn torrent_to_item(torrent: TorrentWithStats) -> PluginDownloadItem {
             downloaded_bytes: Some(torrent.stats.progress_bytes),
             download_rate_bytes_per_second: Some(down_rate),
             seed_ratio: ratio,
-            raw_status: Some(torrent.stats.state.to_string()),
+            raw_status: Some(torrent.stats.state.clone()),
             status_reason: torrent.stats.error,
             ..PluginTorrentItem::default()
         }),
         total_size_bytes: Some(torrent.stats.total_bytes),
         remaining_size_bytes: Some(remaining),
-        eta_seconds: (down_rate > 0).then_some(remaining / down_rate),
+        eta_seconds: eta_seconds(remaining, down_rate),
         progress_percent,
         can_move_files: Some(can_remove),
         can_remove: Some(can_remove),
         removed: Some(false),
-        raw_state: Some(torrent.stats.state.to_string()),
+        raw_state: Some(torrent.stats.state.clone()),
         completed_at: None,
     }
 }
@@ -600,14 +611,18 @@ fn now_unix_seconds() -> i64 {
         .as_secs() as i64
 }
 
+fn eta_seconds(remaining_bytes: i64, download_rate_bytes_per_second: i64) -> Option<i64> {
+    (download_rate_bytes_per_second > 0).then(|| remaining_bytes / download_rate_bytes_per_second)
+}
+
 fn map_state(stats: &TorrentStats) -> DownloadItemState {
     if stats.finished {
-        DownloadItemState::Completed
-    } else {
-        match stats.state {
-            0 | 2 => DownloadItemState::Downloading,
-            _ => DownloadItemState::Paused,
-        }
+        return DownloadItemState::Completed;
+    }
+    match stats.state.to_ascii_lowercase().as_str() {
+        "live" | "initializing" => DownloadItemState::Downloading,
+        "error" => DownloadItemState::Failed,
+        _ => DownloadItemState::Paused,
     }
 }
 
@@ -734,6 +749,178 @@ fn connection_field(
 fn is_localhost_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     lower.contains("://localhost") || lower.contains("://127.0.0.1") || lower.contains("://[::1]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats(state: &str, finished: bool) -> TorrentStats {
+        TorrentStats {
+            state: state.to_string(),
+            finished,
+            ..Default::default()
+        }
+    }
+
+    fn torrent(output_folder: &str, name: &str) -> TorrentWithStats {
+        TorrentWithStats {
+            output_folder: output_folder.to_string(),
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn parse_torrent(json: &str) -> TorrentWithStats {
+        serde_json::from_str(json).expect("rqbit torrent JSON should parse")
+    }
+
+    #[test]
+    fn maps_all_rqbit_string_states() {
+        assert_eq!(
+            map_state(&stats("live", false)),
+            DownloadItemState::Downloading
+        );
+        assert_eq!(
+            map_state(&stats("initializing", false)),
+            DownloadItemState::Downloading
+        );
+        assert_eq!(
+            map_state(&stats("paused", false)),
+            DownloadItemState::Paused
+        );
+        assert_eq!(map_state(&stats("error", false)), DownloadItemState::Failed);
+        assert_eq!(
+            map_state(&stats("paused", true)),
+            DownloadItemState::Completed
+        );
+        assert_eq!(
+            map_state(&stats("LIVE", false)),
+            DownloadItemState::Downloading
+        );
+    }
+
+    #[test]
+    fn parses_string_states_from_rqbit_list_json() {
+        let parsed: ListTorrentsResponse = serde_json::from_str(
+            r#"{
+              "torrents": [
+                { "id": 0, "info_hash": "aa", "name": "a", "output_folder": "/downloads/a", "stats": { "state": "paused", "finished": true } },
+                { "id": 1, "info_hash": "bb", "name": "b", "output_folder": "/downloads", "stats": { "state": "live", "finished": false } },
+                { "id": 2, "info_hash": "cc", "name": "c", "output_folder": "/downloads/c", "stats": { "state": "initializing", "finished": false } },
+                { "id": 3, "info_hash": "dd", "name": "d", "output_folder": "/downloads/d", "stats": { "state": "error", "finished": false, "error": "disk full" } }
+              ]
+            }"#,
+        )
+        .expect("rqbit list JSON should parse");
+
+        let states: Vec<_> = parsed
+            .torrents
+            .iter()
+            .map(|torrent| (torrent.stats.state.as_str(), map_state(&torrent.stats)))
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                ("paused", DownloadItemState::Completed),
+                ("live", DownloadItemState::Downloading),
+                ("initializing", DownloadItemState::Downloading),
+                ("error", DownloadItemState::Failed),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_numeric_torrent_state() {
+        let error = match serde_json::from_str::<ListTorrentsResponse>(
+            r#"{
+              "torrents": [
+                {
+                  "id": 1,
+                  "info_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "name": "legacy",
+                  "output_folder": "/downloads",
+                  "stats": { "state": 1, "finished": false }
+                }
+              ]
+            }"#,
+        ) {
+            Ok(_) => panic!("rqbit 8/9 serializes state as a string"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("invalid type"));
+    }
+
+    #[test]
+    fn zero_download_rate_does_not_compute_eta() {
+        assert_eq!(eta_seconds(1_048_576, 0), None);
+        assert_eq!(eta_seconds(0, 0), None);
+
+        let item = torrent_to_item(parse_torrent(
+            r#"{
+              "id": 4,
+              "info_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "name": "Show.S01E02.mkv",
+              "output_folder": "/downloads",
+              "stats": {
+                "state": "paused",
+                "progress_bytes": 100,
+                "total_bytes": 1000,
+                "finished": false,
+                "live": null
+              }
+            }"#,
+        ));
+        assert_eq!(item.eta_seconds, None);
+    }
+
+    #[test]
+    fn positive_download_rate_reports_eta() {
+        assert_eq!(eta_seconds(2_097_152, 1_048_576), Some(2));
+
+        let item = torrent_to_item(parse_torrent(
+            r#"{
+              "id": 4,
+              "info_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "name": "Show.S01E02.mkv",
+              "output_folder": "/downloads",
+              "stats": {
+                "state": "live",
+                "progress_bytes": 0,
+                "total_bytes": 2097152,
+                "finished": false,
+                "live": { "download_speed": { "mbps": 1.0 } }
+              }
+            }"#,
+        ));
+        assert_eq!(item.eta_seconds, Some(2));
+    }
+
+    #[test]
+    fn output_path_joins_single_file_into_session_folder() {
+        // rqbit writes a single-file torrent directly into the session folder.
+        assert_eq!(
+            torrent("/downloads", "Show.S01E02.mkv").output_path(),
+            "/downloads/Show.S01E02.mkv"
+        );
+        assert_eq!(
+            torrent("/downloads/", "Show.S01E02.mkv").output_path(),
+            "/downloads/Show.S01E02.mkv"
+        );
+    }
+
+    #[test]
+    fn output_path_uses_multi_file_subfolder_without_duplicating_name() {
+        // Multi-file torrents already include the torrent name in output_folder.
+        assert_eq!(
+            torrent("/downloads/Show s02e01-02", "Show s02e01-02").output_path(),
+            "/downloads/Show s02e01-02"
+        );
+        assert_eq!(
+            torrent("/downloads/Show s02e01-02/", "Show s02e01-02").output_path(),
+            "/downloads/Show s02e01-02"
+        );
+    }
 }
 
 scryer_plugin_pdk::scryer_download_client_bridge_main!(
