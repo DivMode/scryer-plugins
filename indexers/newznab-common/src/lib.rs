@@ -745,23 +745,7 @@ fn execute_rss_search(
     };
 
     // Determine which search types to use based on categories and facet
-    let has_movie_cats = req.categories.iter().any(|c| c.starts_with('2'));
-    let has_tv_cats = req.categories.iter().any(|c| c.starts_with('5'));
-    let facet_movie = matches!(req.facet.as_deref(), Some("movie"));
-    let facet_tv = matches!(req.facet.as_deref(), Some("series" | "anime"));
-
-    let mut search_types = Vec::new();
-    if has_movie_cats || facet_movie {
-        search_types.push("movie");
-    }
-    if has_tv_cats || facet_tv {
-        search_types.push("tvsearch");
-    }
-    if search_types.is_empty() {
-        // No clear signal — try both
-        search_types.push("tvsearch");
-        search_types.push("movie");
-    }
+    let search_types = rss_search_types(req);
 
     log!(
         LogLevel::Info,
@@ -881,6 +865,27 @@ fn execute_rss_search(
         grab_current: last_limits.grab_current,
         grab_max: last_limits.grab_max,
     })
+}
+
+fn rss_search_types(req: &SearchRequest) -> Vec<&'static str> {
+    let has_movie_cats = req.categories.iter().any(|c| c.starts_with('2'));
+    let has_tv_cats = req.categories.iter().any(|c| c.starts_with('5'));
+    let facet_movie = matches!(req.facet.as_deref(), Some("movie"));
+    let facet_tv = matches!(req.facet.as_deref(), Some("series" | "anime"));
+
+    let mut search_types = Vec::new();
+    if has_movie_cats || facet_movie {
+        search_types.push("movie");
+    }
+    if has_tv_cats || facet_tv {
+        search_types.push("tvsearch");
+    }
+    if search_types.is_empty() {
+        // No clear signal — try both
+        search_types.push("tvsearch");
+        search_types.push("movie");
+    }
+    search_types
 }
 
 // ---------------------------------------------------------------------------
@@ -3050,6 +3055,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rss_anime_categories_select_tvsearch_not_generic_search() {
+        let request = SearchRequest {
+            categories: vec!["5070".to_string()],
+            facet: Some("anime".to_string()),
+            ..SearchRequest::default()
+        };
+
+        assert_eq!(rss_search_types(&request), vec!["tvsearch"]);
+    }
+
+    #[test]
+    fn titled_request_retains_title_and_category_for_full_search() {
+        let request = SearchRequest {
+            query: "Frieren S02E01".to_string(),
+            categories: vec!["5070".to_string()],
+            ..SearchRequest::default()
+        };
+
+        let url = build_search_url(
+            "https://feed.animetosho.xyz/api/newznab",
+            NabSearchShape::Tv.search_type(),
+            Some(request.query.as_str()),
+            "test-key",
+            None,
+            None,
+            None,
+            None,
+            None,
+            build_category_param(&request.categories).as_deref(),
+            200,
+            None,
+            None,
+            "",
+        )
+        .expect("search URL");
+
+        assert_eq!(query_value(&url, "t").as_deref(), Some("tvsearch"));
+        assert_eq!(query_value(&url, "q").as_deref(), Some("Frieren S02E01"));
+        assert_eq!(query_value(&url, "cat").as_deref(), Some("5070"));
+    }
+
+    #[test]
     fn password_metadata_classification_handles_flags_and_real_values() {
         for raw in [None, Some(""), Some("  ")] {
             assert_eq!(
@@ -4069,7 +4116,7 @@ mod tests {
         let mut result = make_result();
         let mut usenet_date = None;
         apply_standard_attrs(&pairs, &mut result, &mut usenet_date);
-        assert!(result.provider_extra.get("response_tmdbid").is_none());
+        assert!(!result.provider_extra.contains_key("response_tmdbid"));
     }
 
     #[test]
