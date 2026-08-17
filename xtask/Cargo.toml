@@ -31,7 +31,6 @@ sevenz-rust2 = { version = "0.21", default-features = false, features = ["compre
 zip = { version = "8.0.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [profile.xtask-release]
-inherits = "release"
-codegen-units = 64
-lto = false
-opt-level = "s"
+inherits = "dev"
+debug = 0
+incremental = false
