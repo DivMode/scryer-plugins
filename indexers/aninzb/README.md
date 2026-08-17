@@ -4,7 +4,7 @@ An anime and series Usenet indexer for AniNZB's public JSON API. It supports tit
 
 ## Configuration
 
-AniNZB has no user configuration. It always uses `https://api.aninzb.moe/` with a browser-style User-Agent and fixed respectful request pacing. Existing AniNZB/Newznab settings are accepted for compatibility but ignored.
+AniNZB exposes only a legacy **Base URL** field so it remains installable on older Scryer versions. Its value is ignored: the plugin always uses `https://api.aninzb.moe/` with a browser-style User-Agent and fixed respectful request pacing. No API key, path, additional-parameters, or rate-limit controls are exposed. Existing AniNZB/Newznab settings are accepted for compatibility but ignored.
 
 ## Behavior and limits
 

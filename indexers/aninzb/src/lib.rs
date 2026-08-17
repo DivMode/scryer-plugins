@@ -10,11 +10,13 @@ use newznab_common::{
     SearchResponse, SearchResult, current_sdk_constraint, is_hit_budget_exhausted_error,
     polite_http_get,
 };
+use scryer_plugin_sdk::{ConfigFieldDef, ConfigFieldRole, ConfigFieldType, ConfigFieldValueSource};
 use serde::Deserialize;
 use url::Url;
 
 const ANINZB_API_BASE_URL: &str = "https://api.aninzb.moe/";
 const ANINZB_API_HOST: &str = "api.aninzb.moe";
+const LEGACY_BASE_URL_DEFAULT: &str = "https://aninzb.moe";
 const API_MAX_RESULTS: usize = 50;
 const MAX_API_RESPONSE_BYTES: usize = 20 * 1024 * 1024;
 const API_REQUESTS_PER_SECOND: u32 = 2;
@@ -213,11 +215,29 @@ fn build_descriptor() -> PluginDescriptor {
                 }),
             },
             scoring_policies: vec![],
-            config_fields: vec![],
+            config_fields: legacy_config_fields(),
             allowed_hosts: vec![ANINZB_API_HOST.to_string()],
             rate_limit_seconds: None,
         }),
     }
+}
+
+fn legacy_config_fields() -> Vec<ConfigFieldDef> {
+    vec![ConfigFieldDef {
+        key: "base_url".to_string(),
+        label: "Base URL".to_string(),
+        field_type: ConfigFieldType::String,
+        required: true,
+        default_value: Some(LEGACY_BASE_URL_DEFAULT.to_string()),
+        value_source: ConfigFieldValueSource::User,
+        role: Some(ConfigFieldRole::ConnectionUrl),
+        host_binding: None,
+        options: vec![],
+        help_text: Some(
+            "Retained for compatibility; AniNZB always uses its fixed public API endpoint."
+                .to_string(),
+        ),
+    }]
 }
 
 #[plugin_fn]
@@ -567,13 +587,20 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_is_fixed_api_and_has_no_configuration() {
+    fn descriptor_keeps_only_the_legacy_base_url_configuration() {
         let descriptor = build_descriptor();
         let ProviderDescriptor::Indexer(indexer) = descriptor.provider else {
             panic!("expected indexer descriptor");
         };
 
-        assert!(indexer.config_fields.is_empty());
+        assert_eq!(indexer.config_fields.len(), 1);
+        let base_url = &indexer.config_fields[0];
+        assert_eq!(base_url.key, "base_url");
+        assert_eq!(base_url.role, Some(ConfigFieldRole::ConnectionUrl));
+        assert_eq!(
+            base_url.default_value.as_deref(),
+            Some(LEGACY_BASE_URL_DEFAULT)
+        );
         assert_eq!(indexer.allowed_hosts, vec![ANINZB_API_HOST.to_string()]);
         assert_eq!(indexer.rate_limit_seconds, None);
         assert_eq!(indexer.capabilities.query_param.as_deref(), Some("name"));
