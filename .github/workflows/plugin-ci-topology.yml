@@ -4,7 +4,6 @@ on:
   pull_request:
     paths:
       - .github/workflows/plugin-ci.yml
-      - .github/workflows/plugin-ci-core.yml
       - .github/workflows/plugin-ci-topology.yml
       - .github/scripts/plan-plugin-ci.py
       - xtask/**
@@ -18,6 +17,6 @@ permissions:
 
 jobs:
   run:
-    uses: ./.github/workflows/plugin-ci-core.yml
+    uses: ./.github/workflows/plugin-ci.yml
     permissions:
       contents: read
