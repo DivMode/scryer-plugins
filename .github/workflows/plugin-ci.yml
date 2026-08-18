@@ -52,7 +52,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Check formatting
-        run: cargo run --locked --manifest-path xtask/Cargo.toml -- ci fmt
+        run: cargo run --locked --profile xtask-release --manifest-path xtask/Cargo.toml -- ci fmt
 
   clippy:
     needs: plan
@@ -80,7 +80,7 @@ jobs:
 
       - name: Run strict clippy
         if: ${{ matrix.plugin_id != '' }}
-        run: cargo run --locked --manifest-path xtask/Cargo.toml -- ci clippy --plugin-id "${{ matrix.plugin_id }}"
+        run: cargo run --locked --profile xtask-release --manifest-path xtask/Cargo.toml -- ci clippy --plugin-id "${{ matrix.plugin_id }}"
 
   clippy-xtask:
     needs: plan
@@ -100,7 +100,7 @@ jobs:
         run: rustup component add clippy --toolchain "$(rustup show active-toolchain | awk '{print $1}')"
 
       - name: Run strict clippy for xtask
-        run: cargo clippy --all-targets --all-features --locked --manifest-path xtask/Cargo.toml -- -D warnings
+        run: cargo clippy --profile xtask-release --all-targets --all-features --locked --manifest-path xtask/Cargo.toml -- -D warnings
 
   audit:
     needs: plan
@@ -138,7 +138,7 @@ jobs:
               scope_args+=(--plugin-id "$plugin_id")
             done
           fi
-          cargo run --locked --manifest-path xtask/Cargo.toml -- ci audit "${scope_args[@]}"
+          cargo run --locked --profile xtask-release --manifest-path xtask/Cargo.toml -- ci audit "${scope_args[@]}"
 
   wasm-validate:
     needs: plan
@@ -193,8 +193,8 @@ jobs:
 
       - name: Prefetch plugin release dependencies
         if: ${{ matrix.plugin_id != '' }}
-        run: cargo run --locked --manifest-path xtask/Cargo.toml -- official prefetch "${{ matrix.plugin_id }}"
+        run: cargo run --locked --profile xtask-release --manifest-path xtask/Cargo.toml -- official prefetch "${{ matrix.plugin_id }}"
 
       - name: Validate official plugins through the release Wasm path
         if: ${{ matrix.plugin_id != '' }}
-        run: cargo run --locked --manifest-path xtask/Cargo.toml -- plugin validate-all --plugin-id "${{ matrix.plugin_id }}"
+        run: cargo run --locked --profile xtask-release --manifest-path xtask/Cargo.toml -- plugin validate-all --plugin-id "${{ matrix.plugin_id }}"
