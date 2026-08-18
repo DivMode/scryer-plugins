@@ -491,11 +491,10 @@ fn handle_download_control(
     let config = QbittorrentConfig::from_extism()?;
 
     match request.action {
-        DownloadControlAction::Pause => {
-            post_form(&config, "/torrents/pause", &[("hashes".to_string(), hash)])?
-        }
-        DownloadControlAction::Resume => {
-            post_form(&config, "/torrents/resume", &[("hashes".to_string(), hash)])?
+        DownloadControlAction::Pause | DownloadControlAction::Resume => {
+            let version = get_text(&config, "/app/version")?;
+            let endpoint = control_endpoint(request.action, &version);
+            post_form(&config, endpoint, &[("hashes".to_string(), hash)])?
         }
         DownloadControlAction::Remove => post_form(
             &config,
@@ -516,6 +515,24 @@ fn handle_download_control(
     }
 
     Ok(PluginResult::Ok(()))
+}
+
+fn control_endpoint(action: DownloadControlAction, version: &str) -> &'static str {
+    let is_v5_or_newer = version
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u64>().ok())
+        .is_some_and(|major| major >= 5);
+
+    match (action, is_v5_or_newer) {
+        (DownloadControlAction::Pause, true) => "/torrents/stop",
+        (DownloadControlAction::Resume, true) => "/torrents/start",
+        (DownloadControlAction::Pause, false) => "/torrents/pause",
+        (DownloadControlAction::Resume, false) => "/torrents/resume",
+        _ => unreachable!("control endpoint requested for unsupported action"),
+    }
 }
 
 pub fn scryer_download_mark_imported(input: String) -> FnResult<String> {
@@ -2683,6 +2700,42 @@ mod tests {
             }
             PluginResult::Ok(()) => panic!("expected structured error"),
         }
+    }
+
+    #[test]
+    fn control_endpoints_preserve_qbittorrent_4_behavior() {
+        assert_eq!(
+            control_endpoint(DownloadControlAction::Pause, "4.6.7"),
+            "/torrents/pause"
+        );
+        assert_eq!(
+            control_endpoint(DownloadControlAction::Resume, "v4.6.7"),
+            "/torrents/resume"
+        );
+    }
+
+    #[test]
+    fn control_endpoints_use_qbittorrent_5_names() {
+        assert_eq!(
+            control_endpoint(DownloadControlAction::Pause, "5.0.0"),
+            "/torrents/stop"
+        );
+        assert_eq!(
+            control_endpoint(DownloadControlAction::Resume, "v5.1.2"),
+            "/torrents/start"
+        );
+    }
+
+    #[test]
+    fn control_endpoints_fall_back_to_qbittorrent_4_names_for_unknown_versions() {
+        assert_eq!(
+            control_endpoint(DownloadControlAction::Pause, "development build"),
+            "/torrents/pause"
+        );
+        assert_eq!(
+            control_endpoint(DownloadControlAction::Resume, ""),
+            "/torrents/resume"
+        );
     }
 
     fn test_add_request(kind: DownloadInputKind) -> PluginDownloadClientAddRequest {
