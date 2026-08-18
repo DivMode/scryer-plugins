@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "qbittorrent-download-client"
-version = "1.0.2"
+version = "1.0.4"
 dependencies = [
  "base64 0.23.1",
  "scryer-plugin-pdk",
