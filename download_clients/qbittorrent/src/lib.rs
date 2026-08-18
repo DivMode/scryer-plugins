@@ -2015,7 +2015,10 @@ fn map_state(state: &str) -> DownloadItemState {
         "pausedup" | "queuedup" | "stalledup" | "uploading" | "forcedup" => {
             DownloadItemState::Completed
         }
-        "error" | "missingfiles" => DownloadItemState::Failed,
+        // qBittorrent uses these states for recoverable client-side conditions.
+        // Keep the torrent visible for operator diagnosis instead of triggering
+        // Scryer's failed-download cleanup flow.
+        "error" | "missingfiles" => DownloadItemState::Warning,
         "unknown" => DownloadItemState::Error,
         _ => DownloadItemState::Warning,
     }
@@ -2204,10 +2207,10 @@ mod tests {
     }
 
     #[test]
-    fn state_mapping_handles_completed_states() {
+    fn state_mapping_handles_completed_and_warning_states() {
         assert_eq!(map_state("pausedUP"), DownloadItemState::Completed);
         assert_eq!(map_state("moving"), DownloadItemState::ImportPending);
-        assert_eq!(map_state("missingFiles"), DownloadItemState::Failed);
+        assert_eq!(map_state("missingFiles"), DownloadItemState::Warning);
     }
 
     #[test]
@@ -2750,6 +2753,13 @@ mod tests {
             }
             PluginResult::Ok(_) => panic!("expected structured error"),
         }
+    }
+
+    #[test]
+    fn qbit_error_states_remain_warnings_and_do_not_trigger_failed_download_cleanup() {
+        assert_eq!(map_state("error"), DownloadItemState::Warning);
+        assert_eq!(map_state("downloading"), DownloadItemState::Downloading);
+        assert_eq!(map_state("uploading"), DownloadItemState::Completed);
     }
 }
 

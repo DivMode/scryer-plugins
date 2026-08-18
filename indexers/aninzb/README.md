@@ -1,13 +1,13 @@
 # AniNZB Indexer
 
-An anime and series Usenet indexer for AniNZB's Newznab-compatible service. It supports title, TVDB, and AniDB searches together with recent, RSS, automatic, and interactive feeds.
+An anime and series Usenet indexer for AniNZB's public JSON API. It supports title, TVDB, and AniDB searches together with recent, RSS, automatic, and interactive feeds.
 
-## Configure in Scryer
+## Configuration
 
-**base_url** defaults to https://aninzb.moe; the shared Newznab fields **api_key**, **api_path** (default /api), and **additional_params** are available for the service configuration. **hourly_hit_cap** and **daily_hit_cap** control the plugin's local request budgets; their defaults are 500 and 3,000 respectively.
+AniNZB exposes only a legacy **Base URL** field so it remains installable on older Scryer versions. Its value is ignored: the plugin always uses `https://api.aninzb.moe/` with a browser-style User-Agent and fixed respectful request pacing. No API key, path, additional-parameters, or rate-limit controls are exposed. Existing AniNZB/Newznab settings are accepted for compatibility but ignored.
 
 ## Behavior and limits
 
-AniNZB is deliberately not a movie source: movie-shaped requests return an empty result set. The plugin limits Newznab pages to 100 items, spaces requests by three seconds, and uses bounded retries for provider throttling. When either configured hit budget is exhausted, it returns no results rather than continuing to query the service.
+AniNZB is deliberately not a movie source: movie-shaped requests return an empty result set. Recent and RSS feeds use the documented `source=release` search, whose results are newest first. Each search makes one API request and returns at most 50 results. The first request is sent immediately; later requests are locally paced to no more than two per second. The plugin uses bounded retries for provider throttling and stops querying when its fixed local request budget is exhausted.
 
-Returned entries are normalized as Usenet releases with available grab, comment, provider metadata, and info-link fields. Selection, scoring, and submission to a download client remain Scryer's responsibility.
+The API may return nullable metadata. Usable entries are normalized as Usenet releases when they include both a filename and NZB URL. Source, series aliases, poster, subtitle, screenshot, and thumbnail links are preserved as provider metadata; selection, scoring, and submission to a download client remain Scryer's responsibility.
