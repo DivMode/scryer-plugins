@@ -1196,7 +1196,22 @@ fn remaining_size(task: &DsTask) -> i64 {
 
 fn eta_seconds(task: &DsTask, remaining: i64) -> Option<i64> {
     let speed = transfer_i64(task, "speed_download").unwrap_or_default();
-    (speed > 0).then_some(remaining / speed)
+    eta_seconds_for_speed(remaining, speed)
+}
+
+fn eta_seconds_for_speed(remaining: i64, speed: i64) -> Option<i64> {
+    (speed > 0).then(|| remaining / speed)
+}
+
+#[cfg(test)]
+mod eta_seconds_tests {
+    use super::eta_seconds_for_speed;
+
+    #[test]
+    fn zero_speed_does_not_evaluate_the_division() {
+        assert_eq!(eta_seconds_for_speed(10, 0), None);
+        assert_eq!(eta_seconds_for_speed(10, 2), Some(5));
+    }
 }
 
 fn seed_ratio(task: &DsTask) -> Option<f64> {
