@@ -57,6 +57,12 @@ struct FloodTorrent {
     tags: Vec<String>,
     #[serde(default, rename = "dateFinished")]
     date_finished: Option<i64>,
+    #[serde(default, rename = "upTotal")]
+    up_total: Option<i64>,
+    /// Flood surfaces libtorrent's private flag as `isPrivate`; `None` when the running Flood
+    /// build does not report it.
+    #[serde(default, rename = "isPrivate")]
+    is_private: Option<bool>,
 }
 
 #[derive(Default, Deserialize)]
@@ -228,7 +234,7 @@ pub fn scryer_download_list_queue(_input: String) -> FnResult<String> {
     let items = list_torrents(&config)?
         .into_iter()
         .filter(|(_, torrent)| matches_scope(&config, torrent))
-        .map(|(hash, torrent)| torrent_to_item(&config, hash, torrent))
+        .map(|(hash, torrent)| torrent_to_item(hash, torrent))
         .collect::<Vec<_>>();
     Ok(serde_json::to_string(&PluginResult::Ok(items))?)
 }
@@ -238,7 +244,7 @@ pub fn scryer_download_list_history(_input: String) -> FnResult<String> {
     let items = list_torrents(&config)?
         .into_iter()
         .filter(|(_, torrent)| matches_scope(&config, torrent))
-        .map(|(hash, torrent)| torrent_to_item(&config, hash, torrent))
+        .map(|(hash, torrent)| torrent_to_item(hash, torrent))
         .collect::<Vec<_>>();
     Ok(serde_json::to_string(&PluginResult::Ok(items))?)
 }
@@ -653,14 +659,11 @@ fn slug_tag(value: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-fn torrent_to_item(
-    config: &FloodConfig,
-    hash: String,
-    torrent: FloodTorrent,
-) -> PluginDownloadItem {
+fn torrent_to_item(hash: String, torrent: FloodTorrent) -> PluginDownloadItem {
     let remaining = (torrent.size_bytes - torrent.bytes_done).max(0);
     let state = map_state(&torrent);
-    let removable = can_remove(config, &hash, &torrent, state);
+    let now = now_unix_seconds();
+    let can_remove = derive_can_remove(&hash, &torrent, state, now);
     PluginDownloadItem {
         client_item_id: normalize_hash(&hash),
         download_id: None,
@@ -679,8 +682,11 @@ fn torrent_to_item(
             tags: torrent.tags.clone(),
             save_path: Some(torrent.directory.clone()),
             content_paths: vec![torrent.directory.clone()],
+            uploaded_bytes: torrent.up_total,
             downloaded_bytes: Some(torrent.bytes_done),
             seed_ratio: Some(torrent.ratio),
+            seed_time_seconds: seed_time_seconds(&torrent, now),
+            is_private: torrent.is_private,
             raw_status: Some(torrent.status.join(",")),
             status_reason: if torrent.message.trim().is_empty() {
                 None
@@ -701,8 +707,9 @@ fn torrent_to_item(
         } else {
             None
         },
-        can_move_files: Some(removable),
-        can_remove: Some(removable),
+        // Data completeness only; whether a move is safe while seeding is decided Scryer-side.
+        can_move_files: Some(state == DownloadItemState::Completed),
+        can_remove,
         removed: Some(false),
         raw_state: Some(torrent.status.join(",")),
         completed_at: torrent.date_finished.map(|value| value.to_string()),
@@ -789,35 +796,58 @@ fn is_completed(torrent: &FloodTorrent) -> bool {
     status.contains("seeding") || status.contains("complete")
 }
 
-fn can_remove(
-    config: &FloodConfig,
+/// Honest `can_remove` for Flood.
+///
+/// Flood (rTorrent under the hood) exposes no per-torrent seeding limit, so the only goal the
+/// plugin can measure is the one Scryer handed it at add time. Without that stash the seeding
+/// verdict is unknowable and the plugin reports `None`.
+fn derive_can_remove(
     hash: &str,
     torrent: &FloodTorrent,
     state: DownloadItemState,
-) -> bool {
-    if state != DownloadItemState::Completed || config.post_import_tags.is_empty() {
-        return false;
+    now: i64,
+) -> Option<bool> {
+    derive_can_remove_with_config(torrent, state, seed_config(hash), now)
+}
+
+fn derive_can_remove_with_config(
+    torrent: &FloodTorrent,
+    state: DownloadItemState,
+    seed_config: Option<FloodSeedConfig>,
+    now: i64,
+) -> Option<bool> {
+    if state != DownloadItemState::Completed {
+        return Some(false);
     }
 
-    let Some(seed_config) = seed_config(hash) else {
-        return false;
-    };
+    let seed_config = seed_config?;
 
     if seed_config
         .ratio
         .is_some_and(|ratio| torrent.ratio >= ratio)
     {
-        return true;
+        return Some(true);
     }
 
     if let (Some(finished), Some(seed_time)) =
         (torrent.date_finished, seed_config.seed_time_seconds)
-        && now_unix_seconds().saturating_sub(finished) >= seed_time
     {
-        return true;
+        return Some(now.saturating_sub(finished) >= seed_time);
     }
 
-    false
+    if seed_config.ratio.is_some() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Seconds spent seeding, derived from Flood's `dateFinished` timestamp.
+fn seed_time_seconds(torrent: &FloodTorrent, now: i64) -> Option<i64> {
+    torrent
+        .date_finished
+        .filter(|finished| *finished > 0)
+        .map(|finished| now.saturating_sub(finished).max(0))
 }
 
 fn matches_scope(config: &FloodConfig, torrent: &FloodTorrent) -> bool {
@@ -1028,6 +1058,225 @@ fn connection_field(
 fn is_localhost_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     lower.contains("://localhost") || lower.contains("://127.0.0.1") || lower.contains("://[::1]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: i64 = 1_700_000_000;
+
+    fn seeding_torrent(ratio: f64) -> FloodTorrent {
+        FloodTorrent {
+            bytes_done: 1_000,
+            directory: "/downloads".to_string(),
+            name: "Movie".to_string(),
+            ratio,
+            size_bytes: 1_000,
+            status: vec!["complete".to_string(), "seeding".to_string()],
+            date_finished: Some(NOW - 600),
+            ..FloodTorrent::default()
+        }
+    }
+
+    #[test]
+    fn can_remove_is_false_while_downloading() {
+        let torrent = FloodTorrent {
+            status: vec!["downloading".to_string()],
+            bytes_done: 400,
+            ..seeding_torrent(0.0)
+        };
+        let state = map_state(&torrent);
+        assert_eq!(
+            derive_can_remove_with_config(
+                &torrent,
+                state,
+                Some(FloodSeedConfig {
+                    ratio: Some(1.0),
+                    seed_time_seconds: None,
+                }),
+                NOW
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_false_while_seeding_towards_an_unmet_ratio_goal() {
+        assert_eq!(
+            derive_can_remove_with_config(
+                &seeding_torrent(0.4),
+                DownloadItemState::Completed,
+                Some(FloodSeedConfig {
+                    ratio: Some(2.0),
+                    seed_time_seconds: None,
+                }),
+                NOW
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_true_once_the_ratio_goal_is_met() {
+        assert_eq!(
+            derive_can_remove_with_config(
+                &seeding_torrent(2.5),
+                DownloadItemState::Completed,
+                Some(FloodSeedConfig {
+                    ratio: Some(2.0),
+                    seed_time_seconds: None,
+                }),
+                NOW
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_unknown_without_a_stored_goal() {
+        assert_eq!(
+            derive_can_remove_with_config(
+                &seeding_torrent(9.0),
+                DownloadItemState::Completed,
+                None,
+                NOW
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn can_remove_is_unknown_when_only_a_seed_time_goal_exists_without_a_finish_timestamp() {
+        let torrent = FloodTorrent {
+            date_finished: None,
+            ..seeding_torrent(0.1)
+        };
+        assert_eq!(
+            derive_can_remove_with_config(
+                &torrent,
+                DownloadItemState::Completed,
+                Some(FloodSeedConfig {
+                    ratio: None,
+                    seed_time_seconds: Some(3_600),
+                }),
+                NOW
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn can_move_files_tracks_data_completeness_not_seeding() {
+        let item = torrent_to_item("abc".to_string(), seeding_torrent(0.1));
+        assert_eq!(item.can_move_files, Some(true));
+        // No stored goal in the test host, so the seeding verdict is unknown.
+        assert_eq!(item.can_remove, None);
+    }
+
+    #[test]
+    fn seed_time_is_derived_from_date_finished() {
+        let torrent = FloodTorrent {
+            date_finished: Some(NOW - 900),
+            ..seeding_torrent(0.1)
+        };
+        assert_eq!(seed_time_seconds(&torrent, NOW), Some(900));
+        let never_finished = FloodTorrent {
+            date_finished: None,
+            ..torrent
+        };
+        assert_eq!(seed_time_seconds(&never_finished, NOW), None);
+    }
+
+    #[test]
+    fn is_private_maps_present_true_present_false_and_absent() {
+        let map = |raw: &str| {
+            let torrent: FloodTorrent = serde_json::from_str(raw).unwrap();
+            torrent_to_item("abc".to_string(), torrent)
+                .torrent
+                .unwrap()
+                .is_private
+        };
+        assert_eq!(
+            map(r#"{"name":"n","status":["seeding"],"isPrivate":true}"#),
+            Some(true)
+        );
+        assert_eq!(
+            map(r#"{"name":"n","status":["seeding"],"isPrivate":false}"#),
+            Some(false)
+        );
+        assert_eq!(map(r#"{"name":"n","status":["seeding"]}"#), None);
+    }
+
+    #[test]
+    fn uploaded_bytes_come_from_up_total() {
+        let torrent: FloodTorrent =
+            serde_json::from_str(r#"{"name":"n","status":["seeding"],"upTotal":4096}"#).unwrap();
+        let item = torrent_to_item("abc".to_string(), torrent);
+        assert_eq!(item.torrent.unwrap().uploaded_bytes, Some(4_096));
+    }
+}
+
+#[cfg(test)]
+mod extism_host_stubs {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn alloc(_len: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn config_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_headers() -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_request(_request: u64, _body: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_status_code() -> u64 {
+        200
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length_unsafe(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u64(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u8(_offset: u64) -> u8 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u64(_offset: u64, _value: u64) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u8(_offset: u64, _value: u8) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_set(_ptr: u64, _value: u64) {}
 }
 
 scryer_plugin_pdk::scryer_download_client_bridge_main!(

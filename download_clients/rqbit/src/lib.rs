@@ -451,7 +451,14 @@ fn torrent_to_item(torrent: TorrentWithStats) -> PluginDownloadItem {
     } else {
         Some(0.0)
     };
-    let can_remove = can_remove(&hash, &torrent, ratio);
+    let now = now_unix_seconds();
+    let can_remove = derive_can_remove(&hash, &torrent, ratio);
+    let seed_time_seconds = torrent
+        .stats
+        .finished
+        .then(|| finished_at(&hash, &torrent))
+        .flatten()
+        .map(|finished_at| now.saturating_sub(finished_at).max(0));
     let path = torrent.output_path();
 
     PluginDownloadItem {
@@ -471,16 +478,19 @@ fn torrent_to_item(torrent: TorrentWithStats) -> PluginDownloadItem {
             downloaded_bytes: Some(torrent.stats.progress_bytes),
             download_rate_bytes_per_second: Some(down_rate),
             seed_ratio: ratio,
+            seed_time_seconds,
             raw_status: Some(torrent.stats.state.to_string()),
             status_reason: torrent.stats.error,
             ..PluginTorrentItem::default()
         }),
         total_size_bytes: Some(torrent.stats.total_bytes),
         remaining_size_bytes: Some(remaining),
-        eta_seconds: (down_rate > 0).then_some(remaining / down_rate),
+        // `then_some` would evaluate the division eagerly and trap on idle/seeding torrents.
+        eta_seconds: (down_rate > 0).then(|| remaining / down_rate),
         progress_percent,
-        can_move_files: Some(can_remove),
-        can_remove: Some(can_remove),
+        // Data completeness only; whether a move is safe while seeding is decided Scryer-side.
+        can_move_files: Some(torrent.stats.finished),
+        can_remove,
         removed: Some(false),
         raw_state: Some(torrent.stats.state.to_string()),
         completed_at: None,
@@ -509,28 +519,51 @@ fn torrent_to_completed(torrent: TorrentWithStats) -> PluginCompletedDownload {
     }
 }
 
-fn can_remove(hash: &str, torrent: &TorrentWithStats, ratio: Option<f64>) -> bool {
+/// Honest `can_remove` for rqbit.
+///
+/// rqbit exposes no seeding-limit API, so the only goal this plugin can measure is the one
+/// Scryer handed it at add time. Without that stash the verdict is unknowable (`None`) and
+/// Scryer-side goal evaluation decides.
+fn derive_can_remove(hash: &str, torrent: &TorrentWithStats, ratio: Option<f64>) -> Option<bool> {
+    derive_can_remove_with_config(
+        torrent,
+        seed_config(hash),
+        ratio,
+        finished_at(hash, torrent),
+        now_unix_seconds(),
+    )
+}
+
+fn derive_can_remove_with_config(
+    torrent: &TorrentWithStats,
+    seed_config: Option<RqbitSeedConfig>,
+    ratio: Option<f64>,
+    finished_at: Option<i64>,
+    now: i64,
+) -> Option<bool> {
     if !torrent.stats.finished {
-        return false;
+        return Some(false);
     }
 
-    let Some(seed_config) = seed_config(hash) else {
-        return false;
-    };
+    let seed_config = seed_config?;
 
     if let (Some(current), Some(limit)) = (ratio, seed_config.ratio)
         && current >= limit
     {
-        return true;
+        return Some(true);
     }
 
     if let Some(seed_time_seconds) = seed_config.seed_time_seconds
-        && let Some(finished_at) = finished_at(hash, torrent)
+        && let Some(finished_at) = finished_at
     {
-        return now_unix_seconds().saturating_sub(finished_at) >= seed_time_seconds;
+        return Some(now.saturating_sub(finished_at) >= seed_time_seconds);
     }
 
-    false
+    if seed_config.ratio.is_some() && ratio.is_some() {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn store_seed_config(hash: &str, request: &PluginDownloadClientAddRequest) -> Result<(), Error> {
@@ -734,6 +767,208 @@ fn connection_field(
 fn is_localhost_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     lower.contains("://localhost") || lower.contains("://127.0.0.1") || lower.contains("://[::1]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: i64 = 1_700_000_000;
+
+    fn finished_torrent() -> TorrentWithStats {
+        TorrentWithStats {
+            id: 1,
+            info_hash: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            name: "Movie".to_string(),
+            output_folder: "/downloads/Movie".to_string(),
+            stats: TorrentStats {
+                state: 3,
+                progress_bytes: 1_000,
+                uploaded_bytes: 2_500,
+                total_bytes: 1_000,
+                finished: true,
+                ..TorrentStats::default()
+            },
+        }
+    }
+
+    #[test]
+    fn can_remove_is_false_while_the_download_is_unfinished() {
+        let mut torrent = finished_torrent();
+        torrent.stats.finished = false;
+        torrent.stats.progress_bytes = 400;
+        assert_eq!(
+            derive_can_remove_with_config(
+                &torrent,
+                Some(RqbitSeedConfig {
+                    ratio: Some(1.0),
+                    seed_time_seconds: None,
+                }),
+                Some(0.4),
+                Some(NOW - 100),
+                NOW
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_false_while_seeding_towards_an_unmet_ratio_goal() {
+        assert_eq!(
+            derive_can_remove_with_config(
+                &finished_torrent(),
+                Some(RqbitSeedConfig {
+                    ratio: Some(4.0),
+                    seed_time_seconds: None,
+                }),
+                Some(2.5),
+                None,
+                NOW
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_true_once_the_ratio_goal_is_met() {
+        assert_eq!(
+            derive_can_remove_with_config(
+                &finished_torrent(),
+                Some(RqbitSeedConfig {
+                    ratio: Some(2.0),
+                    seed_time_seconds: None,
+                }),
+                Some(2.5),
+                None,
+                NOW
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_true_once_the_seed_time_goal_elapsed() {
+        assert_eq!(
+            derive_can_remove_with_config(
+                &finished_torrent(),
+                Some(RqbitSeedConfig {
+                    ratio: None,
+                    seed_time_seconds: Some(3_600),
+                }),
+                Some(0.1),
+                Some(NOW - 7_200),
+                NOW
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_unknown_without_a_stored_goal() {
+        assert_eq!(
+            derive_can_remove_with_config(&finished_torrent(), None, Some(9.0), None, NOW),
+            None
+        );
+    }
+
+    #[test]
+    fn can_remove_is_unknown_when_the_seed_time_goal_has_no_reference_timestamp() {
+        assert_eq!(
+            derive_can_remove_with_config(
+                &finished_torrent(),
+                Some(RqbitSeedConfig {
+                    ratio: None,
+                    seed_time_seconds: Some(3_600),
+                }),
+                Some(0.1),
+                None,
+                NOW
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn can_move_files_tracks_data_completeness_not_seeding() {
+        let item = torrent_to_item(finished_torrent());
+        assert_eq!(item.can_move_files, Some(true));
+        // No stored goal in the test host, so the seeding verdict is unknown.
+        assert_eq!(item.can_remove, None);
+    }
+
+    #[test]
+    fn is_private_is_never_claimed_because_rqbit_does_not_report_it() {
+        let item = torrent_to_item(finished_torrent());
+        assert_eq!(item.torrent.unwrap().is_private, None);
+    }
+
+    #[test]
+    fn observed_ratio_is_uploaded_over_downloaded() {
+        let item = torrent_to_item(finished_torrent());
+        assert_eq!(item.torrent.unwrap().seed_ratio, Some(2.5));
+    }
+}
+
+#[cfg(test)]
+mod extism_host_stubs {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn alloc(_len: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn config_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_headers() -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_request(_request: u64, _body: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_status_code() -> u64 {
+        200
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length_unsafe(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u64(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u8(_offset: u64) -> u8 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u64(_offset: u64, _value: u64) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u8(_offset: u64, _value: u8) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_set(_ptr: u64, _value: u64) {}
 }
 
 scryer_plugin_pdk::scryer_download_client_bridge_main!(

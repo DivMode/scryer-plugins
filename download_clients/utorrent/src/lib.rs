@@ -52,6 +52,9 @@ struct UTorrentTorrent {
     remaining: i64,
     root_download_path: String,
     status_message: Option<String>,
+    /// `list=1` index 24 ("date completed", unix seconds) on builds that report it; `0` when
+    /// the torrent never completed or the build predates the column.
+    date_completed: i64,
 }
 
 #[derive(Default, Deserialize)]
@@ -238,7 +241,7 @@ pub fn scryer_download_list_queue(_input: String) -> FnResult<String> {
     let items = list_torrents(&config)?
         .into_iter()
         .filter(|torrent| torrent.label == config.category)
-        .map(|torrent| torrent_to_item(&config, torrent))
+        .map(torrent_to_item)
         .collect::<Vec<_>>();
     Ok(serde_json::to_string(&PluginResult::Ok(items))?)
 }
@@ -248,7 +251,7 @@ pub fn scryer_download_list_history(_input: String) -> FnResult<String> {
     let items = list_torrents(&config)?
         .into_iter()
         .filter(|torrent| torrent.label == config.category)
-        .map(|torrent| torrent_to_item(&config, torrent))
+        .map(torrent_to_item)
         .collect::<Vec<_>>();
     Ok(serde_json::to_string(&PluginResult::Ok(items))?)
 }
@@ -791,10 +794,11 @@ fn map_torrent(values: Vec<serde_json::Value>) -> UTorrentTorrent {
             .map(value_string)
             .filter(|value| !value.is_empty()),
         root_download_path: values.get(26).map(value_string).unwrap_or_default(),
+        date_completed: values.get(24).and_then(value_i64).unwrap_or_default(),
     }
 }
 
-fn torrent_to_item(config: &UTorrentConfig, torrent: UTorrentTorrent) -> PluginDownloadItem {
+fn torrent_to_item(torrent: UTorrentTorrent) -> PluginDownloadItem {
     let state = map_state(&torrent);
     let output_path = if last_path_segment(&torrent.root_download_path) == torrent.name {
         torrent.root_download_path.clone()
@@ -824,6 +828,7 @@ fn torrent_to_item(config: &UTorrentConfig, torrent: UTorrentTorrent) -> PluginD
             upload_rate_bytes_per_second: Some(torrent.upload_speed),
             download_rate_bytes_per_second: Some(torrent.download_speed),
             seed_ratio: Some(torrent.ratio as f64 / 1000.0),
+            seed_time_seconds: seed_time_seconds(&torrent, now_unix_seconds()),
             raw_status: Some(torrent.status.to_string()),
             status_reason: torrent.status_message.clone(),
             ..PluginTorrentItem::default()
@@ -832,8 +837,9 @@ fn torrent_to_item(config: &UTorrentConfig, torrent: UTorrentTorrent) -> PluginD
         remaining_size_bytes: Some(torrent.remaining),
         eta_seconds: (torrent.eta != -1).then_some(torrent.eta),
         progress_percent: Some(((torrent.progress as f64 / 10.0).round().clamp(0.0, 100.0)) as u8),
-        can_move_files: Some(can_remove(config, &torrent)),
-        can_remove: Some(can_remove(config, &torrent)),
+        // Data completeness only; whether a move is safe while seeding is decided Scryer-side.
+        can_move_files: Some(is_completed(&torrent)),
+        can_remove: derive_can_remove(&torrent),
         removed: Some(false),
         raw_state: Some(torrent.status.to_string()),
         completed_at: None,
@@ -890,10 +896,40 @@ fn is_completed(torrent: &UTorrentTorrent) -> bool {
         && torrent.progress >= 1000
 }
 
-fn can_remove(config: &UTorrentConfig, torrent: &UTorrentTorrent) -> bool {
-    !config.post_import_category.is_empty()
-        && !status_has(torrent.status, STATUS_QUEUED)
-        && !status_has(torrent.status, STATUS_STARTED)
+/// Honest `can_remove` for uTorrent.
+///
+/// uTorrent's `list=1` payload carries no seeding limits (those live behind per-torrent
+/// `getprops`), so the only client-side fact available is whether uTorrent is still running
+/// the torrent. A stopped, fully downloaded torrent is no longer seeding, so removing it
+/// cannot interrupt seeding; anything uTorrent is still running is unfinished business, and
+/// a user-paused or queued torrent is unknowable.
+fn derive_can_remove(torrent: &UTorrentTorrent) -> Option<bool> {
+    if !is_completed(torrent) {
+        return Some(false);
+    }
+    if status_has(torrent.status, STATUS_STARTED) {
+        // Still being seeded under whatever limits uTorrent holds privately.
+        return Some(false);
+    }
+    if status_has(torrent.status, STATUS_PAUSED) || status_has(torrent.status, STATUS_QUEUED) {
+        // Paused/queued by the user or the queue manager, not by a seeding limit.
+        return None;
+    }
+    // Loaded but not started: uTorrent stopped the torrent, so it is no longer seeding.
+    Some(true)
+}
+
+/// Seconds spent seeding, derived from uTorrent's "date completed" column.
+fn seed_time_seconds(torrent: &UTorrentTorrent, now: i64) -> Option<i64> {
+    (is_completed(torrent) && torrent.date_completed > 0)
+        .then(|| now.saturating_sub(torrent.date_completed).max(0))
+}
+
+fn now_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
 }
 
 fn status_has(status: i64, flag: i64) -> bool {
@@ -1064,6 +1100,168 @@ fn connection_field(
 fn is_localhost_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     lower.contains("://localhost") || lower.contains("://127.0.0.1") || lower.contains("://[::1]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: i64 = 1_700_000_000;
+
+    fn completed_torrent(status: i64) -> UTorrentTorrent {
+        UTorrentTorrent {
+            hash: "ABCDEF0123456789ABCDEF0123456789ABCDEF01".to_string(),
+            status,
+            name: "Movie".to_string(),
+            size: 1_000,
+            progress: 1_000,
+            downloaded: 1_000,
+            uploaded: 1_500,
+            ratio: 1_500,
+            remaining: 0,
+            root_download_path: "/downloads".to_string(),
+            date_completed: NOW - 600,
+            ..UTorrentTorrent::default()
+        }
+    }
+
+    #[test]
+    fn can_remove_is_false_while_downloading() {
+        let torrent = UTorrentTorrent {
+            progress: 400,
+            remaining: 600,
+            ..completed_torrent(STATUS_LOADED | STATUS_CHECKED | STATUS_STARTED)
+        };
+        assert_eq!(derive_can_remove(&torrent), Some(false));
+    }
+
+    #[test]
+    fn can_remove_is_false_while_utorrent_is_still_seeding() {
+        let torrent = completed_torrent(STATUS_LOADED | STATUS_CHECKED | STATUS_STARTED);
+        assert_eq!(derive_can_remove(&torrent), Some(false));
+    }
+
+    #[test]
+    fn can_remove_is_true_once_utorrent_stopped_the_finished_torrent() {
+        let torrent = completed_torrent(STATUS_LOADED | STATUS_CHECKED);
+        assert_eq!(derive_can_remove(&torrent), Some(true));
+    }
+
+    #[test]
+    fn can_remove_is_unknown_for_paused_or_queued_torrents() {
+        let paused = completed_torrent(STATUS_LOADED | STATUS_CHECKED | STATUS_PAUSED);
+        let queued = completed_torrent(STATUS_LOADED | STATUS_CHECKED | STATUS_QUEUED);
+        assert_eq!(derive_can_remove(&paused), None);
+        assert_eq!(derive_can_remove(&queued), None);
+    }
+
+    #[test]
+    fn can_move_files_tracks_data_completeness_not_seeding() {
+        let torrent = completed_torrent(STATUS_LOADED | STATUS_CHECKED | STATUS_STARTED);
+        let item = torrent_to_item(torrent);
+        assert_eq!(item.can_move_files, Some(true));
+        assert_eq!(item.can_remove, Some(false));
+    }
+
+    #[test]
+    fn seed_time_is_derived_from_the_completion_timestamp() {
+        let torrent = completed_torrent(STATUS_LOADED | STATUS_CHECKED | STATUS_STARTED);
+        assert_eq!(seed_time_seconds(&torrent, NOW), Some(600));
+        let never_completed = UTorrentTorrent {
+            date_completed: 0,
+            ..torrent
+        };
+        assert_eq!(seed_time_seconds(&never_completed, NOW), None);
+    }
+
+    #[test]
+    fn is_private_is_never_claimed_because_utorrent_does_not_report_it() {
+        let torrent = completed_torrent(STATUS_LOADED | STATUS_CHECKED);
+        assert_eq!(torrent_to_item(torrent).torrent.unwrap().is_private, None);
+    }
+
+    #[test]
+    fn observed_ratio_is_reported_in_whole_units() {
+        let torrent = completed_torrent(STATUS_LOADED | STATUS_CHECKED);
+        assert_eq!(
+            torrent_to_item(torrent).torrent.unwrap().seed_ratio,
+            Some(1.5)
+        );
+    }
+
+    #[test]
+    fn list_row_maps_the_date_completed_column() {
+        let mut row: Vec<serde_json::Value> = (0..27).map(|_| serde_json::json!(0)).collect();
+        row[0] = serde_json::json!("ABCDEF0123456789ABCDEF0123456789ABCDEF01");
+        row[1] = serde_json::json!(STATUS_LOADED | STATUS_CHECKED);
+        row[2] = serde_json::json!("Movie");
+        row[24] = serde_json::json!(1_699_999_000_i64);
+        row[26] = serde_json::json!("/downloads");
+        let torrent = map_torrent(row);
+        assert_eq!(torrent.date_completed, 1_699_999_000);
+    }
+}
+
+#[cfg(test)]
+mod extism_host_stubs {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn alloc(_len: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn config_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_headers() -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_request(_request: u64, _body: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_status_code() -> u64 {
+        200
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length_unsafe(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u64(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u8(_offset: u64) -> u8 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u64(_offset: u64, _value: u64) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u8(_offset: u64, _value: u8) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_set(_ptr: u64, _value: u64) {}
 }
 
 scryer_plugin_pdk::scryer_download_client_bridge_main!(
