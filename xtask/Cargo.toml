@@ -25,13 +25,12 @@ wasmtime-wasi = "47.0.0"
 zstd = "0.13"
 
 [dev-dependencies]
-aws-lc-sys = "0.43"
+aws-lc-sys = "0.44"
 crc32fast = "1"
 sevenz-rust2 = { version = "0.21", default-features = false, features = ["compress"] }
 zip = { version = "8.0.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [profile.xtask-release]
-inherits = "release"
-codegen-units = 64
-lto = false
-opt-level = "s"
+inherits = "dev"
+debug = 0
+incremental = false

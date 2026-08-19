@@ -453,6 +453,21 @@ fn map_torrent(raw: Vec<serde_json::Value>) -> Option<HadoukenTorrent> {
     })
 }
 
+fn eta_seconds(remaining: i64, download_rate: i64) -> Option<i64> {
+    (download_rate > 0).then(|| remaining / download_rate)
+}
+
+#[cfg(test)]
+mod eta_seconds_tests {
+    use super::eta_seconds;
+
+    #[test]
+    fn zero_rate_does_not_evaluate_the_division() {
+        assert_eq!(eta_seconds(10, 0), None);
+        assert_eq!(eta_seconds(10, 2), Some(5));
+    }
+}
+
 fn torrent_to_item(torrent: HadoukenTorrent) -> PluginDownloadItem {
     let remaining = (torrent.total_size - torrent.downloaded_bytes).max(0);
     let state = map_state(&torrent);
@@ -490,8 +505,7 @@ fn torrent_to_item(torrent: HadoukenTorrent) -> PluginDownloadItem {
         }),
         total_size_bytes: Some(torrent.total_size),
         remaining_size_bytes: Some(remaining),
-        // `then_some` would evaluate the division eagerly and trap on idle/seeding torrents.
-        eta_seconds: (torrent.download_rate > 0).then(|| remaining / torrent.download_rate),
+        eta_seconds: eta_seconds(remaining, torrent.download_rate),
         progress_percent: Some(((torrent.progress / 10.0).round().clamp(0.0, 100.0)) as u8),
         // Data completeness only; whether a move is safe while seeding is decided Scryer-side.
         can_move_files: Some(torrent.is_finished),

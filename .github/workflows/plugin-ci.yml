@@ -45,20 +45,20 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: rustfmt
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Check formatting
-        run: cargo run --locked --manifest-path xtask/Cargo.toml -- ci fmt
+        run: cargo run --locked --profile xtask-release --manifest-path xtask/Cargo.toml -- ci fmt
 
   clippy:
     needs: plan
     name: clippy (${{ matrix.plugin_id || 'not-needed' }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.plugin_matrix) }}
@@ -70,99 +70,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: ${{ matrix.plugin_id != '' }}
 
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         if: ${{ matrix.plugin_id != '' }}
         with:
           components: clippy
+          targets: wasm32-wasip1
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: ${{ matrix.plugin_id != '' }}
 
       - name: Run strict clippy
         if: ${{ matrix.plugin_id != '' }}
-        run: cargo run --locked --manifest-path xtask/Cargo.toml -- ci clippy --plugin-id "${{ matrix.plugin_id }}"
-
-  clippy-xtask:
-    needs: plan
-    if: ${{ needs.plan.outputs.mode == 'full' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          components: clippy
-
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-
-      - name: Install Clippy for the active toolchain
-        run: rustup component add clippy --toolchain "$(rustup show active-toolchain | awk '{print $1}')"
-
-      - name: Run strict clippy for xtask
-        run: cargo clippy --all-targets --all-features --locked --manifest-path xtask/Cargo.toml -- -D warnings
-
-  audit:
-    needs: plan
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: No Rust changes require an audit
-        if: ${{ needs.plan.outputs.mode == 'none' }}
-        run: echo "No plugin or shared Rust changes detected."
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ needs.plan.outputs.mode != 'none' }}
-
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        if: ${{ needs.plan.outputs.mode != 'none' }}
-
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        if: ${{ needs.plan.outputs.mode != 'none' }}
-
-      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
-        if: ${{ needs.plan.outputs.mode != 'none' }}
-        with:
-          tool: cargo-audit
-
-      - name: Run cargo audit
-        if: ${{ needs.plan.outputs.mode != 'none' }}
-        env:
-          CI_SCOPE: ${{ needs.plan.outputs.mode }}
-          CI_PLUGIN_IDS: ${{ needs.plan.outputs.plugin_ids }}
-        run: |
-          scope_args=()
-          if [[ "$CI_SCOPE" == "scoped" ]]; then
-            IFS=',' read -r -a plugin_ids <<< "$CI_PLUGIN_IDS"
-            for plugin_id in "${plugin_ids[@]}"; do
-              scope_args+=(--plugin-id "$plugin_id")
-            done
-          fi
-          cargo run --locked --manifest-path xtask/Cargo.toml -- ci audit "${scope_args[@]}"
-
-  wasm-validate:
-    needs: plan
-    name: wasm-validate (${{ matrix.plugin_id || 'not-needed' }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.plan.outputs.plugin_matrix) }}
-    steps:
-      - name: No Rust changes require Wasm validation
-        if: ${{ matrix.plugin_id == '' }}
-        run: echo "No plugin or shared Rust changes detected."
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ matrix.plugin_id != '' }}
-
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        if: ${{ matrix.plugin_id != '' }}
-        with:
-          targets: wasm32-wasip1
-
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        if: ${{ matrix.plugin_id != '' }}
+        run: cargo run --locked --profile xtask-release --manifest-path xtask/Cargo.toml -- ci clippy --plugin-id "${{ matrix.plugin_id }}"
 
       - name: Install WASI SDK for enhanced subtitle sync
         if: ${{ matrix.plugin_id == 'enhanced-subtitle-sync' }}
@@ -193,8 +112,66 @@ jobs:
 
       - name: Prefetch plugin release dependencies
         if: ${{ matrix.plugin_id != '' }}
-        run: cargo run --locked --manifest-path xtask/Cargo.toml -- official prefetch "${{ matrix.plugin_id }}"
+        run: cargo run --locked --profile xtask-release --manifest-path xtask/Cargo.toml -- official prefetch "${{ matrix.plugin_id }}"
 
       - name: Validate official plugins through the release Wasm path
         if: ${{ matrix.plugin_id != '' }}
-        run: cargo run --locked --manifest-path xtask/Cargo.toml -- plugin validate-all --plugin-id "${{ matrix.plugin_id }}"
+        run: cargo run --locked --profile xtask-release --manifest-path xtask/Cargo.toml -- plugin validate-all --plugin-id "${{ matrix.plugin_id }}"
+
+  clippy-xtask:
+    needs: plan
+    if: ${{ needs.plan.outputs.mode == 'full' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install Clippy for the active toolchain
+        run: rustup component add clippy --toolchain "$(rustup show active-toolchain | awk '{print $1}')"
+
+      - name: Run strict clippy for xtask
+        run: cargo clippy --profile xtask-release --all-targets --all-features --locked --manifest-path xtask/Cargo.toml -- -D warnings
+
+  audit:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: No Rust changes require an audit
+        if: ${{ needs.plan.outputs.mode == 'none' }}
+        run: echo "No plugin or shared Rust changes detected."
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ needs.plan.outputs.mode != 'none' }}
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        if: ${{ needs.plan.outputs.mode != 'none' }}
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: ${{ needs.plan.outputs.mode != 'none' }}
+
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        if: ${{ needs.plan.outputs.mode != 'none' }}
+        with:
+          tool: cargo-audit
+
+      - name: Run cargo audit
+        if: ${{ needs.plan.outputs.mode != 'none' }}
+        env:
+          CI_SCOPE: ${{ needs.plan.outputs.mode }}
+          CI_PLUGIN_IDS: ${{ needs.plan.outputs.plugin_ids }}
+        run: |
+          scope_args=()
+          if [[ "$CI_SCOPE" == "scoped" ]]; then
+            IFS=',' read -r -a plugin_ids <<< "$CI_PLUGIN_IDS"
+            for plugin_id in "${plugin_ids[@]}"; do
+              scope_args+=(--plugin-id "$plugin_id")
+            done
+          fi
+          cargo run --locked --profile xtask-release --manifest-path xtask/Cargo.toml -- ci audit "${scope_args[@]}"

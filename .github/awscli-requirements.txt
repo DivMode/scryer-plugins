@@ -1,12 +1,15 @@
 # Generated for Ubuntu 24.04 (CPython 3.12) release runners.
 # Regenerate with hashes whenever AWS CLI is intentionally upgraded.
-awscli==1.45.63 \
-    --hash=sha256:05c9722616587f1df81c657b3d8b0fcec31a4a0da8679d93e03006b67005329b
-botocore==1.43.63 \
-    --hash=sha256:8deed86feacc8f8d2491f1d170562af191f8b33924052d834f4217d5d797e5a9
+awscli==1.46.0 \
+    --hash=sha256:0aa98754c23c7eff4c7d970cb619670dc9b0214ee451bb3fe88e74e4a9a03a90 \
+    --hash=sha256:5c1bd660bd3f967f5754a2267fb54e81edf379374faa27973671561888d39bf6
+botocore==1.43.73 \
+    --hash=sha256:068433028e011ccbeab1dd7c46b1090c24e378397693c66e67ca571176498daa \
+    --hash=sha256:0fa1e63c24b3531be3e1bc1687a88b3be9e63a430153f24edd93efc162bb1c51
 colorama==0.4.6 \
     --hash=sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6
 docutils==0.19 \
+    --hash=sha256:33995a6753c30b7f577febfc2c50411fec6aac7f7ffeb7c4cfe5991072dcf9e6 \
     --hash=sha256:5e1de4d849fee02c63b040a4a3fd567f4ab104defd8a5511fbbc24a8a017efbc
 jmespath==1.1.0 \
     --hash=sha256:a5663118de4908c91729bea0acadca56526eb2698e83de10cd116ae0f4e97c64
@@ -17,7 +20,8 @@ python-dateutil==2.9.0.post0 \
 PyYAML==6.0.3 \
     --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc
 rsa==4.7.2 \
-    --hash=sha256:78f9a9bf4e7be0c5ded4583326e7461e3a3c5aae24073648b4bdfa797d78c9d2
+    --hash=sha256:78f9a9bf4e7be0c5ded4583326e7461e3a3c5aae24073648b4bdfa797d78c9d2 \
+    --hash=sha256:9d689e6ca1b3038bc82bf8d23e944b6b6037bc02301a574935b2dd946e0353b9
 s3transfer==0.19.2 \
     --hash=sha256:d8168eccca828cbb2cd573675333f3bddd254313a9c42494b84c76b539e8ba25
 six==1.17.0 \

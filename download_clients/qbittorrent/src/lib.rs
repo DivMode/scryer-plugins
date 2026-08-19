@@ -541,11 +541,10 @@ fn handle_download_control(
     let config = QbittorrentConfig::from_extism()?;
 
     match request.action {
-        DownloadControlAction::Pause => {
-            post_form(&config, "/torrents/pause", &[("hashes".to_string(), hash)])?
-        }
-        DownloadControlAction::Resume => {
-            post_form(&config, "/torrents/resume", &[("hashes".to_string(), hash)])?
+        DownloadControlAction::Pause | DownloadControlAction::Resume => {
+            let version = get_text(&config, "/app/version")?;
+            let endpoint = control_endpoint(request.action, &version);
+            post_form(&config, endpoint, &[("hashes".to_string(), hash)])?
         }
         DownloadControlAction::Remove => post_form(
             &config,
@@ -566,6 +565,24 @@ fn handle_download_control(
     }
 
     Ok(PluginResult::Ok(()))
+}
+
+fn control_endpoint(action: DownloadControlAction, version: &str) -> &'static str {
+    let is_v5_or_newer = version
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u64>().ok())
+        .is_some_and(|major| major >= 5);
+
+    match (action, is_v5_or_newer) {
+        (DownloadControlAction::Pause, true) => "/torrents/stop",
+        (DownloadControlAction::Resume, true) => "/torrents/start",
+        (DownloadControlAction::Pause, false) => "/torrents/pause",
+        (DownloadControlAction::Resume, false) => "/torrents/resume",
+        _ => unreachable!("control endpoint requested for unsupported action"),
+    }
 }
 
 pub fn scryer_download_mark_imported(input: String) -> FnResult<String> {
@@ -2241,7 +2258,10 @@ fn map_state(state: &str) -> DownloadItemState {
         "pausedup" | "stoppedup" | "queuedup" | "stalledup" | "uploading" | "forcedup" => {
             DownloadItemState::Completed
         }
-        "error" | "missingfiles" => DownloadItemState::Failed,
+        // qBittorrent uses these states for recoverable client-side conditions.
+        // Keep the torrent visible for operator diagnosis instead of triggering
+        // Scryer's failed-download cleanup flow.
+        "error" | "missingfiles" => DownloadItemState::Warning,
         "unknown" => DownloadItemState::Error,
         _ => DownloadItemState::Warning,
     }
@@ -2437,10 +2457,10 @@ mod tests {
     }
 
     #[test]
-    fn state_mapping_handles_completed_states() {
+    fn state_mapping_handles_completed_and_warning_states() {
         assert_eq!(map_state("pausedUP"), DownloadItemState::Completed);
         assert_eq!(map_state("moving"), DownloadItemState::ImportPending);
-        assert_eq!(map_state("missingFiles"), DownloadItemState::Failed);
+        assert_eq!(map_state("missingFiles"), DownloadItemState::Warning);
     }
 
     #[test]
@@ -2915,6 +2935,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn control_endpoints_preserve_qbittorrent_4_behavior() {
+        assert_eq!(
+            control_endpoint(DownloadControlAction::Pause, "4.6.7"),
+            "/torrents/pause"
+        );
+        assert_eq!(
+            control_endpoint(DownloadControlAction::Resume, "v4.6.7"),
+            "/torrents/resume"
+        );
+    }
+
+    #[test]
+    fn control_endpoints_use_qbittorrent_5_names() {
+        assert_eq!(
+            control_endpoint(DownloadControlAction::Pause, "5.0.0"),
+            "/torrents/stop"
+        );
+        assert_eq!(
+            control_endpoint(DownloadControlAction::Resume, "v5.1.2"),
+            "/torrents/start"
+        );
+    }
+
+    #[test]
+    fn control_endpoints_fall_back_to_qbittorrent_4_names_for_unknown_versions() {
+        assert_eq!(
+            control_endpoint(DownloadControlAction::Pause, "development build"),
+            "/torrents/pause"
+        );
+        assert_eq!(
+            control_endpoint(DownloadControlAction::Resume, ""),
+            "/torrents/resume"
+        );
+    }
+
     fn test_add_request(kind: DownloadInputKind) -> PluginDownloadClientAddRequest {
         serde_json::from_value(serde_json::json!({
             "source": { "kind": kind },
@@ -3260,6 +3316,13 @@ mod tests {
         assert_eq!(torrent.inactive_seeding_time_limit, Some(-2));
         assert_eq!(torrent.last_activity, Some(1_699_999_000));
         assert_eq!(derive_can_remove(&torrent, None, NOW), Some(true));
+    }
+
+    #[test]
+    fn qbit_error_states_remain_warnings_and_do_not_trigger_failed_download_cleanup() {
+        assert_eq!(map_state("error"), DownloadItemState::Warning);
+        assert_eq!(map_state("downloading"), DownloadItemState::Downloading);
+        assert_eq!(map_state("uploading"), DownloadItemState::Completed);
     }
 }
 

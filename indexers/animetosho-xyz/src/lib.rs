@@ -7,7 +7,7 @@ use newznab_common::{
     IndexerProtocol, IndexerResponseFeatures, IndexerSearchInput, IndexerSourceKind,
     IndexerTorrentCapabilities, MetadataExtractor, NewznabConfig, NewznabHttpBehavior,
     PluginDescriptor, PluginResult, ProviderDescriptor, SDK_VERSION, SearchRequest, SearchResponse,
-    current_sdk_constraint, execute_raw_search, extract_base_metadata,
+    current_sdk_constraint, execute_full_search, extract_base_metadata,
 };
 use scryer_plugin_sdk::{ConfigFieldOption, ConfigFieldValueSource};
 
@@ -163,7 +163,7 @@ pub fn scryer_indexer_search(input: String) -> FnResult<String> {
 
     let mode = DownloadMode::from_config()?;
     let config = animetosho_config(mode)?;
-    let mut response = execute_raw_search(&config, &req, mode.extractor())?;
+    let mut response = execute_full_search(&config, &req, mode.extractor())?;
     annotate_response(&mut response, mode);
     Ok(serde_json::to_string(&PluginResult::Ok(response))?)
 }
