@@ -566,6 +566,21 @@ fn resolve_numeric_id(
         .map(|item| item.id))
 }
 
+fn eta_seconds(remaining: i64, transferred_speed: i64) -> Option<i64> {
+    (transferred_speed > 0).then(|| remaining / transferred_speed)
+}
+
+#[cfg(test)]
+mod eta_seconds_tests {
+    use super::eta_seconds;
+
+    #[test]
+    fn zero_speed_does_not_evaluate_the_division() {
+        assert_eq!(eta_seconds(10, 0), None);
+        assert_eq!(eta_seconds(10, 2), Some(5));
+    }
+}
+
 fn map_queue_item(
     config: &NzbVortexConfig,
     item: VortexQueueItem,
@@ -588,7 +603,7 @@ fn map_queue_item(
         torrent: None,
         total_size_bytes: Some(item.total_download_size),
         remaining_size_bytes: Some(remaining),
-        eta_seconds: (item.transferred_speed > 0).then_some(remaining / item.transferred_speed),
+        eta_seconds: eta_seconds(remaining, item.transferred_speed),
         progress_percent: Some(progress),
         can_move_files: Some(true),
         can_remove: Some(true),
