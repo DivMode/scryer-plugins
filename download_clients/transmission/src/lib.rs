@@ -1091,7 +1091,9 @@ fn idle_limit_state(session: &SessionConfig, torrent: &TransmissionTorrent) -> S
         // unverifiable.
         0 if session.idle_seeding_limit_enabled.unwrap_or(false) => {
             match session.idle_seeding_limit {
-                Some(limit) if (is_stopped || is_seeding) && torrent.seconds_seeding > limit * 60 => {
+                Some(limit)
+                    if (is_stopped || is_seeding) && torrent.seconds_seeding > limit * 60 =>
+                {
                     SeedLimitState::Met
                 }
                 Some(_) => SeedLimitState::Unmet,
