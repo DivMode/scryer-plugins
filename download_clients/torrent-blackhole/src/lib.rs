@@ -471,8 +471,13 @@ fn entry_to_item(config: &BlackholeConfig, entry: WatchFolderEntry) -> PluginDow
         remaining_size_bytes: remaining_grace_seconds.map(|_| size).or(Some(0)),
         eta_seconds: remaining_grace_seconds.or(Some(0)),
         progress_percent: if completed { Some(100) } else { None },
-        can_move_files: Some(!config.read_only),
-        can_remove: Some(!config.read_only),
+        // The watch folder is served by an external client this plugin cannot see, so it can
+        // never prove seeding has finished. `Remove` here deletes the payload from disk, which
+        // would pull data out from under a still-seeding client — hence `None` (unknowable)
+        // rather than a guessed `true`. `can_move_files` additionally waits for the entry to
+        // settle so a still-being-written download is never moved.
+        can_move_files: Some(completed && !config.read_only),
+        can_remove: None,
         removed: Some(false),
         raw_state: Some(if completed {
             "completed".to_string()
@@ -631,6 +636,120 @@ fn field(
         options: vec![],
         help_text: help_text.map(str::to_string),
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(read_only: bool) -> BlackholeConfig {
+        BlackholeConfig {
+            torrent_folder: "/blackhole/torrents".to_string(),
+            watch_folder: "/blackhole/done".to_string(),
+            save_magnet_files: false,
+            magnet_file_extension: ".magnet".to_string(),
+            read_only,
+        }
+    }
+
+    fn entry(remaining_grace_seconds: Option<i64>) -> WatchFolderEntry {
+        WatchFolderEntry {
+            path: PathBuf::from("/blackhole/done/Movie"),
+            remaining_grace_seconds,
+        }
+    }
+
+    #[test]
+    fn can_remove_is_always_unknown_because_seeding_happens_outside_the_plugin() {
+        assert_eq!(entry_to_item(&config(false), entry(None)).can_remove, None);
+        assert_eq!(entry_to_item(&config(true), entry(None)).can_remove, None);
+        assert_eq!(
+            entry_to_item(&config(false), entry(Some(12))).can_remove,
+            None
+        );
+    }
+
+    #[test]
+    fn can_move_files_waits_for_the_entry_to_settle() {
+        assert_eq!(
+            entry_to_item(&config(false), entry(Some(12))).can_move_files,
+            Some(false)
+        );
+        assert_eq!(
+            entry_to_item(&config(false), entry(None)).can_move_files,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn read_only_blackholes_never_offer_to_move_files() {
+        assert_eq!(
+            entry_to_item(&config(true), entry(None)).can_move_files,
+            Some(false)
+        );
+    }
+}
+
+#[cfg(test)]
+mod extism_host_stubs {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn alloc(_len: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn config_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_headers() -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_request(_request: u64, _body: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_status_code() -> u64 {
+        200
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length_unsafe(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u64(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u8(_offset: u64) -> u8 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u64(_offset: u64, _value: u64) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u8(_offset: u64, _value: u8) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_set(_ptr: u64, _value: u64) {}
 }
 
 scryer_plugin_pdk::scryer_download_client_bridge_main!(

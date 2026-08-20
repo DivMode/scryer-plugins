@@ -638,11 +638,9 @@ fn torrent_to_item(torrent: Aria2Status) -> PluginDownloadItem {
     } else {
         None
     };
-    let ratio = if torrent.total_length > 0 {
-        Some(torrent.upload_length as f64 / torrent.total_length as f64)
-    } else {
-        None
-    };
+    let ratio = observed_ratio(&torrent);
+    let can_remove = derive_can_remove(&torrent);
+    let can_move_files = Some(is_data_complete(&torrent));
     let remote_output_path = get_output_path(&torrent);
 
     PluginDownloadItem {
@@ -672,8 +670,9 @@ fn torrent_to_item(torrent: Aria2Status) -> PluginDownloadItem {
         remaining_size_bytes: Some(remaining),
         eta_seconds: eta,
         progress_percent,
-        can_move_files: Some(false),
-        can_remove: Some(torrent.status == "complete"),
+        // Data completeness only; whether a move is safe while seeding is decided Scryer-side.
+        can_move_files,
+        can_remove,
         removed: Some(torrent.status == "removed"),
         raw_state: Some(torrent.status),
         completed_at: None,
@@ -756,6 +755,32 @@ fn longest_common_content_path(paths: &[String]) -> Option<String> {
         common = separator.to_string();
     }
     Some(common)
+}
+
+/// Whether the payload is fully downloaded and therefore movable.
+fn is_data_complete(torrent: &Aria2Status) -> bool {
+    torrent.status == "complete"
+        || (torrent.total_length > 0 && torrent.completed_length >= torrent.total_length)
+}
+
+/// Honest `can_remove` for aria2.
+///
+/// aria2 keeps a BitTorrent download `active` while it is seeding and only moves it to
+/// `complete` once seeding has stopped (`--seed-ratio` / `--seed-time` reached, or seeding
+/// disabled). Those option values are not part of `tellStatus`, so the seeding goal of a
+/// still-active torrent is unknowable here and Scryer-side evaluation decides.
+fn derive_can_remove(torrent: &Aria2Status) -> Option<bool> {
+    match torrent.status.as_str() {
+        "complete" => Some(true),
+        _ if is_data_complete(torrent) => None,
+        _ => Some(false),
+    }
+}
+
+/// Observed share ratio: uploaded over what has actually been downloaded so far.
+fn observed_ratio(torrent: &Aria2Status) -> Option<f64> {
+    (torrent.completed_length > 0)
+        .then(|| torrent.upload_length as f64 / torrent.completed_length as f64)
 }
 
 fn map_state(torrent: &Aria2Status) -> DownloadItemState {
@@ -940,6 +965,135 @@ fn connection_field(
 fn is_localhost_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     lower.contains("://localhost") || lower.contains("://127.0.0.1") || lower.contains("://[::1]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(status: &str, completed: i64) -> Aria2Status {
+        Aria2Status {
+            bittorrent_name: Some("Movie".to_string()),
+            info_hash: Some("abcdef0123456789abcdef0123456789abcdef01".to_string()),
+            completed_length: completed,
+            download_speed: 0,
+            files: vec!["/downloads/Movie/Movie.mkv".to_string()],
+            gid: "2089b05ecca3d829".to_string(),
+            status: status.to_string(),
+            total_length: 1_000,
+            upload_length: 2_000,
+            error_message: None,
+        }
+    }
+
+    #[test]
+    fn can_remove_is_false_while_downloading() {
+        let torrent = status("active", 400);
+        assert_eq!(derive_can_remove(&torrent), Some(false));
+        assert!(!is_data_complete(&torrent));
+    }
+
+    #[test]
+    fn can_remove_is_unknown_while_aria2_is_still_seeding() {
+        // aria2 leaves a fully downloaded torrent `active` while it seeds, and the
+        // seed-ratio/seed-time options are not part of tellStatus.
+        let torrent = status("active", 1_000);
+        assert_eq!(derive_can_remove(&torrent), None);
+    }
+
+    #[test]
+    fn can_remove_is_true_once_aria2_reports_complete() {
+        assert_eq!(derive_can_remove(&status("complete", 1_000)), Some(true));
+    }
+
+    #[test]
+    fn can_remove_is_unknown_for_a_paused_complete_download() {
+        assert_eq!(derive_can_remove(&status("paused", 1_000)), None);
+    }
+
+    #[test]
+    fn can_move_files_tracks_data_completeness_not_seeding() {
+        let item = torrent_to_item(status("active", 1_000));
+        assert_eq!(item.can_move_files, Some(true));
+        assert_eq!(item.can_remove, None);
+
+        let downloading = torrent_to_item(status("active", 400));
+        assert_eq!(downloading.can_move_files, Some(false));
+    }
+
+    #[test]
+    fn observed_ratio_uses_completed_length() {
+        assert_eq!(observed_ratio(&status("active", 1_000)), Some(2.0));
+        assert_eq!(observed_ratio(&status("active", 0)), None);
+    }
+
+    #[test]
+    fn is_private_is_never_claimed_because_aria2_does_not_report_it() {
+        let item = torrent_to_item(status("complete", 1_000));
+        assert_eq!(item.torrent.unwrap().is_private, None);
+    }
+}
+
+#[cfg(test)]
+mod extism_host_stubs {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn alloc(_len: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn config_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_headers() -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_request(_request: u64, _body: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_status_code() -> u64 {
+        200
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length_unsafe(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u64(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u8(_offset: u64) -> u8 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u64(_offset: u64, _value: u64) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u8(_offset: u64, _value: u8) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_set(_ptr: u64, _value: u64) {}
 }
 
 scryer_plugin_pdk::scryer_download_client_bridge_main!(

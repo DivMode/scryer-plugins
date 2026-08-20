@@ -453,8 +453,8 @@ fn map_torrent(raw: Vec<serde_json::Value>) -> Option<HadoukenTorrent> {
     })
 }
 
-fn eta_seconds(total_size: i64, download_rate: i64) -> Option<i64> {
-    (download_rate > 0).then(|| total_size / download_rate)
+fn eta_seconds(remaining: i64, download_rate: i64) -> Option<i64> {
+    (download_rate > 0).then(|| remaining / download_rate)
 }
 
 #[cfg(test)]
@@ -505,10 +505,11 @@ fn torrent_to_item(torrent: HadoukenTorrent) -> PluginDownloadItem {
         }),
         total_size_bytes: Some(torrent.total_size),
         remaining_size_bytes: Some(remaining),
-        eta_seconds: eta_seconds(torrent.total_size, torrent.download_rate),
+        eta_seconds: eta_seconds(remaining, torrent.download_rate),
         progress_percent: Some(((torrent.progress / 10.0).round().clamp(0.0, 100.0)) as u8),
-        can_move_files: Some(torrent.is_finished && torrent.state == HadoukenState::Paused),
-        can_remove: Some(torrent.is_finished && torrent.state == HadoukenState::Paused),
+        // Data completeness only; whether a move is safe while seeding is decided Scryer-side.
+        can_move_files: Some(torrent.is_finished),
+        can_remove: derive_can_remove(&torrent),
         removed: Some(false),
         raw_state: Some(format!("{:?}", torrent.state)),
         completed_at: None,
@@ -533,6 +534,20 @@ fn torrent_to_completed(torrent: HadoukenTorrent) -> PluginCompletedDownload {
         size_bytes: Some(torrent.total_size),
         completed_at: None,
         parameters: Vec::new(),
+    }
+}
+
+/// Honest `can_remove` for Hadouken.
+///
+/// Hadouken's `webui.list` payload carries no seeding limits and no client-side "seeding
+/// finished" signal — a paused, finished torrent is just as likely to have been paused by the
+/// user. The plugin therefore never claims a finished torrent is done seeding; Scryer-side
+/// goal evaluation decides.
+fn derive_can_remove(torrent: &HadoukenTorrent) -> Option<bool> {
+    if torrent.is_finished {
+        None
+    } else {
+        Some(false)
     }
 }
 
@@ -709,6 +724,146 @@ fn connection_field(
 fn is_localhost_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     lower.contains("://localhost") || lower.contains("://127.0.0.1") || lower.contains("://[::1]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn torrent(state: HadoukenState, progress: f64) -> HadoukenTorrent {
+        HadoukenTorrent {
+            info_hash: "ABCDEF0123456789ABCDEF0123456789ABCDEF01".to_string(),
+            progress,
+            name: "Movie".to_string(),
+            label: String::new(),
+            save_path: "/downloads".to_string(),
+            state,
+            is_finished: progress >= 1000.0,
+            total_size: 1_000,
+            downloaded_bytes: 1_000,
+            uploaded_bytes: 1_500,
+            download_rate: 0,
+            error: String::new(),
+        }
+    }
+
+    #[test]
+    fn can_remove_is_false_while_downloading() {
+        assert_eq!(
+            derive_can_remove(&torrent(HadoukenState::Downloading, 400.0)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_unknown_for_finished_torrents_seeding_or_paused() {
+        assert_eq!(
+            derive_can_remove(&torrent(HadoukenState::Downloading, 1000.0)),
+            None
+        );
+        assert_eq!(
+            derive_can_remove(&torrent(HadoukenState::Paused, 1000.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn can_move_files_tracks_data_completeness_not_seeding() {
+        let item = torrent_to_item(torrent(HadoukenState::Downloading, 1000.0));
+        assert_eq!(item.can_move_files, Some(true));
+        assert_eq!(item.can_remove, None);
+    }
+
+    #[test]
+    fn item_mapping_does_not_trap_on_a_zero_download_rate() {
+        // A seeding torrent reports downRate 0; eager division used to trap the plugin.
+        let item = torrent_to_item(torrent(HadoukenState::Downloading, 1000.0));
+        assert_eq!(item.eta_seconds, None);
+    }
+
+    #[test]
+    fn is_private_is_never_claimed_because_hadouken_does_not_report_it() {
+        let item = torrent_to_item(torrent(HadoukenState::Paused, 1000.0));
+        assert_eq!(item.torrent.unwrap().is_private, None);
+    }
+
+    #[test]
+    fn observed_ratio_is_uploaded_over_downloaded() {
+        let item = torrent_to_item(torrent(HadoukenState::Paused, 1000.0));
+        assert_eq!(item.torrent.unwrap().seed_ratio, Some(1.5));
+    }
+
+    #[test]
+    fn eta_uses_remaining_bytes_not_total_size() {
+        let mut half_done = torrent(HadoukenState::Downloading, 500.0);
+        half_done.downloaded_bytes = 600;
+        half_done.download_rate = 100;
+        // remaining = 1000 - 600 = 400 → 4s at 100 B/s (total_size would give 10s).
+        let item = torrent_to_item(half_done);
+        assert_eq!(item.eta_seconds, Some(4));
+    }
+}
+
+#[cfg(test)]
+mod extism_host_stubs {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn alloc(_len: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn config_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_headers() -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_request(_request: u64, _body: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_status_code() -> u64 {
+        200
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length_unsafe(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u64(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u8(_offset: u64) -> u8 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u64(_offset: u64, _value: u64) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u8(_offset: u64, _value: u8) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_set(_ptr: u64, _value: u64) {}
 }
 
 scryer_plugin_pdk::scryer_download_client_bridge_main!(

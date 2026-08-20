@@ -266,13 +266,14 @@ fn scryer_download_list_queue_inner() -> FnResult<String> {
 
 pub fn scryer_download_list_completed(_input: String) -> FnResult<String> {
     let config = TriblerConfig::from_extism()?;
-    let settings = get_settings(&config)?;
     let downloads = get_downloads(&config)?
         .into_iter()
         .filter(is_visible_download)
+        // Completed downloads are those whose data is fully present; waiting for the seeding
+        // goal here would keep finished payloads out of import indefinitely.
         .filter(|download| {
             matches!(download.status.as_deref(), Some("SEEDING" | "STOPPED"))
-                && has_reached_seed_limit(download, &settings.lib_torrent.download_defaults)
+                && is_data_complete(download)
         })
         .map(|download| torrent_to_completed(&config, download))
         .collect::<Result<Vec<_>, _>>()?;
@@ -546,7 +547,13 @@ fn torrent_to_item(
     let remaining = ((size as f64) * (1.0 - progress)).round().max(0.0) as i64;
     let state = map_state(&download);
     let hash = normalize_hash(&download.infohash);
-    let can_remove = has_reached_seed_limit(&download, &settings.lib_torrent.download_defaults);
+    let can_remove = derive_can_remove(
+        &download,
+        &settings.lib_torrent.download_defaults,
+        state,
+        current_unix_seconds(),
+    );
+    let can_move_files = Some(is_data_complete(&download));
     Ok(PluginDownloadItem {
         client_item_id: hash.clone(),
         download_id: None,
@@ -576,8 +583,9 @@ fn torrent_to_item(
             .eta
             .map(|value| value.clamp(0.0, 31_536_000.0) as i64),
         progress_percent: Some((progress * 100.0).round().clamp(0.0, 100.0) as u8),
-        can_move_files: Some(can_remove),
-        can_remove: Some(can_remove),
+        // Data completeness only; whether a move is safe while seeding is decided Scryer-side.
+        can_move_files,
+        can_remove,
         removed: Some(false),
         raw_state: download.status,
         completed_at: None,
@@ -643,22 +651,47 @@ fn map_state(download: &TriblerDownload) -> DownloadItemState {
     }
 }
 
-fn has_reached_seed_limit(download: &TriblerDownload, defaults: &DownloadDefaults) -> bool {
-    if download.status.as_deref() != Some("STOPPED") {
-        return false;
+/// Honest `can_remove` for Tribler.
+///
+/// Tribler has no per-download seeding limit; the only goal it enforces is the global
+/// `seeding_mode` in its libtorrent download defaults. When that mode is missing or
+/// unrecognised there is nothing to compare against and the plugin reports `None` so that
+/// Scryer-side goal evaluation decides.
+fn derive_can_remove(
+    download: &TriblerDownload,
+    defaults: &DownloadDefaults,
+    state: DownloadItemState,
+    now: i64,
+) -> Option<bool> {
+    if state != DownloadItemState::Completed {
+        return Some(false);
     }
+    // Tribler stops a download once the configured seeding goal is reached.
+    let is_stopped = download.status.as_deref() == Some("STOPPED");
     match defaults.seeding_mode.as_deref() {
-        Some("ratio") => download
-            .all_time_ratio
-            .zip(defaults.seeding_ratio)
-            .is_some_and(|(actual, target)| actual >= target),
-        Some("time") => download
-            .time_added
-            .zip(defaults.seeding_time)
-            .is_some_and(|(started, seconds)| started + (seconds as i64) < current_unix_seconds()),
-        Some("never") => true,
-        _ => false,
+        // No seeding obligation at all.
+        Some("never") => Some(true),
+        // Seed indefinitely: the goal can never be reached.
+        Some("forever") => Some(false),
+        Some("ratio") => match download.all_time_ratio.zip(defaults.seeding_ratio) {
+            Some((actual, target)) if actual >= target => is_stopped.then_some(true),
+            Some(_) => Some(false),
+            None => None,
+        },
+        Some("time") => match download.time_added.zip(defaults.seeding_time) {
+            Some((started, seconds)) if started + (seconds as i64) < now => {
+                is_stopped.then_some(true)
+            }
+            Some(_) => Some(false),
+            None => None,
+        },
+        _ => None,
     }
+}
+
+/// Whether the payload is fully downloaded and therefore movable.
+fn is_data_complete(download: &TriblerDownload) -> bool {
+    download.status.as_deref() == Some("SEEDING") || download.progress.unwrap_or_default() >= 1.0
 }
 
 fn current_unix_seconds() -> i64 {
@@ -740,6 +773,209 @@ fn field(
 fn is_localhost_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     lower.contains("://localhost") || lower.contains("://127.0.0.1") || lower.contains("://[::1]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: i64 = 1_700_000_000;
+
+    fn download(status: &str, progress: f64, ratio: f64) -> TriblerDownload {
+        TriblerDownload {
+            name: "Movie".to_string(),
+            progress: Some(progress),
+            infohash: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            status: Some(status.to_string()),
+            all_time_ratio: Some(ratio),
+            time_added: Some(NOW - 3_600),
+            size: Some(1_000),
+            destination: "/downloads".to_string(),
+            ..TriblerDownload::default()
+        }
+    }
+
+    fn defaults(mode: Option<&str>, ratio: Option<f64>, time: Option<f64>) -> DownloadDefaults {
+        DownloadDefaults {
+            save_as: "/downloads".to_string(),
+            seeding_mode: mode.map(str::to_string),
+            seeding_ratio: ratio,
+            seeding_time: time,
+        }
+    }
+
+    #[test]
+    fn can_remove_is_false_while_downloading() {
+        assert_eq!(
+            derive_can_remove(
+                &download("DOWNLOADING", 0.4, 0.0),
+                &defaults(Some("ratio"), Some(1.0), None),
+                DownloadItemState::Downloading,
+                NOW
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_false_while_seeding_towards_an_unmet_ratio() {
+        assert_eq!(
+            derive_can_remove(
+                &download("SEEDING", 1.0, 0.4),
+                &defaults(Some("ratio"), Some(2.0), None),
+                DownloadItemState::Completed,
+                NOW
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_true_once_tribler_stopped_a_download_at_its_ratio() {
+        assert_eq!(
+            derive_can_remove(
+                &download("STOPPED", 1.0, 2.5),
+                &defaults(Some("ratio"), Some(2.0), None),
+                DownloadItemState::Completed,
+                NOW
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_true_when_tribler_never_seeds() {
+        assert_eq!(
+            derive_can_remove(
+                &download("STOPPED", 1.0, 0.0),
+                &defaults(Some("never"), None, None),
+                DownloadItemState::Completed,
+                NOW
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_false_when_tribler_seeds_forever() {
+        assert_eq!(
+            derive_can_remove(
+                &download("SEEDING", 1.0, 9.0),
+                &defaults(Some("forever"), None, None),
+                DownloadItemState::Completed,
+                NOW
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_unknown_without_a_recognised_seeding_mode() {
+        assert_eq!(
+            derive_can_remove(
+                &download("SEEDING", 1.0, 9.0),
+                &defaults(None, None, None),
+                DownloadItemState::Completed,
+                NOW
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn can_remove_is_unknown_when_the_ratio_goal_lacks_a_target() {
+        assert_eq!(
+            derive_can_remove(
+                &download("STOPPED", 1.0, 9.0),
+                &defaults(Some("ratio"), None, None),
+                DownloadItemState::Completed,
+                NOW
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn met_goal_that_tribler_has_not_stopped_yet_is_unknown() {
+        assert_eq!(
+            derive_can_remove(
+                &download("SEEDING", 1.0, 9.0),
+                &defaults(Some("ratio"), Some(2.0), None),
+                DownloadItemState::Completed,
+                NOW
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn data_completeness_covers_seeding_and_finished_downloads() {
+        assert!(is_data_complete(&download("SEEDING", 0.999, 0.0)));
+        assert!(is_data_complete(&download("STOPPED", 1.0, 0.0)));
+        assert!(!is_data_complete(&download("DOWNLOADING", 0.5, 0.0)));
+    }
+}
+
+#[cfg(test)]
+mod extism_host_stubs {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn alloc(_len: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn config_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_headers() -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_request(_request: u64, _body: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_status_code() -> u64 {
+        200
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length_unsafe(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u64(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u8(_offset: u64) -> u8 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u64(_offset: u64, _value: u64) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u8(_offset: u64, _value: u8) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_set(_ptr: u64, _value: u64) {}
 }
 
 scryer_plugin_pdk::scryer_download_client_bridge_main!(

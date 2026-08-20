@@ -656,7 +656,11 @@ fn set_torrent_settings(
         );
     }
     if let Some(seed_ratio) = seed_ratio {
-        body.insert("stop_ratio".to_string(), serde_json::json!(seed_ratio));
+        // `stop_ratio` is an integer percentage in the Freebox API.
+        body.insert(
+            "stop_ratio".to_string(),
+            serde_json::json!(seed_ratio.round() as i64),
+        );
     }
     let _: FreeboxDownloadTask = api_json(
         config,
@@ -753,11 +757,9 @@ fn torrent_to_item(config: &FreeboxConfig, torrent: FreeboxDownloadTask) -> Plug
             downloaded_bytes: Some(torrent.received_bytes),
             upload_rate_bytes_per_second: Some(torrent.transmitted_rate),
             download_rate_bytes_per_second: Some(torrent.received_rate),
-            seed_ratio: Some(if torrent.stop_ratio <= 0 {
-                0.0
-            } else {
-                torrent.stop_ratio as f64 / 100.0
-            }),
+            // The *observed* ratio. This used to report `stop_ratio`, i.e. the configured
+            // goal, which made every torrent look like it had already met its target.
+            seed_ratio: observed_ratio(&torrent),
             raw_status: Some(torrent.status.clone()),
             status_reason: non_empty(torrent.error.clone()),
             ..PluginTorrentItem::default()
@@ -770,8 +772,9 @@ fn torrent_to_item(config: &FreeboxConfig, torrent: FreeboxDownloadTask) -> Plug
                 .round()
                 .clamp(0.0, 100.0)) as u8,
         ),
-        can_move_files: Some(torrent.status == "done"),
-        can_remove: Some(torrent.status == "done"),
+        // Data completeness only; whether a move is safe while seeding is decided Scryer-side.
+        can_move_files: Some(is_data_complete(&torrent)),
+        can_remove: derive_can_remove(&torrent),
         removed: Some(false),
         raw_state: Some(torrent.status),
         completed_at: None,
@@ -799,6 +802,47 @@ fn torrent_to_completed(
         size_bytes: Some(torrent.size),
         completed_at: None,
         parameters: Vec::new(),
+    }
+}
+
+/// Ratio actually achieved, from the task's transfer counters.
+fn observed_ratio(torrent: &FreeboxDownloadTask) -> Option<f64> {
+    (torrent.received_bytes > 0)
+        .then(|| torrent.transmitted_bytes as f64 / torrent.received_bytes as f64)
+}
+
+/// Whether the payload is fully downloaded and therefore movable.
+fn is_data_complete(torrent: &FreeboxDownloadTask) -> bool {
+    matches!(torrent.status.as_str(), "done" | "seeding") || torrent.received_percent >= 10_000
+}
+
+/// Honest `can_remove` for the Freebox download manager.
+///
+/// Freebox reports `done` only once it has stopped seeding a torrent, and `seeding` while the
+/// torrent is still being served toward its `stop_ratio` (a percentage; `<= 0` means "no
+/// limit"). Anything else — user-stopped, errored, still downloading — is either unfinished
+/// or unknowable.
+fn derive_can_remove(torrent: &FreeboxDownloadTask) -> Option<bool> {
+    match torrent.status.as_str() {
+        // Freebox finished with the torrent: it is no longer seeding.
+        "done" => Some(true),
+        "seeding" => {
+            if torrent.stop_ratio <= 0 {
+                // No client-side seeding goal; Scryer-side evaluation decides.
+                return None;
+            }
+            let goal = torrent.stop_ratio as f64 / 100.0;
+            match observed_ratio(torrent) {
+                // Goal reached but Freebox has not switched the task to `done` yet.
+                Some(ratio) if ratio >= goal => None,
+                Some(_) => Some(false),
+                None => None,
+            }
+        }
+        // Stopped/queued/errored complete torrents are not seeding for a reason Freebox
+        // attributes to a limit, so the seeding verdict is unknowable.
+        _ if is_data_complete(torrent) => None,
+        _ => Some(false),
     }
 }
 
@@ -959,6 +1003,167 @@ fn connection_field(
 fn is_localhost_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     lower.contains("://localhost") || lower.contains("://127.0.0.1") || lower.contains("://[::1]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(status: &str) -> FreeboxDownloadTask {
+        FreeboxDownloadTask {
+            id: "7".to_string(),
+            name: "Movie".to_string(),
+            info_hash: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            status: status.to_string(),
+            task_type: "bt".to_string(),
+            size: 1_000,
+            received_percent: 10_000,
+            received_bytes: 1_000,
+            transmitted_bytes: 500,
+            ..FreeboxDownloadTask::default()
+        }
+    }
+
+    #[test]
+    fn observed_ratio_is_transferred_over_received_not_the_goal() {
+        let torrent = FreeboxDownloadTask {
+            stop_ratio: 300,
+            transmitted_bytes: 500,
+            received_bytes: 1_000,
+            ..task("seeding")
+        };
+        assert_eq!(observed_ratio(&torrent), Some(0.5));
+    }
+
+    #[test]
+    fn can_remove_is_false_while_downloading() {
+        let torrent = FreeboxDownloadTask {
+            received_percent: 4_000,
+            ..task("downloading")
+        };
+        assert_eq!(derive_can_remove(&torrent), Some(false));
+        assert!(!is_data_complete(&torrent));
+    }
+
+    #[test]
+    fn can_remove_is_false_while_seeding_towards_an_unmet_stop_ratio() {
+        let torrent = FreeboxDownloadTask {
+            stop_ratio: 200,
+            ..task("seeding")
+        };
+        assert_eq!(derive_can_remove(&torrent), Some(false));
+    }
+
+    #[test]
+    fn can_remove_is_true_once_freebox_marks_the_task_done() {
+        assert_eq!(derive_can_remove(&task("done")), Some(true));
+    }
+
+    #[test]
+    fn can_remove_is_unknown_when_seeding_without_a_stop_ratio() {
+        let torrent = FreeboxDownloadTask {
+            stop_ratio: 0,
+            ..task("seeding")
+        };
+        assert_eq!(derive_can_remove(&torrent), None);
+    }
+
+    #[test]
+    fn can_remove_is_unknown_for_a_user_stopped_complete_task() {
+        assert_eq!(derive_can_remove(&task("stopped")), None);
+    }
+
+    #[test]
+    fn can_move_files_tracks_data_completeness_not_seeding() {
+        let torrent = FreeboxDownloadTask {
+            stop_ratio: 900,
+            ..task("seeding")
+        };
+        let item = torrent_to_item(&test_config(), torrent);
+        assert_eq!(item.can_move_files, Some(true));
+        assert_eq!(item.can_remove, Some(false));
+    }
+
+    #[test]
+    fn is_private_is_never_claimed_because_freebox_does_not_report_it() {
+        let item = torrent_to_item(&test_config(), task("done"));
+        assert_eq!(item.torrent.unwrap().is_private, None);
+    }
+
+    fn test_config() -> FreeboxConfig {
+        FreeboxConfig {
+            api_root: "https://mafreebox.freebox.fr/api/v8".to_string(),
+            app_id: "scryer".to_string(),
+            app_token: "token".to_string(),
+            destination_directory: String::new(),
+            category: String::new(),
+            recent_priority_first: false,
+            older_priority_first: false,
+            add_paused: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod extism_host_stubs {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn alloc(_len: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn config_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_headers() -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_request(_request: u64, _body: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_status_code() -> u64 {
+        200
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length_unsafe(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u64(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u8(_offset: u64) -> u8 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u64(_offset: u64, _value: u64) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u8(_offset: u64, _value: u8) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_set(_ptr: u64, _value: u64) {}
 }
 
 scryer_plugin_pdk::scryer_download_client_bridge_main!(

@@ -1057,6 +1057,7 @@ fn task_to_item(config: &DsConfig, serial: &str, task: DsTask) -> PluginDownload
                 upload_rate_bytes_per_second: transfer_i64(&task, "speed_upload"),
                 download_rate_bytes_per_second: transfer_i64(&task, "speed_download"),
                 seed_ratio: seed_ratio(&task),
+                seed_time_seconds: seed_time_seconds(&task),
                 raw_status: Some(status_name(task.status).to_string()),
                 ..PluginTorrentItem::default()
             }),
@@ -1072,8 +1073,9 @@ fn task_to_item(config: &DsConfig, serial: &str, task: DsTask) -> PluginDownload
         } else {
             None
         },
-        can_move_files: Some(task.status == DsStatus::Finished),
-        can_remove: Some(task.status == DsStatus::Finished),
+        // Data completeness only; whether a move is safe while seeding is decided Scryer-side.
+        can_move_files: Some(is_data_complete(&task)),
+        can_remove: derive_can_remove(&task),
         removed: Some(false),
         raw_state: Some(status_name(task.status).to_string()),
         completed_at: None,
@@ -1156,6 +1158,36 @@ fn status_from_int(value: i64) -> DsStatus {
         11 => DsStatus::CaptchaNeeded,
         _ => DsStatus::Unknown,
     }
+}
+
+/// Whether the payload is fully downloaded and therefore movable.
+fn is_data_complete(task: &DsTask) -> bool {
+    matches!(task.status, DsStatus::Finished | DsStatus::Seeding)
+        || (task.size > 0 && remaining_size(task) == 0)
+}
+
+/// Honest `can_remove` for Synology Download Station.
+///
+/// Download Station distinguishes `seeding` (payload complete, still being served toward the
+/// global BT seeding ratio/interval) from `finished` (Download Station stopped seeding it).
+/// The goal values are not exposed per task, but the transition between those two states is
+/// the client's own verdict on whether the obligation is discharged.
+fn derive_can_remove(task: &DsTask) -> Option<bool> {
+    match task.status {
+        DsStatus::Finished => Some(true),
+        DsStatus::Seeding => Some(false),
+        _ if is_data_complete(task) => None,
+        _ => Some(false),
+    }
+}
+
+/// Seconds spent seeding, from the task's `seedelapsed` detail field when present.
+fn seed_time_seconds(task: &DsTask) -> Option<i64> {
+    task.additional
+        .detail
+        .get("seedelapsed")
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value >= 0)
 }
 
 fn map_status(task: &DsTask) -> DownloadItemState {
@@ -1355,6 +1387,160 @@ fn field(
         options: vec![],
         help_text: help_text.map(str::to_string),
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(status: DsStatus, downloaded: i64) -> DsTask {
+        let mut transfer = HashMap::new();
+        transfer.insert("size_downloaded".to_string(), downloaded.to_string());
+        transfer.insert("size_uploaded".to_string(), "1500".to_string());
+        transfer.insert("speed_download".to_string(), "0".to_string());
+        transfer.insert("speed_upload".to_string(), "0".to_string());
+        let mut detail = HashMap::new();
+        detail.insert("destination".to_string(), "downloads".to_string());
+        detail.insert("seedelapsed".to_string(), "7200".to_string());
+        DsTask {
+            id: "dbid_1".to_string(),
+            title: "Movie".to_string(),
+            size: 1_000,
+            task_type: "bt".to_string(),
+            status,
+            status_extra: HashMap::new(),
+            additional: DsAdditional { detail, transfer },
+        }
+    }
+
+    fn test_config() -> DsConfig {
+        DsConfig {
+            base_url: "https://nas.local:5001".to_string(),
+            host: "nas.local".to_string(),
+            username: "scryer".to_string(),
+            password: "secret".to_string(),
+            category: String::new(),
+            directory: String::new(),
+        }
+    }
+
+    #[test]
+    fn can_remove_is_false_while_downloading() {
+        let torrent = task(DsStatus::Downloading, 400);
+        assert_eq!(derive_can_remove(&torrent), Some(false));
+        assert!(!is_data_complete(&torrent));
+    }
+
+    #[test]
+    fn can_remove_is_false_while_download_station_is_seeding() {
+        assert_eq!(
+            derive_can_remove(&task(DsStatus::Seeding, 1_000)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_true_once_download_station_reports_finished() {
+        assert_eq!(
+            derive_can_remove(&task(DsStatus::Finished, 1_000)),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_unknown_for_a_paused_complete_task() {
+        assert_eq!(derive_can_remove(&task(DsStatus::Paused, 1_000)), None);
+    }
+
+    #[test]
+    fn can_move_files_tracks_data_completeness_not_seeding() {
+        let item = task_to_item(&test_config(), "SERIAL", task(DsStatus::Seeding, 1_000));
+        assert_eq!(item.can_move_files, Some(true));
+        assert_eq!(item.can_remove, Some(false));
+    }
+
+    #[test]
+    fn seed_time_comes_from_the_seedelapsed_detail_field() {
+        let with_value = task(DsStatus::Seeding, 1_000);
+        assert_eq!(seed_time_seconds(&with_value), Some(7_200));
+        let mut without_value = task(DsStatus::Seeding, 1_000);
+        without_value.additional.detail.remove("seedelapsed");
+        assert_eq!(seed_time_seconds(&without_value), None);
+    }
+
+    #[test]
+    fn item_mapping_does_not_trap_on_a_zero_download_speed() {
+        let item = task_to_item(&test_config(), "SERIAL", task(DsStatus::Seeding, 1_000));
+        assert_eq!(item.eta_seconds, None);
+    }
+
+    #[test]
+    fn is_private_is_never_claimed_because_download_station_does_not_report_it() {
+        let item = task_to_item(&test_config(), "SERIAL", task(DsStatus::Finished, 1_000));
+        assert_eq!(item.torrent.unwrap().is_private, None);
+    }
+}
+
+#[cfg(test)]
+mod extism_host_stubs {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn alloc(_len: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn config_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_headers() -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_request(_request: u64, _body: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_status_code() -> u64 {
+        200
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length_unsafe(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u64(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u8(_offset: u64) -> u8 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u64(_offset: u64, _value: u64) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u8(_offset: u64, _value: u8) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_set(_ptr: u64, _value: u64) {}
 }
 
 scryer_plugin_pdk::scryer_download_client_bridge_main!(

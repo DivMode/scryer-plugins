@@ -28,7 +28,8 @@ const REQUIRED_PROPERTIES: &[&str] = &[
     "total_size",
     "total_done",
     "time_added",
-    "active_time",
+    "seeding_time",
+    "private",
     "ratio",
     "is_auto_managed",
     "stop_at_ratio",
@@ -101,8 +102,10 @@ struct DelugeTorrent {
     size: i64,
     #[serde(default, rename = "total_done")]
     bytes_downloaded: i64,
-    #[serde(default, rename = "active_time")]
-    seconds_downloading: i64,
+    /// Deluge counts seeding time separately from `active_time` (which also covers the
+    /// download phase); only this value is a truthful `seed_time_seconds`.
+    #[serde(default, rename = "seeding_time")]
+    seeding_time: Option<i64>,
     #[serde(default)]
     ratio: f64,
     #[serde(default, rename = "is_auto_managed")]
@@ -111,6 +114,8 @@ struct DelugeTorrent {
     stop_at_ratio: bool,
     #[serde(default, rename = "stop_ratio")]
     stop_ratio: f64,
+    #[serde(default)]
+    private: Option<bool>,
 }
 
 fn plugin_error<T>(code: PluginErrorCode, public_message: impl Into<String>) -> PluginResult<T> {
@@ -819,11 +824,7 @@ fn torrent_to_item(config: &DelugeConfig, torrent: DelugeTorrent) -> PluginDownl
     let remaining = (torrent.size - torrent.bytes_downloaded).max(0);
     let path = output_path(&torrent);
     let state = map_state(&torrent);
-    let ratio_goal_met = !matches!(config.post_import_action, PostImportAction::Retain)
-        && torrent.is_auto_managed
-        && torrent.stop_at_ratio
-        && torrent.ratio >= torrent.stop_ratio
-        && torrent.state == "Paused";
+    let can_remove = derive_can_remove(&torrent, state);
     PluginDownloadItem {
         client_item_id: hash.clone(),
         download_id: None,
@@ -847,7 +848,8 @@ fn torrent_to_item(config: &DelugeConfig, torrent: DelugeTorrent) -> PluginDownl
             content_paths: vec![path],
             downloaded_bytes: Some(torrent.bytes_downloaded),
             seed_ratio: Some(torrent.ratio),
-            seed_time_seconds: Some(torrent.seconds_downloading),
+            seed_time_seconds: torrent.seeding_time,
+            is_private: torrent.private,
             raw_status: Some(torrent.state.clone()),
             status_reason: if torrent.message.trim().is_empty() {
                 None
@@ -860,8 +862,9 @@ fn torrent_to_item(config: &DelugeConfig, torrent: DelugeTorrent) -> PluginDownl
         remaining_size_bytes: Some(remaining),
         eta_seconds: (torrent.eta >= 0.0).then_some(torrent.eta as i64),
         progress_percent: Some(torrent.progress.round().clamp(0.0, 100.0) as u8),
-        can_move_files: Some(ratio_goal_met),
-        can_remove: Some(ratio_goal_met),
+        // Data completeness only; whether a move is safe while seeding is decided Scryer-side.
+        can_move_files: Some(state == DownloadItemState::Completed),
+        can_remove,
         removed: Some(false),
         raw_state: Some(torrent.state),
         completed_at: None,
@@ -896,6 +899,30 @@ fn output_path(torrent: &DelugeTorrent) -> String {
         torrent.download_path.trim_end_matches('/'),
         torrent.name
     )
+}
+
+/// Honest `can_remove` for Deluge.
+///
+/// Deluge only enforces a ratio goal, and only for auto-managed torrents with `stop_at_ratio`
+/// set. When that is off there is no client-side seeding obligation to observe, so the plugin
+/// reports `None` and Scryer-side goal evaluation decides.
+fn derive_can_remove(torrent: &DelugeTorrent, state: DownloadItemState) -> Option<bool> {
+    if state != DownloadItemState::Completed {
+        return Some(false);
+    }
+    if !torrent.is_auto_managed || !torrent.stop_at_ratio {
+        return None;
+    }
+    if torrent.ratio < torrent.stop_ratio {
+        return Some(false);
+    }
+    // Deluge pauses the torrent itself once `stop_ratio` is reached; until it has, the goal
+    // is met on paper but the client is still seeding.
+    if torrent.state == "Paused" {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 fn map_state(torrent: &DelugeTorrent) -> DownloadItemState {
@@ -1085,6 +1112,229 @@ fn connection_field(
 fn is_localhost_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     lower.contains("://localhost") || lower.contains("://127.0.0.1") || lower.contains("://[::1]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn finished_torrent(state: &str) -> DelugeTorrent {
+        DelugeTorrent {
+            hash: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            name: "Movie".to_string(),
+            state: state.to_string(),
+            is_finished: true,
+            progress: 100.0,
+            ..DelugeTorrent::default()
+        }
+    }
+
+    #[test]
+    fn can_remove_is_false_while_downloading() {
+        let torrent = DelugeTorrent {
+            hash: "a1".to_string(),
+            name: "Movie".to_string(),
+            state: "Downloading".to_string(),
+            is_auto_managed: true,
+            stop_at_ratio: true,
+            stop_ratio: 1.0,
+            ..DelugeTorrent::default()
+        };
+        let state = map_state(&torrent);
+        assert_eq!(derive_can_remove(&torrent, state), Some(false));
+    }
+
+    #[test]
+    fn can_remove_is_false_while_seeding_towards_an_unmet_stop_ratio() {
+        let torrent = DelugeTorrent {
+            is_auto_managed: true,
+            stop_at_ratio: true,
+            stop_ratio: 2.0,
+            ratio: 0.4,
+            ..finished_torrent("Seeding")
+        };
+        assert_eq!(
+            derive_can_remove(&torrent, DownloadItemState::Completed),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_true_once_deluge_paused_a_torrent_at_its_stop_ratio() {
+        let torrent = DelugeTorrent {
+            is_auto_managed: true,
+            stop_at_ratio: true,
+            stop_ratio: 1.0,
+            ratio: 1.2,
+            ..finished_torrent("Paused")
+        };
+        assert_eq!(
+            derive_can_remove(&torrent, DownloadItemState::Completed),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_unknown_without_a_client_side_ratio_goal() {
+        let not_auto_managed = DelugeTorrent {
+            is_auto_managed: false,
+            stop_at_ratio: true,
+            stop_ratio: 1.0,
+            ratio: 5.0,
+            ..finished_torrent("Paused")
+        };
+        let no_stop_at_ratio = DelugeTorrent {
+            is_auto_managed: true,
+            stop_at_ratio: false,
+            ratio: 5.0,
+            ..finished_torrent("Seeding")
+        };
+        assert_eq!(
+            derive_can_remove(&not_auto_managed, DownloadItemState::Completed),
+            None
+        );
+        assert_eq!(
+            derive_can_remove(&no_stop_at_ratio, DownloadItemState::Completed),
+            None
+        );
+    }
+
+    #[test]
+    fn met_ratio_that_deluge_has_not_paused_yet_is_unknown() {
+        let torrent = DelugeTorrent {
+            is_auto_managed: true,
+            stop_at_ratio: true,
+            stop_ratio: 1.0,
+            ratio: 3.0,
+            ..finished_torrent("Seeding")
+        };
+        assert_eq!(
+            derive_can_remove(&torrent, DownloadItemState::Completed),
+            None
+        );
+    }
+
+    #[test]
+    fn can_move_files_tracks_data_completeness_not_seeding() {
+        let config = test_config();
+        let torrent = DelugeTorrent {
+            is_auto_managed: true,
+            stop_at_ratio: true,
+            stop_ratio: 9.0,
+            ratio: 0.1,
+            ..finished_torrent("Seeding")
+        };
+        let item = torrent_to_item(&config, torrent);
+        assert_eq!(item.can_move_files, Some(true));
+        assert_eq!(item.can_remove, Some(false));
+    }
+
+    #[test]
+    fn seed_time_comes_from_seeding_time_not_active_time() {
+        let torrent: DelugeTorrent = serde_json::from_str(
+            r#"{"hash":"a1","name":"n","state":"Seeding","is_finished":true,"active_time":100000,"seeding_time":7200,"ratio":1.0}"#,
+        )
+        .unwrap();
+        let item = torrent_to_item(&test_config(), torrent);
+        assert_eq!(item.torrent.unwrap().seed_time_seconds, Some(7_200));
+    }
+
+    #[test]
+    fn is_private_maps_present_true_present_false_and_absent() {
+        let map = |raw: &str| {
+            let torrent: DelugeTorrent = serde_json::from_str(raw).unwrap();
+            torrent_to_item(&test_config(), torrent)
+                .torrent
+                .unwrap()
+                .is_private
+        };
+        assert_eq!(
+            map(r#"{"hash":"a1","name":"n","state":"Seeding","private":true}"#),
+            Some(true)
+        );
+        assert_eq!(
+            map(r#"{"hash":"a1","name":"n","state":"Seeding","private":false}"#),
+            Some(false)
+        );
+        assert_eq!(map(r#"{"hash":"a1","name":"n","state":"Seeding"}"#), None);
+    }
+
+    fn test_config() -> DelugeConfig {
+        DelugeConfig {
+            json_url: "http://localhost:8112/json".to_string(),
+            password: "deluge".to_string(),
+            category: String::new(),
+            imported_category: String::new(),
+            recent_priority: PluginTorrentQueuePlacement::Default,
+            older_priority: PluginTorrentQueuePlacement::Default,
+            add_paused: false,
+            download_directory: String::new(),
+            completed_directory: String::new(),
+            post_import_action: PostImportAction::Retain,
+        }
+    }
+}
+
+#[cfg(test)]
+mod extism_host_stubs {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn alloc(_len: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn config_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_headers() -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_request(_request: u64, _body: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_status_code() -> u64 {
+        200
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length_unsafe(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u64(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u8(_offset: u64) -> u8 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u64(_offset: u64, _value: u64) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u8(_offset: u64, _value: u8) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_set(_ptr: u64, _value: u64) {}
 }
 
 scryer_plugin_pdk::scryer_download_client_bridge_main!(
