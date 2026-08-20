@@ -1,17 +1,16 @@
 use std::collections::HashMap;
 
-use extism_pdk::*;
 use newznab_common::{
     Capabilities, IndexerCategoryModel, IndexerCategoryValueKind, IndexerDescriptor,
     IndexerFeedMode, IndexerLimitCapabilities, IndexerProtocol, IndexerResponseFeatures,
-    IndexerSearchInput, IndexerSourceKind, NewznabConfig, PluginDescriptor, PluginResult,
-    ProviderDescriptor, SDK_VERSION, ScoringPolicy, SearchRequest, current_sdk_constraint,
+    IndexerSearchInput, IndexerSourceKind, NewznabConfig, PluginDescriptor, ProviderDescriptor,
+    SDK_VERSION, ScoringPolicy, SearchRequest, SearchResponse, current_sdk_constraint,
     execute_full_search, standard_config_fields,
 };
+use scryer_plugin_pdk::*;
 
-#[plugin_fn]
-pub fn scryer_describe(_input: String) -> FnResult<String> {
-    let descriptor = PluginDescriptor {
+fn build_descriptor() -> PluginDescriptor {
+    PluginDescriptor {
         id: "dognzb".to_string(),
         name: "DogNZB Indexer".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -93,17 +92,14 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
             allowed_hosts: vec![],
             rate_limit_seconds: None,
         }),
-    };
-    Ok(serde_json::to_string(&descriptor)?)
+    }
 }
 
-#[plugin_fn]
-pub fn scryer_indexer_search(input: String) -> FnResult<String> {
-    let req: SearchRequest = serde_json::from_str(&input)?;
-    let mut config = NewznabConfig::from_extism()?;
+fn search(req: SearchRequest) -> FnResult<SearchResponse> {
+    let mut config = NewznabConfig::from_host()?;
     config.page_size = 100;
     let response = execute_full_search(&config, &req, dognzb_metadata_extractor)?;
-    Ok(serde_json::to_string(&PluginResult::Ok(response))?)
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +177,8 @@ score_entry["dognzb_mid_rating"] := 50 if {
     input.release.extra.rating < 80
 }
 "#;
+
+indexer_command_compat::scryer_indexer_main!(descriptor = build_descriptor, search = search,);
 
 #[cfg(test)]
 mod tests {

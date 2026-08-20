@@ -1,18 +1,18 @@
 use std::collections::HashMap;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use extism_pdk::*;
+use indexer_command_compat::{LogLevel, log};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
+use scryer_plugin_pdk::*;
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldOption, ConfigFieldRole, ConfigFieldType,
     IndexerCapabilities as Capabilities, IndexerCategoryModel, IndexerCategoryValueKind,
     IndexerDescriptor, IndexerFeedMode, IndexerLimitCapabilities, IndexerProtocol,
     IndexerResponseFeatures, IndexerSearchInput, IndexerSourceKind, IndexerTorrentCapabilities,
-    PluginDescriptor, PluginResult, PluginSearchRequest as SearchRequest,
-    PluginSearchResponse as SearchResponse, PluginSearchResult as SearchResult, ProviderDescriptor,
-    SDK_VERSION,
+    PluginDescriptor, PluginSearchRequest as SearchRequest, PluginSearchResponse as SearchResponse,
+    PluginSearchResult as SearchResult, ProviderDescriptor, SDK_VERSION,
 };
 
 #[derive(Default)]
@@ -38,13 +38,8 @@ enum DownloadPreference {
     Guid,
 }
 
-#[plugin_fn]
-pub fn scryer_describe(_input: String) -> FnResult<String> {
-    Ok(build_descriptor_json()?)
-}
-
-fn build_descriptor_json() -> Result<String, Error> {
-    let descriptor = PluginDescriptor {
+fn build_descriptor() -> PluginDescriptor {
+    PluginDescriptor {
         id: "torrent-rss".to_string(),
         name: "Torrent RSS Feed Indexer".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -112,16 +107,15 @@ fn build_descriptor_json() -> Result<String, Error> {
             allowed_hosts: vec![],
             rate_limit_seconds: Some(2),
         }),
-    };
-    Ok(serde_json::to_string(&descriptor)?)
+    }
 }
 
-#[plugin_fn]
-pub fn scryer_indexer_search(input: String) -> FnResult<String> {
-    let req: SearchRequest = serde_json::from_str(&input)?;
+fn search(req: SearchRequest) -> FnResult<SearchResponse> {
     let feed_url = read_config("feed_url")?;
     if feed_url.trim().is_empty() {
-        return Err(Error::msg("Torrent RSS feed indexer requires feed_url configuration").into());
+        return Err(Error::msg(
+            "Torrent RSS feed indexer requires feed_url configuration",
+        ));
     }
 
     let cookie = optional_config("cookie");
@@ -146,10 +140,10 @@ pub fn scryer_indexer_search(input: String) -> FnResult<String> {
     let mut results = parse_rss_feed(&body, preference);
     results = filter_results(results, &req, limit);
 
-    Ok(serde_json::to_string(&PluginResult::Ok(SearchResponse {
+    Ok(SearchResponse {
         results,
         ..Default::default()
-    }))?)
+    })
 }
 
 fn config_fields() -> Vec<ConfigFieldDef> {
@@ -1003,6 +997,8 @@ fn dedupe(values: Vec<String>) -> Vec<String> {
     out
 }
 
+indexer_command_compat::scryer_indexer_main!(descriptor = build_descriptor, search = search,);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1013,7 +1009,7 @@ mod tests {
 
     #[test]
     fn descriptor_is_torrent_rss() {
-        let json = build_descriptor_json().unwrap();
+        let json = serde_json::to_string(&build_descriptor()).unwrap();
         assert!(json.contains("\"provider_type\":\"torrent_rss\""));
         assert!(json.contains("\"source_kind\":\"torrent\""));
     }

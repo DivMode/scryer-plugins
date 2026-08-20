@@ -1,12 +1,11 @@
-use extism_pdk::*;
 use rss_indexer_common::*;
+use scryer_plugin_pdk::*;
 
 const PROVIDER_ID: &str = "iptorrents";
 const DEFAULT_USER_AGENT: &str = "Scryer IPTorrents Indexer/0.1";
 
-#[plugin_fn]
-pub fn scryer_describe(_input: String) -> FnResult<String> {
-    let descriptor = build_indexer_descriptor(DescriptorSpec {
+fn build_descriptor() -> PluginDescriptor {
+    build_indexer_descriptor(DescriptorSpec {
         id: "iptorrents",
         name: "IPTorrents Indexer",
         version: env!("CARGO_PKG_VERSION"),
@@ -33,27 +32,22 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
             supports_seed_requirements: true,
             ..IndexerTorrentCapabilities::default()
         }),
-    });
-
-    Ok(serde_json::to_string(&descriptor)?)
+    })
 }
 
-#[plugin_fn]
-pub fn scryer_indexer_search(input: String) -> FnResult<String> {
-    let req: SearchRequest = serde_json::from_str(&input)?;
+fn search(req: SearchRequest) -> FnResult<SearchResponse> {
     let feed_url = required_config("feed_url")?;
     if !is_direct_download_feed_url(&feed_url) {
         return Err(Error::msg(
             "IPTorrents feed_url must be the direct-download RSS URL containing ;download",
-        )
-        .into());
+        ));
     }
-    let http_config = RssHttpConfig::from_extism(DEFAULT_USER_AGENT);
+    let http_config = RssHttpConfig::from_host(DEFAULT_USER_AGENT);
     let mut options = RssParseOptions::torrent(PROVIDER_ID);
     options.parse_size_in_description = true;
 
     let response = execute_rss_urls(PROVIDER_ID, &[feed_url], &http_config, &req, options)?;
-    Ok(serde_json::to_string(&PluginResult::Ok(response))?)
+    Ok(response)
 }
 
 fn config_fields() -> Vec<ConfigFieldDef> {
@@ -85,3 +79,5 @@ fn is_direct_download_feed_url(url: &str) -> bool {
     };
     query.split(';').any(|part| part == "download")
 }
+
+indexer_command_compat::scryer_indexer_main!(descriptor = build_descriptor, search = search,);

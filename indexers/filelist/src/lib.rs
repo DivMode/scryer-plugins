@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use extism_pdk::*;
+use scryer_plugin_pdk::*;
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldRole, ConfigFieldType, IndexerCapabilities as Capabilities,
     IndexerCategoryModel, IndexerCategoryValueKind, IndexerDescriptor, IndexerFeedMode,
     IndexerLimitCapabilities, IndexerProtocol, IndexerResponseFeatures, IndexerSearchInput,
-    IndexerSourceKind, IndexerTorrentCapabilities, PluginDescriptor, PluginResult,
+    IndexerSourceKind, IndexerTorrentCapabilities, PluginDescriptor,
     PluginSearchRequest as SearchRequest, PluginSearchResponse as SearchResponse,
     PluginSearchResult as SearchResult, ProviderDescriptor, SDK_VERSION,
 };
@@ -17,9 +17,8 @@ use url::Url;
 const DEFAULT_BASE_URL: &str = "https://filelist.io";
 const DEFAULT_CATEGORIES: &str = "23,21,27";
 
-#[plugin_fn]
-pub fn scryer_describe(_input: String) -> FnResult<String> {
-    let descriptor = PluginDescriptor {
+fn build_descriptor() -> PluginDescriptor {
+    PluginDescriptor {
         id: "filelist".to_string(),
         name: "FileList Indexer".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -91,15 +90,11 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
             allowed_hosts: vec![],
             rate_limit_seconds: Some(2),
         }),
-    };
-
-    Ok(serde_json::to_string(&descriptor)?)
+    }
 }
 
-#[plugin_fn]
-pub fn scryer_indexer_search(input: String) -> FnResult<String> {
-    let req: SearchRequest = serde_json::from_str(&input)?;
-    let config = FileListConfig::from_extism()?;
+fn search(req: SearchRequest) -> FnResult<SearchResponse> {
+    let config = FileListConfig::from_host()?;
     let urls = build_urls(&config, &req);
     let mut results = Vec::new();
 
@@ -115,10 +110,10 @@ pub fn scryer_indexer_search(input: String) -> FnResult<String> {
         req.limit.min(200)
     };
     let results = dedupe_results(results).into_iter().take(limit).collect();
-    Ok(serde_json::to_string(&PluginResult::Ok(SearchResponse {
+    Ok(SearchResponse {
         results,
         ..Default::default()
-    }))?)
+    })
 }
 
 fn config_fields() -> Vec<ConfigFieldDef> {
@@ -460,7 +455,7 @@ struct FileListConfig {
 }
 
 impl FileListConfig {
-    fn from_extism() -> Result<Self, Error> {
+    fn from_host() -> Result<Self, Error> {
         let categories = config_csv_i64("categories", DEFAULT_CATEGORIES);
         let anime_categories = config_csv_i64("anime_categories", "");
         if categories.is_empty() && anime_categories.is_empty() {
@@ -500,3 +495,5 @@ struct FileListTorrent {
     #[serde(default, rename = "upload_date")]
     upload_date: String,
 }
+
+indexer_command_compat::scryer_indexer_main!(descriptor = build_descriptor, search = search,);

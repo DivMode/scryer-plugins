@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 
-use extism_pdk::*;
 use newznab_common::{
     Capabilities, ConfigFieldDef, ConfigFieldRole, ConfigFieldType, IndexerCategoryModel,
     IndexerCategoryValueKind, IndexerDescriptor, IndexerFeedMode, IndexerLimitCapabilities,
     IndexerProtocol, IndexerResponseFeatures, IndexerSearchInput, IndexerSourceKind,
     IndexerTorrentCapabilities, MetadataExtractor, NewznabConfig, NewznabHttpBehavior,
-    PluginDescriptor, PluginResult, ProviderDescriptor, SDK_VERSION, SearchRequest, SearchResponse,
-    current_sdk_constraint, execute_full_search, extract_base_metadata,
+    PluginActionRequest, PluginActionResponse, PluginDescriptor, ProviderDescriptor, SDK_VERSION,
+    SearchRequest, SearchResponse, current_sdk_constraint, execute_full_search,
+    extract_base_metadata,
 };
+use scryer_plugin_pdk::*;
 use scryer_plugin_sdk::{ConfigFieldOption, ConfigFieldValueSource};
 
 const PROVIDER_ID: &str = "animetosho-xyz";
@@ -66,11 +67,6 @@ impl DownloadMode {
             Self::Torrent => torrent_metadata_extractor,
         }
     }
-}
-
-#[plugin_fn]
-pub fn scryer_describe(_input: String) -> FnResult<String> {
-    Ok(serde_json::to_string(&build_descriptor())?)
 }
 
 fn build_descriptor() -> PluginDescriptor {
@@ -156,21 +152,18 @@ fn build_descriptor() -> PluginDescriptor {
     }
 }
 
-#[plugin_fn]
-pub fn scryer_indexer_search(input: String) -> FnResult<String> {
-    let mut req: SearchRequest = serde_json::from_str(&input)?;
+fn search(mut req: SearchRequest) -> FnResult<SearchResponse> {
     normalize_request(&mut req);
 
     let mode = DownloadMode::from_config()?;
     let config = animetosho_config(mode)?;
     let mut response = execute_full_search(&config, &req, mode.extractor())?;
     annotate_response(&mut response, mode);
-    Ok(serde_json::to_string(&PluginResult::Ok(response))?)
+    Ok(response)
 }
 
-#[plugin_fn]
-pub fn scryer_indexer_action(input: String) -> FnResult<String> {
-    Ok(newznab_common::execute_provider_action(&input)?)
+fn action(request: PluginActionRequest) -> FnResult<PluginActionResponse> {
+    newznab_common::execute_provider_action(request)
 }
 
 fn config_fields() -> Vec<ConfigFieldDef> {
@@ -414,6 +407,12 @@ fn dedupe(values: Vec<String>) -> Vec<String> {
     }
     out
 }
+
+indexer_command_compat::scryer_indexer_main!(
+    descriptor = build_descriptor,
+    search = search,
+    action = action,
+);
 
 #[cfg(test)]
 mod tests {

@@ -1,21 +1,17 @@
 use std::collections::HashMap;
 
-use extism_pdk::*;
 use newznab_common::{
     Capabilities, IndexerCategoryModel, IndexerCategoryValueKind, IndexerDescriptor,
     IndexerFeedMode, IndexerLimitCapabilities, IndexerProtocol, IndexerResponseFeatures,
     IndexerSearchInput, IndexerSourceKind, IndexerTorrentCapabilities, NewznabConfig,
-    PluginDescriptor, PluginResult, ProviderDescriptor, SDK_VERSION, SearchRequest,
-    current_sdk_constraint, execute_full_search, standard_config_fields,
+    PluginActionRequest, PluginActionResponse, PluginDescriptor, ProviderDescriptor, SDK_VERSION,
+    SearchRequest, SearchResponse, current_sdk_constraint, execute_full_search,
+    standard_config_fields,
 };
+use scryer_plugin_pdk::*;
 
-#[plugin_fn]
-pub fn scryer_describe(_input: String) -> FnResult<String> {
-    Ok(build_descriptor_json()?)
-}
-
-fn build_descriptor_json() -> Result<String, Error> {
-    let descriptor = PluginDescriptor {
+fn build_descriptor() -> PluginDescriptor {
+    PluginDescriptor {
         id: "torznab".to_string(),
         name: "Torznab Indexer".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -109,21 +105,17 @@ fn build_descriptor_json() -> Result<String, Error> {
             allowed_hosts: vec![],
             rate_limit_seconds: Some(2),
         }),
-    };
-    Ok(serde_json::to_string(&descriptor)?)
+    }
 }
 
-#[plugin_fn]
-pub fn scryer_indexer_search(input: String) -> FnResult<String> {
-    let req: SearchRequest = serde_json::from_str(&input)?;
-    let config = NewznabConfig::from_extism()?;
+fn search(req: SearchRequest) -> FnResult<SearchResponse> {
+    let config = NewznabConfig::from_host()?;
     let response = execute_full_search(&config, &req, torznab_metadata_extractor)?;
-    Ok(serde_json::to_string(&PluginResult::Ok(response))?)
+    Ok(response)
 }
 
-#[plugin_fn]
-pub fn scryer_indexer_action(input: String) -> FnResult<String> {
-    Ok(newznab_common::execute_provider_action(&input)?)
+fn action(request: PluginActionRequest) -> FnResult<PluginActionResponse> {
+    newznab_common::execute_provider_action(request)
 }
 
 fn torznab_metadata_extractor(
@@ -337,6 +329,12 @@ fn dedupe(values: Vec<String>) -> Vec<String> {
     out
 }
 
+indexer_command_compat::scryer_indexer_main!(
+    descriptor = build_descriptor,
+    search = search,
+    action = action,
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,7 +348,7 @@ mod tests {
 
     #[test]
     fn descriptor_is_torznab() {
-        let json = build_descriptor_json().unwrap();
+        let json = serde_json::to_string(&build_descriptor()).unwrap();
         assert!(json.contains("torznab"));
     }
 

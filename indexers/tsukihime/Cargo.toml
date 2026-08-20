@@ -1,7 +1,8 @@
 [package]
 name = "tsukihime-indexer"
-version = "0.1.0"
+version = "2.0.0"
 edition = "2024"
+autolib = false
 license = "GPL-3.0-only"
 description = "Tsukihime anime indexer using the public Tsukihime API"
 
@@ -10,17 +11,19 @@ official = true
 plugin_id = "tsukihime-indexer"
 status = "beta"
 catalog_versions = ["v3"]
-min_scryer_version = "0.17.0"
+min_scryer_version = "0.18.17"
 feature_sets = [{ required_features = [] }, { required_features = ["simd128", "relaxed-simd"] }]
 docs_url = "https://github.com/scryer-media/scryer-plugins/tree/main/indexers/tsukihime"
 source_repo = "https://github.com/scryer-media/scryer-plugins/tree/main/indexers/tsukihime"
 
-[lib]
-crate-type = ["cdylib"]
+[[bin]]
+name = "tsukihime-indexer"
+path = "src/lib.rs"
 
 [dependencies]
-extism-pdk = "1.4"
-scryer-plugin-sdk = "3.2.0"
+indexer-command-compat = { path = "../command-compat" }
+scryer-plugin-pdk = "0.5.7"
+scryer-plugin-sdk = "3.7.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

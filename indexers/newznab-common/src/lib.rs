@@ -9,10 +9,12 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use extism_pdk::*;
+use indexer_command_compat::{LogLevel, log};
 use quick_xml::escape::unescape;
 use quick_xml::events::{Event, attributes::Attribute};
 use quick_xml::{Reader, XmlVersion};
+use scryer_plugin_pdk::*;
+pub use scryer_plugin_sdk::command::{PluginActionRequest, PluginActionResponse};
 pub use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldRole, ConfigFieldType, IndexerCapabilities as Capabilities,
     IndexerCategoryModel, IndexerCategoryValueKind, IndexerDescriptor, IndexerFeedMode,
@@ -189,8 +191,8 @@ impl Default for NewznabHttpBehavior {
 }
 
 impl NewznabConfig {
-    /// Read configuration from Extism host config keys.
-    pub fn from_extism() -> Result<Self, Error> {
+    /// Read configuration from the descriptor-bound host config keys.
+    pub fn from_host() -> Result<Self, Error> {
         let base_url = config::get("base_url")
             .map_err(|e| Error::msg(format!("missing config base_url: {e}")))?
             .unwrap_or_default()
@@ -2785,14 +2787,23 @@ struct CapsConfig {
     api_path: String,
 }
 
-pub fn execute_provider_action(input: &str) -> Result<String, Error> {
-    let request: serde_json::Value = serde_json::from_str(input)?;
-    let response = match action_name(&request).as_deref() {
-        Some("newznabCategories") => newznab_categories(),
+/// Serve one provider action.
+///
+/// The command ABI carries the action name as its own typed field, so the
+/// legacy hunt through `action`/`name`/`providerAction` keys of an untyped
+/// request body is gone. An unknown action still answers with an empty payload
+/// rather than an error: the settings UI probes for optional actions, and a
+/// hard failure there would read as a broken indexer rather than an absent
+/// option list.
+pub fn execute_provider_action(
+    request: PluginActionRequest,
+) -> Result<PluginActionResponse, Error> {
+    let payload = match request.action.trim() {
+        "newznabCategories" => newznab_categories(),
         _ => serde_json::json!({}),
     };
 
-    Ok(serde_json::to_string(&PluginResult::Ok(response))?)
+    Ok(PluginActionResponse { payload })
 }
 
 fn newznab_categories() -> serde_json::Value {
@@ -2997,57 +3008,6 @@ fn default_newznab_categories() -> Vec<NewznabCategoryOption> {
         })
         .collect(),
     }]
-}
-
-fn action_name(request: &serde_json::Value) -> Option<String> {
-    string_member(request, &["action", "name", "providerAction"])
-}
-
-fn string_member(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|key| {
-            value.get(*key).and_then(|value| match value {
-                serde_json::Value::String(value) => Some(value.trim().to_string()),
-                serde_json::Value::Number(value) => Some(value.to_string()),
-                serde_json::Value::Bool(value) => Some(value.to_string()),
-                _ => None,
-            })
-        })
-        .filter(|value| !value.is_empty())
-}
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod extism_host_stubs {
-    #[unsafe(no_mangle)]
-    pub extern "C" fn alloc(_len: u64) -> u64 {
-        0
-    }
-
-    #[unsafe(no_mangle)]
-    pub extern "C" fn config_get(_ptr: u64) -> u64 {
-        0
-    }
-
-    #[unsafe(no_mangle)]
-    pub extern "C" fn length(_offset: u64) -> u64 {
-        0
-    }
-
-    #[unsafe(no_mangle)]
-    pub extern "C" fn load_u64(_offset: u64) -> u64 {
-        0
-    }
-
-    #[unsafe(no_mangle)]
-    pub extern "C" fn load_u8(_offset: u64) -> u8 {
-        0
-    }
-
-    #[unsafe(no_mangle)]
-    pub extern "C" fn store_u64(_offset: u64, _value: u64) {}
-
-    #[unsafe(no_mangle)]
-    pub extern "C" fn store_u8(_offset: u64, _value: u8) {}
 }
 
 #[cfg(test)]

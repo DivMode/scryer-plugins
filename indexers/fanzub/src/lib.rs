@@ -1,14 +1,9 @@
-use extism_pdk::*;
 use rss_indexer_common::*;
+use scryer_plugin_pdk::*;
 
 const PROVIDER_ID: &str = "fanzub";
 const DEFAULT_BASE_URL: &str = "http://fanzub.com/rss/";
 const DEFAULT_USER_AGENT: &str = "Scryer Fanzub Indexer/0.1";
-
-#[plugin_fn]
-pub fn scryer_describe(_input: String) -> FnResult<String> {
-    Ok(serde_json::to_string(&build_descriptor())?)
-}
 
 fn build_descriptor() -> PluginDescriptor {
     build_indexer_descriptor(DescriptorSpec {
@@ -44,20 +39,18 @@ fn build_descriptor() -> PluginDescriptor {
     })
 }
 
-#[plugin_fn]
-pub fn scryer_indexer_search(input: String) -> FnResult<String> {
-    let req: SearchRequest = serde_json::from_str(&input)?;
+fn search(req: SearchRequest) -> FnResult<SearchResponse> {
     let base_url = config_value("base_url").unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
     let anime_standard_format_search = config_bool("anime_standard_format_search");
     let url = fanzub_url(&base_url, &req, anime_standard_format_search);
-    let http_config = RssHttpConfig::from_extism(DEFAULT_USER_AGENT);
+    let http_config = RssHttpConfig::from_host(DEFAULT_USER_AGENT);
     let mut options = RssParseOptions::usenet(PROVIDER_ID);
     options.use_enclosure_url = true;
     options.use_enclosure_length = true;
     options.page_size = 100;
 
     let response = execute_rss_urls(PROVIDER_ID, &[url], &http_config, &req, options)?;
-    Ok(serde_json::to_string(&PluginResult::Ok(response))?)
+    Ok(response)
 }
 
 fn config_fields() -> Vec<ConfigFieldDef> {
@@ -146,6 +139,8 @@ fn clean_title(title: &str) -> String {
         .filter(|ch| !matches!(ch, '!' | '?' | '`'))
         .collect::<String>()
 }
+
+indexer_command_compat::scryer_indexer_main!(descriptor = build_descriptor, search = search,);
 
 #[cfg(test)]
 mod tests {

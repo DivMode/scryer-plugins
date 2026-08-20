@@ -1,17 +1,17 @@
 use std::collections::HashMap;
 
-use extism_pdk::*;
 use newznab_common::{
     Capabilities, IndexerCategoryModel, IndexerCategoryValueKind, IndexerDescriptor,
     IndexerFeedMode, IndexerLimitCapabilities, IndexerProtocol, IndexerResponseFeatures,
-    IndexerSearchInput, IndexerSourceKind, NewznabConfig, PluginDescriptor, PluginResult,
-    ProviderDescriptor, SDK_VERSION, SearchRequest, current_sdk_constraint, execute_full_search,
-    extract_base_metadata, standard_config_fields,
+    IndexerSearchInput, IndexerSourceKind, NewznabConfig, PluginActionRequest,
+    PluginActionResponse, PluginDescriptor, ProviderDescriptor, SDK_VERSION, SearchRequest,
+    SearchResponse, current_sdk_constraint, execute_full_search, extract_base_metadata,
+    standard_config_fields,
 };
+use scryer_plugin_pdk::*;
 
-#[plugin_fn]
-pub fn scryer_describe(_input: String) -> FnResult<String> {
-    let descriptor = PluginDescriptor {
+fn build_descriptor() -> PluginDescriptor {
+    PluginDescriptor {
         id: "newznab".to_string(),
         name: "Newznab Indexer".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -92,19 +92,21 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
             allowed_hosts: vec![],
             rate_limit_seconds: None,
         }),
-    };
-    Ok(serde_json::to_string(&descriptor)?)
+    }
 }
 
-#[plugin_fn]
-pub fn scryer_indexer_search(input: String) -> FnResult<String> {
-    let req: SearchRequest = serde_json::from_str(&input)?;
-    let config = NewznabConfig::from_extism()?;
+fn search(req: SearchRequest) -> FnResult<SearchResponse> {
+    let config = NewznabConfig::from_host()?;
     let response = execute_full_search(&config, &req, extract_base_metadata)?;
-    Ok(serde_json::to_string(&PluginResult::Ok(response))?)
+    Ok(response)
 }
 
-#[plugin_fn]
-pub fn scryer_indexer_action(input: String) -> FnResult<String> {
-    Ok(newznab_common::execute_provider_action(&input)?)
+fn action(request: PluginActionRequest) -> FnResult<PluginActionResponse> {
+    newznab_common::execute_provider_action(request)
 }
+
+indexer_command_compat::scryer_indexer_main!(
+    descriptor = build_descriptor,
+    search = search,
+    action = action,
+);
