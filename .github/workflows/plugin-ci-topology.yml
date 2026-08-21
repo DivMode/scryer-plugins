@@ -1,0 +1,22 @@
+name: plugin-ci topology
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/plugin-ci.yml
+      - .github/workflows/plugin-ci-topology.yml
+      - .github/scripts/plan-plugin-ci.py
+      - xtask/**
+
+concurrency:
+  group: plugin-ci-topology-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    uses: ./.github/workflows/plugin-ci.yml
+    permissions:
+      contents: read
