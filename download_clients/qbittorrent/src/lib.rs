@@ -2262,8 +2262,14 @@ fn map_state(state: &str) -> DownloadItemState {
         // Keep the torrent visible for operator diagnosis instead of triggering
         // Scryer's failed-download cleanup flow.
         "error" | "missingfiles" => DownloadItemState::Warning,
-        "unknown" => DownloadItemState::Error,
-        _ => DownloadItemState::Warning,
+        // `unknown` is qBittorrent's own "I could not determine this torrent's
+        // state" answer, and anything unmatched is a state a newer qBittorrent
+        // added. Neither is evidence of a failure, and neither should become a
+        // queue row that is never cleaned up: keep polling, like Sonarr's
+        // `default: // new status in API? default to downloading`
+        // (Download/Clients/QBittorrent/QBittorrent.cs:350-355). `state_message`
+        // carries the state string so the operator still sees what happened.
+        _ => DownloadItemState::Downloading,
     }
 }
 
@@ -2275,11 +2281,20 @@ fn now_unix_seconds() -> i64 {
 }
 
 fn state_message(state: &str) -> Option<String> {
-    match state.trim().to_ascii_lowercase().as_str() {
+    let normalized = state.trim().to_ascii_lowercase();
+    match normalized.as_str() {
         "missingfiles" => Some("qBittorrent reports missing files".to_string()),
         "error" => Some("qBittorrent reports a torrent error".to_string()),
         "moving" => Some("qBittorrent is moving torrent files".to_string()),
-        _ => None,
+        // Mirrors the state arms that `map_state` recognises; anything else is
+        // an unknown or newly added qBittorrent state, reported as Downloading
+        // with the raw state so the operator can see it.
+        "queueddl" | "pauseddl" | "stoppeddl" | "metadl" | "forcedmetadl" | "stalleddl"
+        | "forceddl" | "downloading" | "allocating" | "checkingup" | "checkingdl"
+        | "checkingresumedata" | "pausedup" | "stoppedup" | "queuedup" | "stalledup"
+        | "uploading" | "forcedup" => None,
+        "" => Some("qBittorrent reported no torrent state".to_string()),
+        other => Some(format!("Unknown qBittorrent download state: {other}")),
     }
 }
 
@@ -3323,6 +3338,45 @@ mod tests {
         assert_eq!(map_state("error"), DownloadItemState::Warning);
         assert_eq!(map_state("downloading"), DownloadItemState::Downloading);
         assert_eq!(map_state("uploading"), DownloadItemState::Completed);
+    }
+
+    #[test]
+    fn unknown_states_keep_polling_instead_of_warning_or_failing() {
+        // qBittorrent's own "state could not be determined" answer, and any
+        // state a newer qBittorrent adds, are not failures and must not park a
+        // queue row in a state nothing clears.
+        for state in ["unknown", "somethingNew", ""] {
+            assert_eq!(
+                map_state(state),
+                DownloadItemState::Downloading,
+                "state {state:?} should keep polling"
+            );
+            assert_ne!(map_state(state), DownloadItemState::Warning);
+            assert_ne!(map_state(state), DownloadItemState::Error);
+        }
+    }
+
+    #[test]
+    fn unknown_states_still_carry_an_operator_message() {
+        assert_eq!(
+            state_message("somethingNew").as_deref(),
+            Some("Unknown qBittorrent download state: somethingnew")
+        );
+        assert_eq!(
+            state_message("unknown").as_deref(),
+            Some("Unknown qBittorrent download state: unknown")
+        );
+        assert_eq!(
+            state_message("").as_deref(),
+            Some("qBittorrent reported no torrent state")
+        );
+        // Recognised states keep their existing messages (or none at all).
+        assert_eq!(state_message("downloading"), None);
+        assert_eq!(state_message("stoppedUP"), None);
+        assert_eq!(
+            state_message("missingFiles").as_deref(),
+            Some("qBittorrent reports missing files")
+        );
     }
 }
 

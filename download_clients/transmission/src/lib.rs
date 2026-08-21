@@ -1013,7 +1013,13 @@ fn map_state(torrent: &TransmissionTorrent) -> DownloadItemState {
         3 | 5 => DownloadItemState::Queued,
         4 => DownloadItemState::Downloading,
         6 => DownloadItemState::Completed,
-        _ => DownloadItemState::Warning,
+        // A status code outside the documented 0..=6 range is a newer
+        // Transmission, not a fault: Transmission reports real faults through
+        // `errorString`, which is handled above. Keep polling rather than
+        // parking the row in a state nothing ever clears, matching Sonarr's
+        // final `else { Downloading }`
+        // (Download/Clients/Transmission/TransmissionBase.cs:130-133).
+        _ => DownloadItemState::Downloading,
     }
 }
 
@@ -1487,6 +1493,28 @@ mod tests {
             Some(false)
         );
         assert_eq!(map(r#"{"hashString":"a1","name":"n"}"#), None);
+    }
+
+    #[test]
+    fn an_undocumented_status_code_keeps_polling_instead_of_warning() {
+        // Transmission reports real faults through `errorString`; a status code
+        // outside 0..=6 is a newer Transmission, not a failure, and must not
+        // park the row in a state nothing clears.
+        let torrent = TransmissionTorrent {
+            total_size: 1_000,
+            left_until_done: 400,
+            is_finished: false,
+            status: 42,
+            ..TransmissionTorrent::default()
+        };
+        assert_eq!(map_state(&torrent), DownloadItemState::Downloading);
+
+        // An error string still wins, whatever the status code.
+        let errored = TransmissionTorrent {
+            error_string: "No data found!".to_string(),
+            ..torrent
+        };
+        assert_eq!(map_state(&errored), DownloadItemState::Warning);
     }
 
     #[test]

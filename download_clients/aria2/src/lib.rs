@@ -794,7 +794,14 @@ fn map_state(torrent: &Aria2Status) -> DownloadItemState {
         "error" => DownloadItemState::Failed,
         "complete" => DownloadItemState::Completed,
         "removed" => DownloadItemState::Completed,
-        _ => DownloadItemState::Warning,
+        // aria2 only ever reports the six statuses above, so this arm is for a
+        // future aria2 that grows one. An unrecognised status is not evidence
+        // of a failure, and a Warning here would be a queue row nothing ever
+        // clears; keep polling instead. (Sonarr leaves its pre-initialised
+        // `DownloadItemStatus.Failed` in place for the same case,
+        // Download/Clients/Aria2/Aria2.cs:95 — the harsher choice, and the one
+        // Scryer's failed-download cleanup makes destructive.)
+        _ => DownloadItemState::Downloading,
     }
 }
 
@@ -1031,6 +1038,23 @@ mod tests {
     fn is_private_is_never_claimed_because_aria2_does_not_report_it() {
         let item = torrent_to_item(status("complete", 1_000));
         assert_eq!(item.torrent.unwrap().is_private, None);
+    }
+
+    #[test]
+    fn an_unrecognised_status_keeps_polling_instead_of_warning_or_failing() {
+        // A status aria2 does not document today must not park the row in a
+        // state nothing clears, nor trip Scryer's failed-download cleanup.
+        assert_eq!(
+            map_state(&status("somethingNew", 400)),
+            DownloadItemState::Downloading
+        );
+        // The documented statuses keep their meaning.
+        assert_eq!(map_state(&status("error", 400)), DownloadItemState::Failed);
+        assert_eq!(map_state(&status("paused", 400)), DownloadItemState::Paused);
+        assert_eq!(
+            map_state(&status("complete", 1_000)),
+            DownloadItemState::Completed
+        );
     }
 }
 
