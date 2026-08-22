@@ -645,9 +645,33 @@ fn torrent_to_item(torrent: RTorrentTorrent) -> PluginDownloadItem {
 }
 
 fn torrent_matches_scope(config: &RTorrentConfig, torrent: &RTorrentTorrent) -> bool {
-    (config.category.is_empty() || torrent.category == config.category)
+    category_allowed(&config.category, &torrent.category)
         && !torrent.path.trim().is_empty()
         && !torrent.path.trim_start().starts_with('.')
+}
+
+/// `category` may list several labels, comma or newline separated.
+///
+/// The host tags each download with its per-scope routing category, so a single
+/// client can legitimately hold `movies`, `tv` and `anime` at once. Matching the
+/// queue against one configured value made every other facet's downloads
+/// invisible: they were never listed, never tracked, and so never imported,
+/// while `scryer_download_add` had happily tagged them. An empty setting still
+/// matches everything, and a single value behaves exactly as before.
+fn category_allowed(configured: &str, actual: &str) -> bool {
+    let actual = actual.trim();
+    let mut configured_any = false;
+    for want in configured.split([',', '\n']) {
+        let want = want.trim();
+        if want.is_empty() {
+            continue;
+        }
+        configured_any = true;
+        if want.eq_ignore_ascii_case(actual) {
+            return true;
+        }
+    }
+    !configured_any
 }
 
 fn torrent_to_completed(torrent: RTorrentTorrent) -> PluginCompletedDownload {
