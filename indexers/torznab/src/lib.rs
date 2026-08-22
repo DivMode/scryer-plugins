@@ -5,7 +5,7 @@ use newznab_common::{
     IndexerFeedMode, IndexerLimitCapabilities, IndexerProtocol, IndexerResponseFeatures,
     IndexerSearchInput, IndexerSourceKind, IndexerTorrentCapabilities, NewznabConfig,
     PluginActionRequest, PluginActionResponse, PluginDescriptor, ProviderDescriptor, SDK_VERSION,
-    SearchRequest, SearchResponse, current_sdk_constraint, execute_full_search,
+    SearchRequest, SearchResponse, SearchResult, current_sdk_constraint, execute_full_search,
     standard_config_fields,
 };
 use scryer_plugin_pdk::*;
@@ -110,8 +110,40 @@ fn build_descriptor() -> PluginDescriptor {
 
 fn search(req: SearchRequest) -> FnResult<SearchResponse> {
     let config = NewznabConfig::from_host()?;
-    let response = execute_full_search(&config, &req, torznab_metadata_extractor)?;
+    let mut response = execute_full_search(&config, &req, torznab_metadata_extractor)?;
+    apply_magnet_fallback(&mut response);
     Ok(response)
+}
+
+/// Provider-extra key the extractor uses for a magnet it *synthesized* from
+/// `infohash`. Never leaves this plugin: `apply_magnet_fallback` either promotes
+/// it to `magnet_uri` or drops it.
+const MAGNET_URI_FALLBACK_KEY: &str = "magnet_uri_fallback";
+
+/// A magnet the feed itself supplies (`magneturl`) is an indexer artifact and is
+/// reported as such. A magnet synthesized from `infohash` is not: it names only
+/// public trackers and carries no private flag, so next to a real torrent link
+/// it would outrank the file the tracker actually serves — Sonarr never
+/// synthesizes one — and on a private tracker it can never fetch metadata at
+/// all. Keep it strictly as the last resort for an item that offers no other
+/// way to download.
+fn apply_magnet_fallback(response: &mut SearchResponse) {
+    for result in &mut response.results {
+        let fallback = result
+            .provider_extra
+            .remove(MAGNET_URI_FALLBACK_KEY)
+            .and_then(|value| value.as_str().map(str::to_string));
+        if result.magnet_url.is_some() || result.download_url.is_some() {
+            continue;
+        }
+        if let Some(magnet_uri) = fallback {
+            result.provider_extra.insert(
+                "magnet_uri".to_string(),
+                serde_json::Value::from(magnet_uri.clone()),
+            );
+            result.magnet_url = Some(magnet_uri);
+        }
+    }
 }
 
 fn action(request: PluginActionRequest) -> FnResult<PluginActionResponse> {
@@ -241,10 +273,12 @@ fn torznab_metadata_extractor(
             "info_hash".to_string(),
             serde_json::Value::from(value.as_str()),
         );
-        // Auto-generate magnet URI if tracker didn't provide one
+        // A magnet synthesized from the info hash is only a fallback for an item
+        // with no other download path; `apply_magnet_fallback` decides that once
+        // the item's enclosure is known. It must not masquerade as `magnet_uri`.
         if magnet_uri.is_none() {
             extra.insert(
-                "magnet_uri".to_string(),
+                MAGNET_URI_FALLBACK_KEY.to_string(),
                 serde_json::Value::from(build_magnet_uri(value)),
             );
         }
@@ -375,6 +409,96 @@ mod tests {
             Some(&serde_json::Value::from("magnet:?xt=urn:btih:abcdef"))
         );
         assert_eq!(extra.get("freeleech"), Some(&serde_json::Value::from(true)));
+    }
+
+    #[test]
+    fn a_synthesized_magnet_is_kept_out_of_magnet_uri_by_the_extractor() {
+        let p = pairs(&[("infohash", "ABCDEF1234567890ABCDEF1234567890ABCDEF12")]);
+        let (_, _, extra) = torznab_metadata_extractor(&p);
+        assert_eq!(extra.get("magnet_uri"), None);
+        let fallback = extra
+            .get(MAGNET_URI_FALLBACK_KEY)
+            .and_then(|value| value.as_str())
+            .expect("synthesized magnet lands under the fallback key");
+        assert!(
+            fallback.starts_with("magnet:?xt=urn:btih:abcdef1234567890abcdef1234567890abcdef12")
+        );
+    }
+
+    fn result_with_fallback(download_url: Option<&str>, magnet_url: Option<&str>) -> SearchResult {
+        let mut provider_extra = HashMap::new();
+        provider_extra.insert(
+            "info_hash".to_string(),
+            serde_json::Value::from("abcdef1234567890abcdef1234567890abcdef12"),
+        );
+        provider_extra.insert(
+            MAGNET_URI_FALLBACK_KEY.to_string(),
+            serde_json::Value::from(build_magnet_uri("abcdef1234567890abcdef1234567890abcdef12")),
+        );
+        SearchResult {
+            title: "Release".to_string(),
+            download_url: download_url.map(str::to_string),
+            magnet_url: magnet_url.map(str::to_string),
+            provider_extra,
+            ..Default::default()
+        }
+    }
+
+    fn response_of(results: Vec<SearchResult>) -> SearchResponse {
+        SearchResponse {
+            results,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_synthesized_magnet_never_competes_with_a_torrent_link() {
+        let mut response = response_of(vec![result_with_fallback(
+            Some("https://tracker.example/download/1.torrent"),
+            None,
+        )]);
+        apply_magnet_fallback(&mut response);
+        let result = &response.results[0];
+        assert_eq!(result.magnet_url, None);
+        assert_eq!(result.provider_extra.get("magnet_uri"), None);
+        assert_eq!(result.provider_extra.get(MAGNET_URI_FALLBACK_KEY), None);
+        assert_eq!(
+            result.download_url.as_deref(),
+            Some("https://tracker.example/download/1.torrent")
+        );
+        assert!(result.provider_extra.contains_key("info_hash"));
+    }
+
+    #[test]
+    fn a_synthesized_magnet_is_the_last_resort_for_an_item_with_no_download_path() {
+        let mut response = response_of(vec![result_with_fallback(None, None)]);
+        apply_magnet_fallback(&mut response);
+        let result = &response.results[0];
+        let magnet = result.magnet_url.as_deref().expect("fallback promoted");
+        assert!(magnet.starts_with("magnet:?xt=urn:btih:abcdef1234567890abcdef1234567890abcdef12"));
+        assert_eq!(
+            result
+                .provider_extra
+                .get("magnet_uri")
+                .and_then(|value| value.as_str()),
+            Some(magnet)
+        );
+        assert_eq!(result.provider_extra.get(MAGNET_URI_FALLBACK_KEY), None);
+    }
+
+    #[test]
+    fn an_indexer_provided_magnet_is_left_alone() {
+        let mut response = response_of(vec![result_with_fallback(
+            Some("https://tracker.example/download/1.torrent"),
+            Some("magnet:?xt=urn:btih:abcdef"),
+        )]);
+        apply_magnet_fallback(&mut response);
+        let result = &response.results[0];
+        assert_eq!(
+            result.magnet_url.as_deref(),
+            Some("magnet:?xt=urn:btih:abcdef")
+        );
+        assert_eq!(result.provider_extra.get(MAGNET_URI_FALLBACK_KEY), None);
     }
 
     #[test]
