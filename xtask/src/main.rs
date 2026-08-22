@@ -657,12 +657,8 @@ struct LocalPluginInfo {
     max_scryer_version: Option<String>,
     docs_url: String,
     plugin_dir: PathBuf,
-    cargo_toml: PathBuf,
-    crate_name: String,
-    current_version: Version,
     source_repo: String,
     distribution_base_url: String,
-    local_dependency_dirs: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2423,8 +2419,6 @@ fn plugin_crate_version(plugin_dir: &Path) -> Result<String> {
 
 fn discover_local_plugin(ctx: &TaskContext, plugin_dir: &Path) -> Result<LocalPluginInfo> {
     let cargo_toml = plugin_dir.join("Cargo.toml");
-    let crate_name = crate_name_from_manifest(&cargo_toml)?;
-    let current_version = version_from_manifest(&cargo_toml)?;
     let manifest_metadata = plugin_manifest_metadata(&cargo_toml)?;
     let description = manifest_metadata.description.clone();
     let manifest_plugin_id = manifest_metadata.plugin_id.as_deref().ok_or_else(|| {
@@ -2449,7 +2443,6 @@ fn discover_local_plugin(ctx: &TaskContext, plugin_dir: &Path) -> Result<LocalPl
         manifest_plugin_id,
         &public_catalog_base_url(),
     );
-    let local_dependency_dirs = local_path_dependency_dirs(ctx, &cargo_toml, plugin_dir)?;
     let descriptor_feature_set = primary_feature_set(&manifest_metadata.feature_sets);
     let wasm = build_plugin_wasm(ctx, plugin_dir, descriptor_feature_set)?;
     let descriptor = load_descriptor_from_wasm(&wasm)?;
@@ -2476,12 +2469,8 @@ fn discover_local_plugin(ctx: &TaskContext, plugin_dir: &Path) -> Result<LocalPl
         max_scryer_version: manifest_metadata.max_scryer_version,
         docs_url,
         plugin_dir: plugin_dir.to_path_buf(),
-        cargo_toml,
-        crate_name,
-        current_version,
         source_repo,
         distribution_base_url,
-        local_dependency_dirs,
     })
 }
 
@@ -9325,14 +9314,10 @@ mod tests {
                 "https://github.com/scryer-media/scryer-plugins/tree/main/notifications/email"
                     .to_string(),
             plugin_dir: PathBuf::from("/tmp/email"),
-            cargo_toml: PathBuf::from("/tmp/email/Cargo.toml"),
-            crate_name: "email".to_string(),
-            current_version: Version::new(0, 1, 0),
             source_repo:
                 "https://github.com/scryer-media/scryer-plugins/tree/main/notifications/email"
                     .to_string(),
             distribution_base_url: "https://cdn.scryer.media/scryer/plugins-v3/email".to_string(),
-            local_dependency_dirs: BTreeSet::new(),
         }
     }
 
