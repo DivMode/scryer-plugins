@@ -1938,9 +1938,7 @@ fn require_release_branch(ctx: &TaskContext) -> Result<String> {
         return Ok(branch);
     }
 
-    bail!(
-        "release preparation must run from a release/* branch (current branch: {branch})"
-    )
+    bail!("release preparation must run from a release/* branch (current branch: {branch})")
 }
 
 fn require_prepare_mode(options: &ReleaseOptions) -> Result<()> {
@@ -2382,9 +2380,7 @@ fn local_plugin_directories(ctx: &TaskContext) -> Result<Vec<PathBuf>> {
     Ok(plugin_dirs)
 }
 
-fn release_publication_candidates(
-    ctx: &TaskContext,
-) -> Result<Vec<ReleasePublicationCandidate>> {
+fn release_publication_candidates(ctx: &TaskContext) -> Result<Vec<ReleasePublicationCandidate>> {
     let mut candidates = Vec::new();
     for plugin_dir in tracked_plugin_crate_dirs(ctx)? {
         let cargo_toml = plugin_dir.join("Cargo.toml");
@@ -2398,8 +2394,7 @@ fn release_publication_candidates(
                 cargo_toml.display()
             )
         })?;
-        let local_dependency_dirs =
-            local_path_dependency_dirs(ctx, &cargo_toml, &plugin_dir)?;
+        let local_dependency_dirs = local_path_dependency_dirs(ctx, &cargo_toml, &plugin_dir)?;
         candidates.push(ReleasePublicationCandidate {
             plugin_id,
             plugin_dir,
@@ -2706,9 +2701,11 @@ fn latest_plugin_v3_release_tag(ctx: &TaskContext, plugin_id: &str) -> Result<Op
 
 fn remote_tag_exists(ctx: &TaskContext, tag: &str) -> Result<bool> {
     let remote_ref = format!("refs/tags/{tag}");
-    Ok(!git_capture(ctx, &["ls-remote", "--tags", "origin", &remote_ref])?
-        .trim()
-        .is_empty())
+    Ok(
+        !git_capture(ctx, &["ls-remote", "--tags", "origin", &remote_ref])?
+            .trim()
+            .is_empty(),
+    )
 }
 
 fn head_short_sha(ctx: &TaskContext) -> Result<String> {
@@ -3024,18 +3021,15 @@ fn fetch_origin_main_and_tags(ctx: &TaskContext) -> Result<()> {
 
 fn merged_pull_request_commit(ctx: &TaskContext, pr: u64) -> Result<String> {
     let pr_number = pr.to_string();
-    let output = run_capture(
-        ctx.command_in("gh", &ctx.repo_root)
-            .args([
-                "pr",
-                "view",
-                &pr_number,
-                "--repo",
-                OFFICIAL_GITHUB_REPO,
-                "--json",
-                "state,baseRefName,mergeCommit",
-            ]),
-    )?;
+    let output = run_capture(ctx.command_in("gh", &ctx.repo_root).args([
+        "pr",
+        "view",
+        &pr_number,
+        "--repo",
+        OFFICIAL_GITHUB_REPO,
+        "--json",
+        "state,baseRefName,mergeCommit",
+    ]))?;
     let pull_request: GitHubPullRequest =
         serde_json::from_str(&output).context("parse GitHub pull request metadata")?;
     if pull_request.state != "MERGED" {
@@ -3094,11 +3088,7 @@ fn verify_tag_absent_locally_and_remotely(ctx: &TaskContext, tag: &str) -> Resul
     Ok(())
 }
 
-fn create_and_verify_signed_tag(
-    ctx: &TaskContext,
-    tag: &str,
-    message: &str,
-) -> Result<()> {
+fn create_and_verify_signed_tag(ctx: &TaskContext, tag: &str, message: &str) -> Result<()> {
     let mut create_tag = ctx.command_in("git", &ctx.repo_root);
     create_tag.args(["tag", "-s", tag, "-m", message, "HEAD"]);
     run_checked(&mut create_tag)?;
@@ -9017,7 +9007,12 @@ fn run_release_many(ctx: &TaskContext, args: ReleaseManyArgs) -> Result<()> {
     let plugins = release_publication_candidates(ctx)?;
     let mut targets = Vec::new();
     for plugin_name in &args.plugin_names {
-        targets.push(resolve_release_target(ctx, &plugins, plugin_name, &args.options)?);
+        targets.push(resolve_release_target(
+            ctx,
+            &plugins,
+            plugin_name,
+            &args.options,
+        )?);
     }
     run_release_targets(ctx, targets, &args.options)
 }
@@ -9045,9 +9040,8 @@ mod tests {
             _ => panic!("expected release command"),
         }
 
-        let publish =
-            Cli::try_parse_from(["xtask", "release-publish-tags", "--pr", "42"])
-                .expect("parse tag publication");
+        let publish = Cli::try_parse_from(["xtask", "release-publish-tags", "--pr", "42"])
+            .expect("parse tag publication");
         match publish.command {
             Commands::ReleasePublishTags(args) => assert_eq!(args.pr, 42),
             _ => panic!("expected release-publish-tags command"),
