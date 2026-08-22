@@ -31,10 +31,16 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
             provider_aliases: vec!["btn".to_string(), "broadcasthe.net".to_string()],
             source_kind: IndexerSourceKind::Torrent,
             capabilities: Capabilities {
-                supported_ids: HashMap::from([(
-                    "series".to_string(),
-                    vec!["tvdb_id".to_string(), "tvrage_id".to_string()],
-                )]),
+                supported_ids: HashMap::from([
+                    (
+                        "series".to_string(),
+                        vec!["tvdb_id".to_string(), "tvrage_id".to_string()],
+                    ),
+                    (
+                        "anime".to_string(),
+                        vec!["tvdb_id".to_string(), "tvrage_id".to_string()],
+                    ),
+                ]),
                 deduplicates_aliases: false,
                 season_param: Some("season".to_string()),
                 episode_param: Some("episode".to_string()),
@@ -108,14 +114,22 @@ pub fn scryer_indexer_search(input: String) -> FnResult<String> {
         for page in 0..MAX_PAGES {
             let offset = page * PAGE_SIZE;
             let response = execute_query(&base_url, &api_key, &query, offset)?;
+            // BTN reports the total match count; stop once this page reaches it
+            // instead of spending another round trip to discover an empty page.
+            // BTN cannot filter some series server-side (it returns the whole
+            // series), and each call can take >10s, which overran Scryer's
+            // search timeout on a 161-torrent series (observed 2026-08-22).
+            let total = response.results as usize;
             let mut page_results = parse_response(&base_url, response)?;
             let empty = page_results.is_empty();
             results.append(&mut page_results);
-            if empty || results.len() >= limit {
+            if empty || results.len() >= limit || offset + PAGE_SIZE >= total {
                 break;
             }
         }
-        if results.len() >= limit {
+        // Tier semantics: the first query that produces anything wins, so the
+        // expensive whole-series fallback never runs when a Name tier matched.
+        if !results.is_empty() || results.len() >= limit {
             break;
         }
     }
@@ -182,11 +196,40 @@ fn build_queries(req: &SearchRequest) -> Vec<BtnQuery> {
         base.tvrage = Some(tvrage.to_string());
     }
 
+    // Queries are tiers, tried in order; the caller stops at the first tier
+    // that returns anything. Measured against BTN 2026-08-22:
+    //
+    //   Devil May Cry (tvdb 440193)      Name "S01%E01%"  -> 1   "S01%E001%" -> 0
+    //   Renegade Immortal (tvdb 433335)  Name "S01%E99%"  -> 0   "S01%E099%" -> 1
+    //
+    // Long-running series using absolute numbering are uploaded as S01E099;
+    // "E99" does not occur anywhere in "E099", so a two-digit pattern cannot
+    // match them. Neither width works for both series, hence two tiers.
+    //
+    // BTN also ignores its own Season/Episode filters for some series
+    // (Renegade Immortal returns all 161 torrents regardless), so those are
+    // the last resort only: paging that many results overran Scryer's search
+    // timeout.
     match (req.season, req.episode) {
         (Some(season), Some(episode)) => {
             queries.push(BtnQuery {
                 category: Some("Episode".to_string()),
                 name: Some(format!("S{season:02}%E{episode:02}%")),
+                ..base.clone()
+            });
+            // Episodes >= 100 already render as three digits; re-querying is
+            // an identical request, so skip it.
+            if episode < 100 {
+                queries.push(BtnQuery {
+                    category: Some("Episode".to_string()),
+                    name: Some(format!("S{season:02}%E{episode:03}%")),
+                    ..base.clone()
+                });
+            }
+            queries.push(BtnQuery {
+                category: Some("Episode".to_string()),
+                season: Some(season.to_string()),
+                episode: Some(episode.to_string()),
                 ..base
             });
         }
@@ -484,6 +527,10 @@ struct BtnQuery {
     tvrage: Option<String>,
     #[serde(rename = "Age", skip_serializing_if = "Option::is_none")]
     age: Option<String>,
+    #[serde(rename = "Season", skip_serializing_if = "Option::is_none")]
+    season: Option<String>,
+    #[serde(rename = "Episode", skip_serializing_if = "Option::is_none")]
+    episode: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -494,25 +541,27 @@ struct JsonRpcResponse<T> {
 
 #[derive(Deserialize)]
 struct BtnTorrents {
-    #[serde(rename = "Torrents")]
+    // BTN returns the wrapper keys in lowercase ("torrents"/"results"); only
+    // the per-torrent fields are CamelCase. Accept both spellings.
+    #[serde(rename = "Torrents", alias = "torrents")]
     torrents: Option<HashMap<String, BtnTorrent>>,
-    #[serde(rename = "Results")]
+    #[serde(rename = "Results", alias = "results", deserialize_with = "de_u32")]
     results: u32,
 }
 
 #[derive(Deserialize)]
 struct BtnTorrent {
-    #[serde(rename = "GroupID")]
+    #[serde(rename = "GroupID", deserialize_with = "de_i64")]
     group_id: i64,
-    #[serde(rename = "TorrentID")]
+    #[serde(rename = "TorrentID", deserialize_with = "de_i64")]
     torrent_id: i64,
     #[serde(rename = "Category")]
     category: String,
-    #[serde(rename = "Snatched")]
+    #[serde(rename = "Snatched", deserialize_with = "de_opt_i64")]
     snatched: Option<i64>,
-    #[serde(rename = "Seeders")]
+    #[serde(rename = "Seeders", deserialize_with = "de_opt_i64")]
     seeders: Option<i64>,
-    #[serde(rename = "Leechers")]
+    #[serde(rename = "Leechers", deserialize_with = "de_opt_i64")]
     leechers: Option<i64>,
     #[serde(rename = "Source")]
     source: Option<String>,
@@ -526,13 +575,13 @@ struct BtnTorrent {
     origin: Option<String>,
     #[serde(rename = "ReleaseName")]
     release_name: String,
-    #[serde(rename = "Size")]
+    #[serde(rename = "Size", deserialize_with = "de_i64")]
     size: i64,
-    #[serde(rename = "Time")]
+    #[serde(rename = "Time", deserialize_with = "de_i64")]
     time: i64,
-    #[serde(rename = "TvdbID")]
+    #[serde(rename = "TvdbID", deserialize_with = "de_opt_i64")]
     tvdb_id: Option<i64>,
-    #[serde(rename = "TvrageID")]
+    #[serde(rename = "TvrageID", deserialize_with = "de_opt_i64")]
     tvrage_id: Option<i64>,
     #[serde(rename = "ImdbID")]
     imdb_id: Option<String>,
@@ -542,4 +591,64 @@ struct BtnTorrent {
     tags: Option<Vec<String>>,
     #[serde(rename = "DownloadURL")]
     download_url: String,
+}
+
+// BroadcasTheNet returns every scalar as a JSON string ("14", "515952755").
+// The upstream structs typed them as integers, so serde rejected the real
+// payload. Accept either spelling.
+fn de_u32<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(de_i64(deserializer)?.max(0) as u32)
+}
+
+fn de_i64<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrInt {
+        String(String),
+        Int(i64),
+        Float(f64),
+    }
+    match StringOrInt::deserialize(deserializer)? {
+        StringOrInt::Int(value) => Ok(value),
+        StringOrInt::Float(value) => Ok(value as i64),
+        StringOrInt::String(value) => value
+            .trim()
+            .parse::<i64>()
+            .map_err(serde::de::Error::custom),
+    }
+}
+
+fn de_opt_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum MaybeStringOrInt {
+        String(String),
+        Int(i64),
+        Float(f64),
+        Null,
+    }
+    match Option::<MaybeStringOrInt>::deserialize(deserializer)? {
+        None | Some(MaybeStringOrInt::Null) => Ok(None),
+        Some(MaybeStringOrInt::Int(value)) => Ok(Some(value)),
+        Some(MaybeStringOrInt::Float(value)) => Ok(Some(value as i64)),
+        Some(MaybeStringOrInt::String(value)) => {
+            let value = value.trim();
+            if value.is_empty() {
+                return Ok(None);
+            }
+            value
+                .parse::<i64>()
+                .map(Some)
+                .map_err(serde::de::Error::custom)
+        }
+    }
 }
