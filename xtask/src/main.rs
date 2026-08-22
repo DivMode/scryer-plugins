@@ -25,7 +25,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::BufWriter;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::LazyLock;
