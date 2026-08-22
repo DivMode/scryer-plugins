@@ -5,7 +5,7 @@ use newznab_common::{
     IndexerFeedMode, IndexerLimitCapabilities, IndexerProtocol, IndexerResponseFeatures,
     IndexerSearchInput, IndexerSourceKind, IndexerTorrentCapabilities, NewznabConfig,
     PluginActionRequest, PluginActionResponse, PluginDescriptor, ProviderDescriptor, SDK_VERSION,
-    SearchRequest, SearchResponse, SearchResult, current_sdk_constraint, execute_full_search,
+    SearchRequest, SearchResponse, current_sdk_constraint, execute_full_search,
     standard_config_fields,
 };
 use scryer_plugin_pdk::*;
@@ -372,6 +372,7 @@ indexer_command_compat::scryer_indexer_main!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use newznab_common::SearchResult;
 
     fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
         items
