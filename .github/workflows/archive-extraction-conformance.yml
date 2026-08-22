@@ -7,14 +7,6 @@ on:
       - archive_extractors/archive-extraction/**
       - pdk/scryer-plugin-pdk/**
       - .github/workflows/archive-extraction-conformance.yml
-  push:
-    branches:
-      - main
-    paths:
-      - .gitattributes
-      - archive_extractors/archive-extraction/**
-      - pdk/scryer-plugin-pdk/**
-      - .github/workflows/archive-extraction-conformance.yml
   workflow_dispatch:
 
 concurrency:

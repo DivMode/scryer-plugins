@@ -25,7 +25,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::BufWriter;
-use std::io::{self, Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::LazyLock;
@@ -240,6 +240,7 @@ enum Commands {
     Release(ReleaseArgs),
     ReleaseMany(ReleaseManyArgs),
     ReleaseChanged(ReleaseChangedArgs),
+    ReleasePublishTags(ReleasePublishTagsArgs),
     Plugin(PluginArgs),
     Ffmpeg(FfmpegArgs),
     Vad(VadArgs),
@@ -260,8 +261,16 @@ struct ReleaseOptions {
     patch: bool,
     #[arg(long)]
     dry_run: bool,
+    #[arg(long, help = "Prepare a release bump on a clean release/* branch")]
+    prepare: bool,
     #[arg(long)]
     version: Option<String>,
+}
+
+#[derive(Args)]
+struct ReleasePublishTagsArgs {
+    #[arg(long)]
+    pr: u64,
 }
 
 #[derive(Args)]
@@ -603,6 +612,29 @@ struct ReleaseTarget {
     current_version: Version,
     next_version: Version,
     tag_name: String,
+}
+
+#[derive(Clone)]
+struct ReleasePublicationCandidate {
+    plugin_id: String,
+    plugin_dir: PathBuf,
+    cargo_toml: PathBuf,
+    crate_name: String,
+    version: Version,
+    local_dependency_dirs: BTreeSet<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHubPullRequest {
+    state: String,
+    base_ref_name: String,
+    merge_commit: Option<GitHubCommit>,
+}
+
+#[derive(Deserialize)]
+struct GitHubCommit {
+    oid: String,
 }
 
 #[derive(Clone)]
@@ -1322,6 +1354,7 @@ fn main() -> Result<()> {
         Commands::Release(args) => run_release(&ctx, args),
         Commands::ReleaseMany(args) => run_release_many(&ctx, args),
         Commands::ReleaseChanged(args) => run_release_changed(&ctx, args),
+        Commands::ReleasePublishTags(args) => run_release_publish_tags(&ctx, args),
         Commands::Plugin(args) => match args.command {
             PluginCommand::New(args) => plugin_new::run_plugin_new(&ctx, args),
             PluginCommand::Validate(args) => run_plugin_validate(&ctx, args),
@@ -1890,23 +1923,34 @@ fn current_branch(ctx: &TaskContext) -> Result<String> {
     git_capture(ctx, &["rev-parse", "--abbrev-ref", "HEAD"]).map(|value| value.trim().to_string())
 }
 
-fn prompt_continue_if_dirty(ctx: &TaskContext) -> Result<()> {
+fn require_clean_worktree(ctx: &TaskContext) -> Result<()> {
     let status = git_capture(ctx, &["status", "--porcelain"])?;
     if status.trim().is_empty() {
         return Ok(());
     }
-    warn("Working tree has uncommitted changes:");
-    for line in status.lines() {
-        eprintln!("     {line}");
+
+    bail!("working tree must be clean before preparing or publishing a release")
+}
+
+fn require_release_branch(ctx: &TaskContext) -> Result<String> {
+    let branch = current_branch(ctx)?;
+    if branch.starts_with("release/") {
+        return Ok(branch);
     }
-    eprint!("\n   Continue anyway? [y/N] ");
-    io::stderr().flush()?;
-    let mut response = String::new();
-    io::stdin().read_line(&mut response)?;
-    if !matches!(response.trim(), "y" | "Y") {
-        bail!("aborted");
+
+    bail!(
+        "release preparation must run from a release/* branch (current branch: {branch})"
+    )
+}
+
+fn require_prepare_mode(options: &ReleaseOptions) -> Result<()> {
+    if options.prepare {
+        return Ok(());
     }
-    Ok(())
+
+    bail!(
+        "release preparation requires --prepare; publish merged release tags with release-publish-tags"
+    )
 }
 
 fn parse_bump(args: &ReleaseOptions) -> Result<(VersionBump, Option<Version>)> {
@@ -1930,6 +1974,7 @@ fn release_options_from_plan_args(args: &OfficialPlanChangedArgs) -> ReleaseOpti
         minor: args.minor,
         patch: args.patch,
         dry_run: false,
+        prepare: false,
         version: args.version.clone(),
     }
 }
@@ -2337,6 +2382,37 @@ fn local_plugin_directories(ctx: &TaskContext) -> Result<Vec<PathBuf>> {
     Ok(plugin_dirs)
 }
 
+fn release_publication_candidates(
+    ctx: &TaskContext,
+) -> Result<Vec<ReleasePublicationCandidate>> {
+    let mut candidates = Vec::new();
+    for plugin_dir in tracked_plugin_crate_dirs(ctx)? {
+        let cargo_toml = plugin_dir.join("Cargo.toml");
+        let metadata = plugin_manifest_metadata(&cargo_toml)?;
+        if !metadata.official {
+            continue;
+        }
+        let plugin_id = metadata.plugin_id.ok_or_else(|| {
+            anyhow!(
+                "{} is missing package.metadata.scryer.plugin_id",
+                cargo_toml.display()
+            )
+        })?;
+        let local_dependency_dirs =
+            local_path_dependency_dirs(ctx, &cargo_toml, &plugin_dir)?;
+        candidates.push(ReleasePublicationCandidate {
+            plugin_id,
+            plugin_dir,
+            crate_name: crate_name_from_manifest(&cargo_toml)?,
+            version: version_from_manifest(&cargo_toml)?,
+            local_dependency_dirs,
+            cargo_toml,
+        });
+    }
+    candidates.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+    Ok(candidates)
+}
+
 fn package_version(manifest_path: &Path) -> Result<String> {
     let document = read_manifest_document(manifest_path)?;
     let version = document["package"]["version"]
@@ -2507,9 +2583,9 @@ fn read_published_child_catalog_releases(
     read_child_catalog_releases_from_path(ctx, &child_path)
 }
 
-fn resolve_release_target_for_plugin(
+fn resolve_release_target_for_candidate(
     ctx: &TaskContext,
-    plugin: &LocalPluginInfo,
+    plugin: &ReleasePublicationCandidate,
     options: &ReleaseOptions,
 ) -> Result<ReleaseTarget> {
     let existing_releases = read_published_child_catalog_releases(ctx, &plugin.plugin_id)?;
@@ -2518,8 +2594,8 @@ fn resolve_release_target_for_plugin(
     let (bump, explicit) = parse_bump(options)?;
     let next_version = match explicit {
         Some(version) => version,
-        None if has_existing_release => next_version(&plugin.current_version, bump),
-        None => plugin.current_version.clone(),
+        None if has_existing_release => next_version(&plugin.version, bump),
+        None => plugin.version.clone(),
     };
     let next_version_text = next_version.to_string();
     if existing_releases
@@ -2540,7 +2616,7 @@ fn resolve_release_target_for_plugin(
         plugin_dir: plugin.plugin_dir.clone(),
         cargo_toml: plugin.cargo_toml.clone(),
         crate_name: plugin.crate_name.clone(),
-        current_version: plugin.current_version.clone(),
+        current_version: plugin.version.clone(),
         next_version,
         tag_name,
     })
@@ -2548,7 +2624,7 @@ fn resolve_release_target_for_plugin(
 
 fn resolve_release_target(
     ctx: &TaskContext,
-    plugins: &[LocalPluginInfo],
+    plugins: &[ReleasePublicationCandidate],
     plugin_name: &str,
     options: &ReleaseOptions,
 ) -> Result<ReleaseTarget> {
@@ -2561,7 +2637,7 @@ fn resolve_release_target(
                 plugin_name
             )
         })?;
-    resolve_release_target_for_plugin(ctx, plugin, options)
+    resolve_release_target_for_candidate(ctx, plugin, options)
 }
 
 fn release_commit_message(targets: &[ReleaseTarget]) -> String {
@@ -2612,6 +2688,27 @@ fn latest_plugin_release_tag(ctx: &TaskContext, plugin_id: &str) -> Result<Optio
         .filter_map(|tag| release_tag_version(plugin_id, tag).map(|version| (version, tag)))
         .max_by(|(left, _), (right, _)| left.cmp(right))
         .map(|(_, tag)| tag.to_string()))
+}
+
+fn latest_plugin_v3_release_tag(ctx: &TaskContext, plugin_id: &str) -> Result<Option<String>> {
+    let prefix = release_tag_v3_prefix(plugin_id);
+    let tags = git_capture(ctx, &["tag"])?;
+    Ok(tags
+        .lines()
+        .filter_map(|tag| {
+            tag.strip_prefix(&prefix)
+                .and_then(|version| Version::parse(version).ok())
+                .map(|version| (version, tag))
+        })
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, tag)| tag.to_string()))
+}
+
+fn remote_tag_exists(ctx: &TaskContext, tag: &str) -> Result<bool> {
+    let remote_ref = format!("refs/tags/{tag}");
+    Ok(!git_capture(ctx, &["ls-remote", "--tags", "origin", &remote_ref])?
+        .trim()
+        .is_empty())
 }
 
 fn head_short_sha(ctx: &TaskContext) -> Result<String> {
@@ -2704,7 +2801,10 @@ fn path_is_under(path: &str, dir: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-fn release_impact_for_plugin(ctx: &TaskContext, plugin: &LocalPluginInfo) -> Result<ReleaseImpact> {
+fn release_impact_for_plugin(
+    ctx: &TaskContext,
+    plugin: &ReleasePublicationCandidate,
+) -> Result<ReleaseImpact> {
     let Some(tag) = latest_plugin_release_tag(ctx, &plugin.plugin_id)? else {
         return Ok(ReleaseImpact::PluginChanged);
     };
@@ -2740,6 +2840,9 @@ fn release_impact_for_plugin(ctx: &TaskContext, plugin: &LocalPluginInfo) -> Res
 }
 
 fn run_release_changed(ctx: &TaskContext, args: ReleaseChangedArgs) -> Result<()> {
+    require_prepare_mode(&args.options)?;
+    require_clean_worktree(ctx)?;
+    require_release_branch(ctx)?;
     let plans = collect_changed_release_targets(ctx, &args.options)?;
     if plans.is_empty() {
         ok("No official plugin changes detected since per-plugin release tags");
@@ -2752,15 +2855,14 @@ fn run_release_changed(ctx: &TaskContext, args: ReleaseChangedArgs) -> Result<()
     }
 
     let targets = plans.into_iter().map(|plan| plan.target).collect();
-    run_tag_only_release_targets(ctx, targets, &args.options)
+    run_prepare_release_targets(ctx, targets, &args.options)
 }
 
 fn collect_changed_release_targets(
     ctx: &TaskContext,
     options: &ReleaseOptions,
 ) -> Result<Vec<PlannedReleaseTarget>> {
-    ensure_current_sdk_dependency_is_published(ctx)?;
-    let plugins = discover_local_plugins(ctx)?;
+    let plugins = release_publication_candidates(ctx)?;
     let mut selected = Vec::new();
     for plugin in &plugins {
         match release_impact_for_plugin(ctx, plugin)? {
@@ -2796,7 +2898,7 @@ fn collect_changed_release_targets(
     Ok(targets)
 }
 
-fn run_tag_only_release_targets(
+fn run_prepare_release_targets(
     ctx: &TaskContext,
     targets: Vec<ReleaseTarget>,
     options: &ReleaseOptions,
@@ -2811,29 +2913,23 @@ fn run_tag_only_release_targets(
         println!("   Tag        : {}", target.tag_name);
     }
     if options.dry_run {
-        println!("   {YELLOW}(dry run — no commits, tags, or pushes){RESET}");
+        println!("   {YELLOW}(dry run — no commits or pushes){RESET}");
     }
 
     step("Pre-flight checks");
+    require_prepare_mode(options)?;
+    require_clean_worktree(ctx)?;
+    let branch = require_release_branch(ctx)?;
     let tags = git_capture(ctx, &["tag"])?;
     for target in &targets {
         if tags.lines().any(|line| line == target.tag_name) {
             bail!("Tag {} already exists", target.tag_name);
         }
+        if remote_tag_exists(ctx, &target.tag_name)? {
+            bail!("Remote tag {} already exists", target.tag_name);
+        }
     }
-    let branch = current_branch(ctx)?;
     println!("   Branch: {branch}");
-    prompt_continue_if_dirty(ctx)?;
-    require_wasm_target(ctx)?;
-    run_ci_strict(
-        ctx,
-        &CiScopeArgs {
-            plugin_ids: targets
-                .iter()
-                .map(|target| target.plugin_id.clone())
-                .collect(),
-        },
-    )?;
     ok("Pre-flight OK");
 
     let lockfiles = targets
@@ -2845,8 +2941,7 @@ fn run_tag_only_release_targets(
         .map(|lockfile| git_path_is_tracked(ctx, lockfile))
         .collect::<Result<Vec<_>>>()?;
 
-    let target_indices = (0..targets.len()).collect::<Vec<_>>();
-    run_bounded(target_indices.clone(), |index| {
+    run_bounded((0..targets.len()).collect::<Vec<_>>(), |index| {
         let target = &targets[index];
         step(format!(
             "Bumping {} to {}",
@@ -2858,68 +2953,8 @@ fn run_tag_only_release_targets(
         Ok(())
     })?;
 
-    run_bounded(target_indices, |index| {
-        let target = &targets[index];
-        step(format!(
-            "Building {} (release, wasm32-wasip1)",
-            target.crate_name
-        ));
-        let manifest_metadata = plugin_manifest_metadata(&target.cargo_toml)?;
-        let mut descriptor = None;
-        let mut descriptor_json = None;
-        for feature_set in &manifest_metadata.feature_sets {
-            let built_wasm = build_plugin_wasm(ctx, &target.plugin_dir, feature_set)?;
-            let current_descriptor = load_descriptor_from_wasm(&built_wasm)?;
-            validate_descriptor_contract(&current_descriptor)?;
-            let current_descriptor_json = serde_json::to_string(&current_descriptor)?;
-            if let Some(expected_json) = &descriptor_json {
-                if expected_json != &current_descriptor_json {
-                    bail!(
-                        "{}: descriptor differs across feature_sets after release bump",
-                        target.plugin_id
-                    );
-                }
-            } else {
-                descriptor_json = Some(current_descriptor_json);
-                descriptor = Some(current_descriptor);
-            }
-        }
-        ok("Built release WASM variants");
-
-        step(format!("Validating {}", target.plugin_id));
-        let descriptor = descriptor.expect("feature_sets should never be empty");
-        let descriptor_version = Version::parse(&descriptor.version).with_context(|| {
-            format!(
-                "{}: descriptor version {} is not valid semver",
-                descriptor.id, descriptor.version
-            )
-        })?;
-        if descriptor.id != target.plugin_id {
-            bail!(
-                "built descriptor id {} does not match plugin id {}",
-                descriptor.id,
-                target.plugin_id
-            );
-        }
-        if descriptor_version != target.next_version {
-            bail!(
-                "{}: built descriptor version {} does not match requested release version {}",
-                descriptor.id,
-                descriptor.version,
-                target.next_version
-            );
-        }
-        ok(format!(
-            "Validated descriptor {} {} ({})",
-            descriptor.id,
-            descriptor.version,
-            descriptor.plugin_type()
-        ));
-        Ok(())
-    })?;
-
     if options.dry_run {
-        println!("\n{YELLOW}{BOLD}Dry run complete — stopping before commit/tag/push.{RESET}");
+        println!("\n{YELLOW}{BOLD}Dry run complete — stopping before commit/push.{RESET}");
         let mut restore = targets
             .iter()
             .map(|target| target.cargo_toml.clone())
@@ -2962,61 +2997,181 @@ fn run_tag_only_release_targets(
         run_checked(&mut commit)?;
         ok("Committed");
     } else {
-        ok("No release-prep file changes to commit; tagging current HEAD");
+        bail!("release preparation made no manifest or lockfile changes")
     }
 
-    for target in &targets {
-        step(format!("Creating signed tag {}", target.tag_name));
-        let mut tag = ctx.command_in("git", &ctx.repo_root);
-        tag.args([
-            "tag",
-            "-s",
-            &target.tag_name,
-            "-m",
-            &format!("Release {}", target.tag_name),
-        ]);
-        run_checked(&mut tag)?;
-        ok(format!("Tag {} created", target.tag_name));
-    }
-
-    let release_tag = repo_release_tag_name(ctx)?;
-    step(format!("Creating signed release trigger tag {release_tag}"));
-    let mut release_tag_command = ctx.command_in("git", &ctx.repo_root);
-    release_tag_command.args([
-        "tag",
-        "-s",
-        &release_tag,
-        "-m",
-        &format!("Release trigger for {}", release_commit_message(&targets)),
-    ]);
-    run_checked(&mut release_tag_command)?;
-    ok(format!("Tag {release_tag} created"));
-
-    step("Pushing to origin");
+    step("Pushing release branch to origin");
     let mut push_branch = ctx.command_in("git", &ctx.repo_root);
     push_branch.args(["push", "origin", &branch]);
     run_checked(&mut push_branch)?;
+    ok(format!("Pushed {branch}"));
+
+    println!(
+        "\n{GREEN}{BOLD}Prepared {} plugin release bump(s) without creating tags{RESET}",
+        targets.len()
+    );
+    println!(
+        "   Merge the release branch PR, then run release-publish-tags at its merged main commit."
+    );
+    Ok(())
+}
+
+fn fetch_origin_main_and_tags(ctx: &TaskContext) -> Result<()> {
+    let mut fetch = ctx.command_in("git", &ctx.repo_root);
+    fetch.args(["fetch", "--tags", "origin", "main"]);
+    run_checked(&mut fetch).context("fetch origin/main and release tags")
+}
+
+fn merged_pull_request_commit(ctx: &TaskContext, pr: u64) -> Result<String> {
+    let pr_number = pr.to_string();
+    let output = run_capture(
+        ctx.command_in("gh", &ctx.repo_root)
+            .args([
+                "pr",
+                "view",
+                &pr_number,
+                "--repo",
+                OFFICIAL_GITHUB_REPO,
+                "--json",
+                "state,baseRefName,mergeCommit",
+            ]),
+    )?;
+    let pull_request: GitHubPullRequest =
+        serde_json::from_str(&output).context("parse GitHub pull request metadata")?;
+    if pull_request.state != "MERGED" {
+        bail!("pull request #{pr} is not merged")
+    }
+    if pull_request.base_ref_name != "main" {
+        bail!(
+            "pull request #{pr} targets {}, not main",
+            pull_request.base_ref_name
+        )
+    }
+    pull_request
+        .merge_commit
+        .map(|commit| commit.oid)
+        .context("merged pull request has no merge commit")
+}
+
+fn publishable_release_targets(ctx: &TaskContext) -> Result<Vec<ReleaseTarget>> {
+    let mut targets = Vec::new();
+    for candidate in release_publication_candidates(ctx)? {
+        let latest_version = latest_plugin_v3_release_tag(ctx, &candidate.plugin_id)?
+            .and_then(|tag| release_tag_version(&candidate.plugin_id, &tag));
+        if latest_version
+            .as_ref()
+            .is_some_and(|latest| &candidate.version <= latest)
+        {
+            continue;
+        }
+        targets.push(ReleaseTarget {
+            plugin_id: candidate.plugin_id.clone(),
+            plugin_dir: candidate.plugin_dir,
+            cargo_toml: candidate.cargo_toml,
+            crate_name: candidate.crate_name,
+            current_version: candidate.version.clone(),
+            next_version: candidate.version.clone(),
+            tag_name: official_plugin_release_tag(
+                &candidate.plugin_id,
+                &candidate.version.to_string(),
+            ),
+        });
+    }
+    if targets.is_empty() {
+        bail!("no official plugin manifest versions are newer than their v3 release tags")
+    }
+    Ok(targets)
+}
+
+fn verify_tag_absent_locally_and_remotely(ctx: &TaskContext, tag: &str) -> Result<()> {
+    let local_tags = git_capture(ctx, &["tag", "--list", tag])?;
+    if !local_tags.trim().is_empty() {
+        bail!("local tag {tag} already exists")
+    }
+    if remote_tag_exists(ctx, tag)? {
+        bail!("remote tag {tag} already exists")
+    }
+    Ok(())
+}
+
+fn create_and_verify_signed_tag(
+    ctx: &TaskContext,
+    tag: &str,
+    message: &str,
+) -> Result<()> {
+    let mut create_tag = ctx.command_in("git", &ctx.repo_root);
+    create_tag.args(["tag", "-s", tag, "-m", message, "HEAD"]);
+    run_checked(&mut create_tag)?;
+
+    let mut verify_tag = ctx.command_in("git", &ctx.repo_root);
+    verify_tag.args(["verify-tag", tag]);
+    run_checked(&mut verify_tag).with_context(|| format!("created tag {tag} is not signed"))
+}
+
+fn run_release_publish_tags(ctx: &TaskContext, args: ReleasePublishTagsArgs) -> Result<()> {
+    step("Checking merged release PR");
+    require_clean_worktree(ctx)?;
+    fetch_origin_main_and_tags(ctx)?;
+    let merge_commit = merged_pull_request_commit(ctx, args.pr)?;
+    let head = git_capture(ctx, &["rev-parse", "HEAD"])?;
+    if head.trim() != merge_commit {
+        bail!(
+            "local HEAD {} does not match merged pull request #{} commit {}",
+            head.trim(),
+            args.pr,
+            merge_commit
+        )
+    }
+    let mut ancestor = ctx.command_in("git", &ctx.repo_root);
+    ancestor.args(["merge-base", "--is-ancestor", &merge_commit, "origin/main"]);
+    if !run_status(&mut ancestor)?.success() {
+        bail!("merged pull request commit {merge_commit} is not reachable from origin/main")
+    }
+    ok(format!("PR #{} merged at {}", args.pr, merge_commit));
+
+    step("Selecting manifest versions to publish");
+    let targets = publishable_release_targets(ctx)?;
+    for target in &targets {
+        println!(
+            "   {} {} ({})",
+            target.plugin_id, target.next_version, target.tag_name
+        );
+        verify_tag_absent_locally_and_remotely(ctx, &target.tag_name)?;
+    }
+    let release_tag = repo_release_tag_name(ctx)?;
+    verify_tag_absent_locally_and_remotely(ctx, &release_tag)?;
+
+    for target in &targets {
+        step(format!("Creating signed tag {}", target.tag_name));
+        create_and_verify_signed_tag(
+            ctx,
+            &target.tag_name,
+            &format!("Release {}", target.tag_name),
+        )?;
+    }
+    step("Pushing component tags");
     let mut push_tags = ctx.command_in("git", &ctx.repo_root);
     push_tags.arg("push").arg("origin");
     for target in &targets {
         push_tags.arg(&target.tag_name);
     }
     run_checked(&mut push_tags)?;
-    let mut push_release_tag = ctx.command_in("git", &ctx.repo_root);
-    push_release_tag.args(["push", "origin", &release_tag]);
-    run_checked(&mut push_release_tag)?;
-    ok(format!(
-        "Pushed {}, {} plugin tag(s), and {}",
-        branch,
-        targets.len(),
-        release_tag
-    ));
 
-    println!(
-        "\n{GREEN}{BOLD}Released {} plugin tag(s) without touching legacy plugin inventory metadata{RESET}",
+    step(format!("Creating signed release trigger tag {release_tag}"));
+    create_and_verify_signed_tag(
+        ctx,
+        &release_tag,
+        &format!("Release trigger for {}", release_commit_message(&targets)),
+    )?;
+    step("Pushing release trigger tag");
+    let mut push_trigger = ctx.command_in("git", &ctx.repo_root);
+    push_trigger.args(["push", "origin", &release_tag]);
+    run_checked(&mut push_trigger)?;
+
+    ok(format!(
+        "Pushed {} component tag(s) and trigger tag {release_tag}",
         targets.len()
-    );
-    println!("   Release batch tag: {release_tag}");
+    ));
     Ok(())
 }
 
@@ -3025,7 +3180,7 @@ fn run_release_targets(
     targets: Vec<ReleaseTarget>,
     options: &ReleaseOptions,
 ) -> Result<()> {
-    run_tag_only_release_targets(ctx, targets, options)
+    run_prepare_release_targets(ctx, targets, options)
 }
 
 fn wasm_filename_for_manifest(cargo_toml: &Path) -> Result<String> {
@@ -3057,7 +3212,7 @@ fn prefetch_plugin_dependencies(ctx: &TaskContext, plugin_dir: &Path) -> Result<
     let lockfile = plugin_dir.join("Cargo.lock");
     if !lockfile.is_file() {
         bail!(
-            "missing lockfile for {}; run cargo xtask release-changed locally before publishing",
+            "missing lockfile for {}; run cargo xtask release-changed --prepare before publishing",
             plugin_dir.display()
         );
     }
@@ -8842,8 +8997,11 @@ fn git_capture_in<const N: usize>(
 }
 
 fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
-    let plugin = discover_local_official_plugin(ctx, &args.plugin_name)?;
-    let target = resolve_release_target_for_plugin(ctx, &plugin, &args.options)?;
+    require_prepare_mode(&args.options)?;
+    require_clean_worktree(ctx)?;
+    require_release_branch(ctx)?;
+    let plugins = release_publication_candidates(ctx)?;
+    let target = resolve_release_target(ctx, &plugins, &args.plugin_name, &args.options)?;
     run_release_targets(ctx, vec![target], &args.options)
 }
 
@@ -8852,14 +9010,14 @@ fn run_release_many(ctx: &TaskContext, args: ReleaseManyArgs) -> Result<()> {
         bail!("release-many requires at least one plugin id");
     }
 
+    require_prepare_mode(&args.options)?;
+    require_clean_worktree(ctx)?;
+    require_release_branch(ctx)?;
+
+    let plugins = release_publication_candidates(ctx)?;
     let mut targets = Vec::new();
     for plugin_name in &args.plugin_names {
-        let plugin = discover_local_official_plugin(ctx, plugin_name)?;
-        targets.push(resolve_release_target_for_plugin(
-            ctx,
-            &plugin,
-            &args.options,
-        )?);
+        targets.push(resolve_release_target(ctx, &plugins, plugin_name, &args.options)?);
     }
     run_release_targets(ctx, targets, &args.options)
 }
@@ -8867,7 +9025,7 @@ fn run_release_many(ctx: &TaskContext, args: ReleaseManyArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
     use scryer_plugin_sdk::{
         NotificationCapabilities, NotificationDescriptor, current_sdk_constraint,
     };
@@ -8876,6 +9034,26 @@ mod tests {
         let file = tempfile::NamedTempFile::new().expect("create temp manifest");
         fs::write(file.path(), contents).expect("write temp manifest");
         file
+    }
+
+    #[test]
+    fn release_commands_expose_separate_preparation_and_tag_publication_modes() {
+        let prepare = Cli::try_parse_from(["xtask", "release", "aninzb", "--prepare"])
+            .expect("parse release preparation");
+        match prepare.command {
+            Commands::Release(args) => assert!(args.options.prepare),
+            _ => panic!("expected release command"),
+        }
+
+        let publish =
+            Cli::try_parse_from(["xtask", "release-publish-tags", "--pr", "42"])
+                .expect("parse tag publication");
+        match publish.command {
+            Commands::ReleasePublishTags(args) => assert_eq!(args.pr, 42),
+            _ => panic!("expected release-publish-tags command"),
+        }
+
+        assert!(require_prepare_mode(&ReleaseOptions::default()).is_err());
     }
 
     #[test]
