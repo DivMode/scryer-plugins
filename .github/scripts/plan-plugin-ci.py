@@ -68,6 +68,28 @@ def plugin_matrix(
     return json.dumps({"include": entries}, separators=(",", ":"))
 
 
+def quality_matrix(
+    mode: str, plugin_ids: list[str], plugins: dict[str, PurePosixPath]
+) -> str:
+    if mode == "full":
+        selected = sorted(plugins)
+    elif mode == "scoped":
+        selected = plugin_ids
+    else:
+        selected = []
+
+    entries = [
+        {"kind": "xtask", "id": "xtask", "directory": "xtask"},
+        *[
+            {"kind": "plugin", "id": plugin_id, "directory": str(plugins[plugin_id])}
+            for plugin_id in selected
+        ],
+    ]
+    if mode == "none":
+        entries = [{"kind": "not-needed", "id": "", "directory": ""}]
+    return json.dumps({"include": entries}, separators=(",", ":"))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     source = parser.add_mutually_exclusive_group(required=True)
@@ -90,6 +112,7 @@ def main() -> None:
     print(f"mode={mode}")
     print(f"plugin_ids={','.join(plugin_ids)}")
     print(f"plugin_matrix={plugin_matrix(mode, plugin_ids, plugins)}")
+    print(f"quality_matrix={quality_matrix(mode, plugin_ids, plugins)}")
 
 
 if __name__ == "__main__":
