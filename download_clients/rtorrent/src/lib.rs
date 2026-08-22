@@ -42,6 +42,8 @@ struct RTorrentTorrent {
     is_active: bool,
     is_finished: bool,
     finished_time: i64,
+    /// `d.is_private=`; `None` when the rTorrent build did not return the column.
+    is_private: Option<bool>,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -215,7 +217,7 @@ pub fn scryer_download_list_queue(_input: String) -> FnResult<String> {
     let items = list_torrents(&config)?
         .into_iter()
         .filter(|torrent| torrent_matches_scope(&config, torrent))
-        .map(|torrent| torrent_to_item(&config, torrent))
+        .map(torrent_to_item)
         .collect::<Vec<_>>();
     Ok(serde_json::to_string(&PluginResult::Ok(items))?)
 }
@@ -225,7 +227,7 @@ pub fn scryer_download_list_history(_input: String) -> FnResult<String> {
     let items = list_torrents(&config)?
         .into_iter()
         .filter(|torrent| torrent_matches_scope(&config, torrent))
-        .map(|torrent| torrent_to_item(&config, torrent))
+        .map(torrent_to_item)
         .collect::<Vec<_>>();
     Ok(serde_json::to_string(&PluginResult::Ok(items))?)
 }
@@ -508,6 +510,8 @@ fn list_torrents(config: &RTorrentConfig) -> Result<Vec<RTorrentTorrent>, Error>
             XmlValue::String("d.is_active=".to_string()),
             XmlValue::String("d.complete=".to_string()),
             XmlValue::String("d.timestamp.finished=".to_string()),
+            // Appended last so older rTorrent builds that omit it keep parsing.
+            XmlValue::String("d.is_private=".to_string()),
         ],
     )?;
     parse_torrents(&response)
@@ -570,12 +574,13 @@ fn parse_torrents(xml: &str) -> Result<Vec<RTorrentTorrent>, Error> {
             is_active: parse_i64(values[9]) != 0,
             is_finished: parse_i64(values[10]) != 0,
             finished_time: parse_i64(values[11]),
+            is_private: values.get(12).map(|value| parse_i64(*value) != 0),
         });
     }
     Ok(out)
 }
 
-fn torrent_to_item(config: &RTorrentConfig, torrent: RTorrentTorrent) -> PluginDownloadItem {
+fn torrent_to_item(torrent: RTorrentTorrent) -> PluginDownloadItem {
     let state = if torrent.is_finished {
         DownloadItemState::Completed
     } else if torrent.is_active {
@@ -588,7 +593,8 @@ fn torrent_to_item(config: &RTorrentConfig, torrent: RTorrentTorrent) -> PluginD
     } else {
         Some(0)
     };
-    let can_remove = !config.post_import_category.is_empty() && can_remove(&torrent);
+    let now = now_unix_seconds();
+    let can_remove = derive_can_remove(&torrent, now);
     PluginDownloadItem {
         client_item_id: torrent.hash.clone(),
         download_id: None,
@@ -605,6 +611,8 @@ fn torrent_to_item(config: &RTorrentConfig, torrent: RTorrentTorrent) -> PluginD
             content_paths: non_empty(torrent.path.clone()).into_iter().collect(),
             download_rate_bytes_per_second: Some(torrent.down_rate),
             seed_ratio: Some(torrent.ratio as f64 / 1000.0),
+            seed_time_seconds: seed_time_seconds(&torrent, now),
+            is_private: torrent.is_private,
             raw_status: Some(format!(
                 "active={},finished={}",
                 torrent.is_active, torrent.is_finished
@@ -624,8 +632,9 @@ fn torrent_to_item(config: &RTorrentConfig, torrent: RTorrentTorrent) -> PluginD
         } else {
             None
         },
-        can_move_files: Some(can_remove),
-        can_remove: Some(can_remove),
+        // Data completeness only; whether a move is safe while seeding is decided Scryer-side.
+        can_move_files: Some(torrent.is_finished),
+        can_remove,
         removed: Some(false),
         raw_state: Some(format!(
             "active={},finished={}",
@@ -685,27 +694,51 @@ fn torrent_to_completed(torrent: RTorrentTorrent) -> PluginCompletedDownload {
     }
 }
 
-fn can_remove(torrent: &RTorrentTorrent) -> bool {
+/// Honest `can_remove` for rTorrent.
+///
+/// rTorrent exposes no per-torrent seeding limit, so the only goal this plugin can measure is
+/// the one Scryer handed it at add time (stashed in a plugin variable). When that stash is
+/// missing — a fresh plugin instance, or a torrent added outside Scryer — the plugin cannot
+/// know whether seeding is finished and reports `None` so Scryer-side evaluation decides.
+fn derive_can_remove(torrent: &RTorrentTorrent, now: i64) -> Option<bool> {
+    derive_can_remove_with_config(torrent, seed_config(&torrent.hash), now)
+}
+
+fn derive_can_remove_with_config(
+    torrent: &RTorrentTorrent,
+    seed_config: Option<RTorrentSeedConfig>,
+    now: i64,
+) -> Option<bool> {
     if !torrent.is_finished {
-        return false;
+        return Some(false);
     }
 
-    let Some(seed_config) = seed_config(&torrent.hash) else {
-        return false;
-    };
+    let seed_config = seed_config?;
 
     let ratio = torrent.ratio as f64 / 1000.0;
     if seed_config.ratio.is_some_and(|limit| ratio >= limit) {
-        return true;
+        return Some(true);
     }
 
     if let Some(seed_time_seconds) = seed_config.seed_time_seconds
         && torrent.finished_time > 0
     {
-        return now_unix_seconds().saturating_sub(torrent.finished_time) >= seed_time_seconds;
+        return Some(now.saturating_sub(torrent.finished_time) >= seed_time_seconds);
     }
 
-    false
+    // A ratio goal exists but is not met yet; a seed-time goal without a finished timestamp
+    // is unmeasurable, so only the ratio verdict is reportable.
+    if seed_config.ratio.is_some() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Seconds the torrent has been seeding, derived from rTorrent's finished timestamp.
+fn seed_time_seconds(torrent: &RTorrentTorrent, now: i64) -> Option<i64> {
+    (torrent.is_finished && torrent.finished_time > 0)
+        .then(|| now.saturating_sub(torrent.finished_time).max(0))
 }
 
 fn store_seed_config(hash: &str, request: &PluginDownloadClientAddRequest) -> Result<(), Error> {
@@ -1002,6 +1035,247 @@ fn connection_field(
 fn is_localhost_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     lower.contains("://localhost") || lower.contains("://127.0.0.1") || lower.contains("://[::1]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: i64 = 1_700_000_000;
+
+    fn finished_torrent(ratio_per_mille: i64) -> RTorrentTorrent {
+        RTorrentTorrent {
+            name: "Movie".to_string(),
+            hash: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            path: "/downloads/Movie".to_string(),
+            total_size: 1_000,
+            remaining_size: 0,
+            ratio: ratio_per_mille,
+            is_active: true,
+            is_finished: true,
+            finished_time: NOW - 600,
+            ..RTorrentTorrent::default()
+        }
+    }
+
+    #[test]
+    fn can_remove_is_false_while_the_download_is_unfinished() {
+        let torrent = RTorrentTorrent {
+            is_finished: false,
+            remaining_size: 500,
+            ..finished_torrent(0)
+        };
+        assert_eq!(
+            derive_can_remove_with_config(
+                &torrent,
+                Some(RTorrentSeedConfig {
+                    ratio: Some(1.0),
+                    seed_time_seconds: None,
+                }),
+                NOW
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_false_while_seeding_towards_an_unmet_ratio_goal() {
+        assert_eq!(
+            derive_can_remove_with_config(
+                &finished_torrent(400),
+                Some(RTorrentSeedConfig {
+                    ratio: Some(2.0),
+                    seed_time_seconds: None,
+                }),
+                NOW
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_true_once_the_ratio_goal_is_met() {
+        assert_eq!(
+            derive_can_remove_with_config(
+                &finished_torrent(2_100),
+                Some(RTorrentSeedConfig {
+                    ratio: Some(2.0),
+                    seed_time_seconds: None,
+                }),
+                NOW
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_true_once_the_seed_time_goal_elapsed() {
+        let torrent = RTorrentTorrent {
+            finished_time: NOW - 7_200,
+            ..finished_torrent(10)
+        };
+        assert_eq!(
+            derive_can_remove_with_config(
+                &torrent,
+                Some(RTorrentSeedConfig {
+                    ratio: None,
+                    seed_time_seconds: Some(3_600),
+                }),
+                NOW
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_unknown_without_a_stored_goal() {
+        // rTorrent exposes no per-torrent limit, so a torrent Scryer did not add (or whose
+        // stashed goal was lost) is unknowable here.
+        assert_eq!(
+            derive_can_remove_with_config(&finished_torrent(5_000), None, NOW),
+            None
+        );
+    }
+
+    #[test]
+    fn can_remove_is_unknown_when_only_a_seed_time_goal_exists_without_a_finish_timestamp() {
+        let torrent = RTorrentTorrent {
+            finished_time: 0,
+            ..finished_torrent(10)
+        };
+        assert_eq!(
+            derive_can_remove_with_config(
+                &torrent,
+                Some(RTorrentSeedConfig {
+                    ratio: None,
+                    seed_time_seconds: Some(3_600),
+                }),
+                NOW
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn can_move_files_tracks_data_completeness_not_seeding() {
+        let item = torrent_to_item(finished_torrent(10));
+        assert_eq!(item.can_move_files, Some(true));
+        // No stored goal in the test host, so the seeding verdict is unknown.
+        assert_eq!(item.can_remove, None);
+    }
+
+    #[test]
+    fn seed_time_is_derived_from_the_finished_timestamp() {
+        let torrent = RTorrentTorrent {
+            finished_time: NOW - 900,
+            ..finished_torrent(10)
+        };
+        assert_eq!(seed_time_seconds(&torrent, NOW), Some(900));
+        let unfinished = RTorrentTorrent {
+            is_finished: false,
+            ..torrent
+        };
+        assert_eq!(seed_time_seconds(&unfinished, NOW), None);
+    }
+
+    #[test]
+    fn is_private_maps_present_true_present_false_and_absent() {
+        let map = |is_private: Option<bool>| {
+            let torrent = RTorrentTorrent {
+                is_private,
+                ..finished_torrent(10)
+            };
+            torrent_to_item(torrent).torrent.unwrap().is_private
+        };
+        assert_eq!(map(Some(true)), Some(true));
+        assert_eq!(map(Some(false)), Some(false));
+        assert_eq!(map(None), None);
+    }
+
+    #[test]
+    fn is_private_column_is_optional_in_the_multicall_response() {
+        let without_private = r#"<?xml version="1.0"?><methodResponse><params><param><value><array><data>
+            <value><array><data>
+                <value><string>Movie</string></value>
+                <value><string>ABCDEF0123456789ABCDEF0123456789ABCDEF01</string></value>
+                <value><string>/downloads/Movie</string></value>
+                <value><string></string></value>
+                <value><i8>1000</i8></value>
+                <value><i8>0</i8></value>
+                <value><i8>0</i8></value>
+                <value><i8>1500</i8></value>
+                <value><i8>1</i8></value>
+                <value><i8>1</i8></value>
+                <value><i8>1</i8></value>
+                <value><i8>1699999000</i8></value>
+            </data></array></value>
+        </data></array></value></param></params></methodResponse>"#;
+        let torrents = parse_torrents(without_private).unwrap();
+        assert_eq!(torrents.len(), 1);
+        assert_eq!(torrents[0].is_private, None);
+    }
+}
+
+#[cfg(test)]
+mod extism_host_stubs {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn alloc(_len: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn config_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_headers() -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_request(_request: u64, _body: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_status_code() -> u64 {
+        200
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length_unsafe(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u64(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u8(_offset: u64) -> u8 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u64(_offset: u64, _value: u64) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u8(_offset: u64, _value: u8) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_set(_ptr: u64, _value: u64) {}
 }
 
 scryer_plugin_pdk::scryer_download_client_bridge_main!(

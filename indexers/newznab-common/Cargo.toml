@@ -5,7 +5,8 @@ edition = "2021"
 license = "GPL-3.0-only"
 
 [dependencies]
-extism-pdk = "1.4"
+indexer-command-compat = { path = "../command-compat" }
+scryer-plugin-pdk = "0.5.7"
 quick-xml = "0.41"
 scryer-plugin-sdk = "3.7.0"
 serde = { version = "1", features = ["derive"] }

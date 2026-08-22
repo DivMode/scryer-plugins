@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use extism_pdk::*;
+use indexer_command_compat::{LogLevel, log};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 use regex::Regex;
+use scryer_plugin_pdk::*;
 pub use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldOption, ConfigFieldRole, ConfigFieldType,
     IndexerCapabilities as Capabilities, IndexerCategoryModel, IndexerCategoryValueKind,
@@ -117,7 +118,7 @@ pub struct RssHttpConfig {
 }
 
 impl RssHttpConfig {
-    pub fn from_extism(default_user_agent: &str) -> Self {
+    pub fn from_host(default_user_agent: &str) -> Self {
         Self {
             user_agent: config_value("user_agent")
                 .unwrap_or_else(|| default_user_agent.to_string()),

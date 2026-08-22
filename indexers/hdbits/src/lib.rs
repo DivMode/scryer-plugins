@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
-use extism_pdk::*;
+use scryer_plugin_pdk::*;
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldRole, ConfigFieldType, IndexerCapabilities as Capabilities,
     IndexerCategoryModel, IndexerCategoryValueKind, IndexerDescriptor, IndexerFeedMode,
     IndexerLimitCapabilities, IndexerProtocol, IndexerResponseFeatures, IndexerSearchInput,
-    IndexerSourceKind, IndexerTorrentCapabilities, PluginDescriptor, PluginResult,
+    IndexerSourceKind, IndexerTorrentCapabilities, PluginDescriptor,
     PluginSearchRequest as SearchRequest, PluginSearchResponse as SearchResponse,
     PluginSearchResult as SearchResult, ProviderDescriptor, SDK_VERSION,
 };
@@ -17,9 +17,8 @@ const DEFAULT_BASE_URL: &str = "https://hdbits.org";
 const DEFAULT_CATEGORIES: &str = "2,3";
 const PAGE_SIZE: usize = 100;
 
-#[plugin_fn]
-pub fn scryer_describe(_input: String) -> FnResult<String> {
-    let descriptor = PluginDescriptor {
+fn build_descriptor() -> PluginDescriptor {
+    PluginDescriptor {
         id: "hdbits".to_string(),
         name: "HDBits Indexer".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -89,20 +88,16 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
             allowed_hosts: vec![],
             rate_limit_seconds: Some(2),
         }),
-    };
-
-    Ok(serde_json::to_string(&descriptor)?)
+    }
 }
 
-#[plugin_fn]
-pub fn scryer_indexer_search(input: String) -> FnResult<String> {
-    let req: SearchRequest = serde_json::from_str(&input)?;
-    let config = HdbitsConfig::from_extism()?;
+fn search(req: SearchRequest) -> FnResult<SearchResponse> {
+    let config = HdbitsConfig::from_host()?;
     let Some(query) = build_query(&config, &req) else {
-        return Ok(serde_json::to_string(&PluginResult::Ok(SearchResponse {
+        return Ok(SearchResponse {
             results: Vec::new(),
             ..Default::default()
-        }))?);
+        });
     };
     let body = post_query(&config, &query)?;
     let mut results = parse_response(&config, &body)?;
@@ -113,10 +108,10 @@ pub fn scryer_indexer_search(input: String) -> FnResult<String> {
     };
     results.truncate(limit);
 
-    Ok(serde_json::to_string(&PluginResult::Ok(SearchResponse {
+    Ok(SearchResponse {
         results,
         ..Default::default()
-    }))?)
+    })
 }
 
 fn config_fields() -> Vec<ConfigFieldDef> {
@@ -411,7 +406,7 @@ struct HdbitsConfig {
 }
 
 impl HdbitsConfig {
-    fn from_extism() -> Result<Self, Error> {
+    fn from_host() -> Result<Self, Error> {
         Ok(Self {
             base_url: config_value("base_url").unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             username: required_config("username")?,
@@ -514,3 +509,5 @@ struct ImdbInfo {
     #[serde(alias = "Id")]
     id: Option<i64>,
 }
+
+indexer_command_compat::scryer_indexer_main!(descriptor = build_descriptor, search = search,);

@@ -2,15 +2,14 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use extism_pdk::*;
+use scryer_plugin_pdk::*;
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldRole, ConfigFieldType, ConfigFieldValueSource, IndexerCapabilities,
     IndexerDescriptor, IndexerFeedMode, IndexerLimitCapabilities, IndexerProtocol,
     IndexerResponseFeatures, IndexerSearchInput, IndexerSourceKind, IndexerTorrentCapabilities,
-    PluginDescriptor, PluginResult, PluginSearchRequest as SearchRequest,
-    PluginSearchResponse as SearchResponse, PluginSearchResult as SearchResult, ProviderDescriptor,
-    SDK_VERSION,
+    PluginDescriptor, PluginSearchRequest as SearchRequest, PluginSearchResponse as SearchResponse,
+    PluginSearchResult as SearchResult, ProviderDescriptor, SDK_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -28,23 +27,16 @@ const RATE_LIMIT_WINDOW_SECONDS: u64 = 60;
 const API_RATE_LIMIT_VAR_KEY: &str = "tsukihime-indexer-api-rate-limit-v1";
 const SEARCH_RATE_LIMIT_VAR_KEY: &str = "tsukihime-indexer-search-rate-limit-v1";
 
-#[plugin_fn]
-pub fn scryer_describe(_input: String) -> FnResult<String> {
-    Ok(serde_json::to_string(&build_descriptor())?)
-}
-
-#[plugin_fn]
-pub fn scryer_indexer_search(input: String) -> FnResult<String> {
-    let request: SearchRequest = serde_json::from_str(&input)?;
+fn search(request: SearchRequest) -> FnResult<SearchResponse> {
     let response = match search_impl(&request) {
         Ok(response) => response,
         Err(TsukihimeError::RateLimited(_)) => SearchResponse {
             results: Vec::new(),
             ..SearchResponse::default()
         },
-        Err(error) => return Err(Error::msg(error.to_string()).into()),
+        Err(error) => return Err(Error::msg(error.to_string())),
     };
-    Ok(serde_json::to_string(&PluginResult::Ok(response))?)
+    Ok(response)
 }
 
 fn build_descriptor() -> PluginDescriptor {
@@ -157,7 +149,7 @@ fn config_fields() -> Vec<ConfigFieldDef> {
 }
 
 fn search_impl(request: &SearchRequest) -> Result<SearchResponse, TsukihimeError> {
-    let config = TsukihimeConfig::from_extism();
+    let config = TsukihimeConfig::from_host();
     let limit = config.limit_for_request(request.limit);
     let results = if let Some(anime_id) = resolve_anime_id(&config, request)? {
         anime_results(&config, anime_id, request, limit)?
@@ -512,7 +504,9 @@ fn http_get(url: &str) -> Result<TsukihimeHttpResponse, TsukihimeError> {
         .map_err(|error| TsukihimeError::Message(format!("Tsukihime request failed: {error}")))?;
     Ok(TsukihimeHttpResponse {
         status: response.status_code(),
-        headers: response.headers().clone(),
+        // The PDK's host response keeps headers ordered; this plugin's own
+        // response type is a HashMap, so collect rather than clone.
+        headers: response.headers().clone().into_iter().collect(),
         body: response.body(),
     })
 }
@@ -727,7 +721,7 @@ struct TsukihimeConfig {
 }
 
 impl TsukihimeConfig {
-    fn from_extism() -> Self {
+    fn from_host() -> Self {
         Self {
             base_url: config_value("base_url").unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             max_results: config_usize("max_results", DEFAULT_MAX_RESULTS),
@@ -920,6 +914,8 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let year = year + if month <= 2 { 1 } else { 0 };
     (year, month, day)
 }
+
+indexer_command_compat::scryer_indexer_main!(descriptor = build_descriptor, search = search,);
 
 #[cfg(test)]
 mod tests {

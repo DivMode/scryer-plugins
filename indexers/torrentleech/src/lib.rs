@@ -1,13 +1,12 @@
-use extism_pdk::*;
 use rss_indexer_common::*;
+use scryer_plugin_pdk::*;
 
 const PROVIDER_ID: &str = "torrentleech";
 const DEFAULT_BASE_URL: &str = "http://rss.torrentleech.org";
 const DEFAULT_USER_AGENT: &str = "Scryer TorrentLeech Indexer/0.1";
 
-#[plugin_fn]
-pub fn scryer_describe(_input: String) -> FnResult<String> {
-    let descriptor = build_indexer_descriptor(DescriptorSpec {
+fn build_descriptor() -> PluginDescriptor {
+    build_indexer_descriptor(DescriptorSpec {
         id: "torrentleech",
         name: "TorrentLeech Indexer",
         version: env!("CARGO_PKG_VERSION"),
@@ -34,24 +33,20 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
             supports_seed_requirements: true,
             ..IndexerTorrentCapabilities::default()
         }),
-    });
-
-    Ok(serde_json::to_string(&descriptor)?)
+    })
 }
 
-#[plugin_fn]
-pub fn scryer_indexer_search(input: String) -> FnResult<String> {
-    let req: SearchRequest = serde_json::from_str(&input)?;
+fn search(req: SearchRequest) -> FnResult<SearchResponse> {
     let base_url = config_value("base_url").unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
     let api_key = required_config("api_key")?;
     let feed_url = format!("{}/{}", base_url.trim().trim_end_matches('/'), api_key);
-    let http_config = RssHttpConfig::from_extism(DEFAULT_USER_AGENT);
+    let http_config = RssHttpConfig::from_host(DEFAULT_USER_AGENT);
     let mut options = RssParseOptions::torrent(PROVIDER_ID);
     options.use_guid_info_url = true;
     options.parse_seeders_in_description = true;
 
     let response = execute_rss_urls(PROVIDER_ID, &[feed_url], &http_config, &req, options)?;
-    Ok(serde_json::to_string(&PluginResult::Ok(response))?)
+    Ok(response)
 }
 
 fn config_fields() -> Vec<ConfigFieldDef> {
@@ -83,3 +78,5 @@ fn config_fields() -> Vec<ConfigFieldDef> {
     fields.extend(http_config_fields(DEFAULT_USER_AGENT));
     fields
 }
+
+indexer_command_compat::scryer_indexer_main!(descriptor = build_descriptor, search = search,);

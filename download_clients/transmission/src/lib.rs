@@ -57,6 +57,8 @@ struct SessionConfig {
     seed_ratio_limited: Option<bool>,
     #[serde(default, rename = "idle-seeding-limit-enabled")]
     idle_seeding_limit_enabled: Option<bool>,
+    #[serde(default, rename = "idle-seeding-limit")]
+    idle_seeding_limit: Option<i64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -101,6 +103,10 @@ struct TransmissionTorrent {
     file_count: Option<i64>,
     #[serde(default, rename = "fileCount")]
     vuze_file_count: Option<i64>,
+    /// `torrent-get` reports `isPrivate` on every supported Transmission release; absent only
+    /// when the field was not requested, in which case it must stay `None`.
+    #[serde(default, rename = "isPrivate")]
+    is_private: Option<bool>,
 }
 
 fn plugin_error<T>(code: PluginErrorCode, public_message: impl Into<String>) -> PluginResult<T> {
@@ -298,7 +304,7 @@ pub fn scryer_download_list_queue(_input: String) -> FnResult<String> {
     let items = torrents
         .into_iter()
         .filter(|torrent| torrent_matches_scope(&config, torrent))
-        .map(|torrent| torrent_to_item(&config, &session, torrent))
+        .map(|torrent| torrent_to_item(&session, torrent))
         .collect::<Vec<_>>();
     Ok(serde_json::to_string(&PluginResult::Ok(items))?)
 }
@@ -310,7 +316,7 @@ pub fn scryer_download_list_history(_input: String) -> FnResult<String> {
     let items = torrents
         .into_iter()
         .filter(|torrent| torrent_matches_scope(&config, torrent))
-        .map(|torrent| torrent_to_item(&config, &session, torrent))
+        .map(|torrent| torrent_to_item(&session, torrent))
         .collect::<Vec<_>>();
     Ok(serde_json::to_string(&PluginResult::Ok(items))?)
 }
@@ -723,6 +729,7 @@ fn list_torrents(config: &TransmissionConfig) -> Result<Vec<TransmissionTorrent>
         "seedRatioMode",
         "seedIdleLimit",
         "seedIdleMode",
+        "isPrivate",
         "fileCount",
         "file-count",
         "labels",
@@ -885,11 +892,7 @@ fn apply_seed_limits(
     Ok(())
 }
 
-fn torrent_to_item(
-    config: &TransmissionConfig,
-    session: &SessionConfig,
-    torrent: TransmissionTorrent,
-) -> PluginDownloadItem {
+fn torrent_to_item(session: &SessionConfig, torrent: TransmissionTorrent) -> PluginDownloadItem {
     let hash = normalize_hash(&torrent.hash_string);
     let state = map_state(&torrent);
     let remote_output_path = output_path(&torrent);
@@ -909,7 +912,7 @@ fn torrent_to_item(
     } else {
         None
     };
-    let can_remove = can_remove(config, session, &torrent, state, ratio);
+    let can_remove = derive_can_remove(session, &torrent, state, ratio);
 
     PluginDownloadItem {
         client_item_id: hash.clone(),
@@ -934,6 +937,7 @@ fn torrent_to_item(
             downloaded_bytes: Some(torrent.downloaded_ever),
             seed_ratio: ratio,
             seed_time_seconds: Some(torrent.seconds_seeding),
+            is_private: torrent.is_private,
             raw_status: Some(torrent.status.to_string()),
             status_reason: if torrent.error_string.trim().is_empty() {
                 None
@@ -946,8 +950,10 @@ fn torrent_to_item(
         remaining_size_bytes: Some(torrent.left_until_done),
         eta_seconds: (torrent.eta >= 0).then_some(torrent.eta),
         progress_percent,
-        can_move_files: Some(can_remove && torrent.status == 0),
-        can_remove: Some(can_remove),
+        // Data completeness only: whether moving is *safe* while seeding is a Scryer-side
+        // policy decision that combines this with the resolved seeding goal.
+        can_move_files: Some(state == DownloadItemState::Completed),
+        can_remove,
         removed: Some(false),
         raw_state: Some(torrent.status.to_string()),
         completed_at: None,
@@ -1007,7 +1013,13 @@ fn map_state(torrent: &TransmissionTorrent) -> DownloadItemState {
         3 | 5 => DownloadItemState::Queued,
         4 => DownloadItemState::Downloading,
         6 => DownloadItemState::Completed,
-        _ => DownloadItemState::Warning,
+        // A status code outside the documented 0..=6 range is a newer
+        // Transmission, not a fault: Transmission reports real faults through
+        // `errorString`, which is handled above. Keep polling rather than
+        // parking the row in a state nothing ever clears, matching Sonarr's
+        // final `else { Downloading }`
+        // (Download/Clients/Transmission/TransmissionBase.cs:130-133).
+        _ => DownloadItemState::Downloading,
     }
 }
 
@@ -1019,64 +1031,115 @@ fn is_completed(torrent: &TransmissionTorrent) -> bool {
         || torrent.is_finished && !matches!(torrent.status, 1 | 2)
 }
 
-fn can_remove(
-    config: &TransmissionConfig,
+/// Whether Transmission's own seeding limits are satisfied for a torrent.
+///
+/// `Unknown` means Transmission enforces no limit for this torrent (mode 2 "unlimited", or
+/// mode 0 with the matching global toggle off), so the plugin must report `can_remove: None`
+/// and let Scryer-side goal evaluation decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeedLimitState {
+    Met,
+    Unmet,
+    Unknown,
+}
+
+fn combine_seed_limit_states(states: &[SeedLimitState]) -> SeedLimitState {
+    if states.contains(&SeedLimitState::Met) {
+        SeedLimitState::Met
+    } else if states.contains(&SeedLimitState::Unmet) {
+        SeedLimitState::Unmet
+    } else {
+        SeedLimitState::Unknown
+    }
+}
+
+fn compare_limit(current: Option<f64>, limit: Option<f64>) -> SeedLimitState {
+    match (current, limit) {
+        (Some(current), Some(limit)) if current >= limit => SeedLimitState::Met,
+        (Some(_), Some(_)) => SeedLimitState::Unmet,
+        _ => SeedLimitState::Unknown,
+    }
+}
+
+fn ratio_limit_state(
+    session: &SessionConfig,
+    torrent: &TransmissionTorrent,
+    ratio: Option<f64>,
+) -> SeedLimitState {
+    match torrent.seed_ratio_mode.unwrap_or_default() {
+        // 1 = honour the per-torrent limit.
+        1 => compare_limit(ratio, torrent.seed_ratio_limit),
+        // 0 = follow the session default, which may be switched off entirely.
+        0 if session.seed_ratio_limited.unwrap_or(false) => {
+            compare_limit(ratio, session.seed_ratio_limit)
+        }
+        // 2 = seed regardless of ratio, or the global limit is disabled.
+        _ => SeedLimitState::Unknown,
+    }
+}
+
+/// Transmission has no total-seed-time limit; Sonarr (and this plugin's add path) map the
+/// seed-time goal onto the *idle* limit, so the same field is what we read back.
+fn idle_limit_state(session: &SessionConfig, torrent: &TransmissionTorrent) -> SeedLimitState {
+    let is_stopped = torrent.status == 0;
+    let is_seeding = torrent.status == 6;
+    match torrent.seed_idle_mode.unwrap_or_default() {
+        1 => match torrent.seed_idle_limit {
+            Some(limit) if (is_stopped || is_seeding) && torrent.seconds_seeding > limit * 60 => {
+                SeedLimitState::Met
+            }
+            Some(_) => SeedLimitState::Unmet,
+            None => SeedLimitState::Unknown,
+        },
+        // Follow the session default. A stopped torrent alone is NOT proof the limit was
+        // reached (the user may have stopped it), so compare against the session's idle
+        // value the same way the per-torrent mode does; without the value the verdict is
+        // unverifiable.
+        0 if session.idle_seeding_limit_enabled.unwrap_or(false) => {
+            match session.idle_seeding_limit {
+                Some(limit)
+                    if (is_stopped || is_seeding) && torrent.seconds_seeding > limit * 60 =>
+                {
+                    SeedLimitState::Met
+                }
+                Some(_) => SeedLimitState::Unmet,
+                None => SeedLimitState::Unknown,
+            }
+        }
+        _ => SeedLimitState::Unknown,
+    }
+}
+
+fn seed_limit_state(
+    session: &SessionConfig,
+    torrent: &TransmissionTorrent,
+    ratio: Option<f64>,
+) -> SeedLimitState {
+    combine_seed_limit_states(&[
+        ratio_limit_state(session, torrent, ratio),
+        idle_limit_state(session, torrent),
+    ])
+}
+
+/// Honest `can_remove`: `Some(true)` only when Transmission stopped the torrent *and* one of
+/// its own limits is satisfied, `Some(false)` when a limit exists and is unmet (or the data
+/// is not complete), `None` when Transmission enforces nothing here.
+fn derive_can_remove(
     session: &SessionConfig,
     torrent: &TransmissionTorrent,
     state: DownloadItemState,
     ratio: Option<f64>,
-) -> bool {
-    if matches!(config.post_import_action, PostImportAction::Retain)
-        || state != DownloadItemState::Completed
-    {
-        return false;
+) -> Option<bool> {
+    if state != DownloadItemState::Completed {
+        return Some(false);
     }
-
-    has_reached_seed_limit(session, torrent, ratio)
-}
-
-fn has_reached_seed_limit(
-    session: &SessionConfig,
-    torrent: &TransmissionTorrent,
-    ratio: Option<f64>,
-) -> bool {
-    let is_stopped = torrent.status == 0;
-    let is_seeding = torrent.status == 6;
-
-    match torrent.seed_ratio_mode.unwrap_or_default() {
-        1 if is_stopped
-            && ratio.is_some_and(|ratio| {
-                torrent.seed_ratio_limit.is_some_and(|limit| ratio >= limit)
-            }) =>
-        {
-            return true;
-        }
-        0 if is_stopped
-            && session.seed_ratio_limited.unwrap_or(false)
-            && ratio.is_some_and(|ratio| {
-                session.seed_ratio_limit.is_some_and(|limit| ratio >= limit)
-            }) =>
-        {
-            return true;
-        }
-        _ => {}
+    match seed_limit_state(session, torrent, ratio) {
+        SeedLimitState::Met if torrent.status == 0 => Some(true),
+        // Limit satisfied but Transmission has not stopped the torrent yet.
+        SeedLimitState::Met => None,
+        SeedLimitState::Unmet => Some(false),
+        SeedLimitState::Unknown => None,
     }
-
-    match torrent.seed_idle_mode.unwrap_or_default() {
-        1 if (is_stopped || is_seeding)
-            && torrent
-                .seed_idle_limit
-                .is_some_and(|limit| torrent.seconds_seeding > limit * 60) =>
-        {
-            return true;
-        }
-        0 if is_stopped && session.idle_seeding_limit_enabled.unwrap_or(false) => {
-            return true;
-        }
-        _ => {}
-    }
-
-    false
 }
 
 fn torrent_matches_scope(config: &TransmissionConfig, torrent: &TransmissionTorrent) -> bool {
@@ -1215,6 +1278,363 @@ fn connection_field(
 fn is_localhost_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     lower.contains("://localhost") || lower.contains("://127.0.0.1") || lower.contains("://[::1]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STATUS_STOPPED: i64 = 0;
+    const STATUS_SEEDING: i64 = 6;
+    const STATUS_DOWNLOADING: i64 = 4;
+
+    fn complete_torrent(status: i64) -> TransmissionTorrent {
+        TransmissionTorrent {
+            hash_string: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            name: "Movie".to_string(),
+            total_size: 1_000,
+            left_until_done: 0,
+            is_finished: true,
+            status,
+            downloaded_ever: 1_000,
+            uploaded_ever: 500,
+            ..TransmissionTorrent::default()
+        }
+    }
+
+    fn item(session: &SessionConfig, torrent: TransmissionTorrent) -> PluginDownloadItem {
+        torrent_to_item(session, torrent)
+    }
+
+    #[test]
+    fn can_remove_is_false_while_downloading() {
+        let torrent = TransmissionTorrent {
+            total_size: 1_000,
+            left_until_done: 400,
+            is_finished: false,
+            status: STATUS_DOWNLOADING,
+            ..TransmissionTorrent::default()
+        };
+        let item = item(&SessionConfig::default(), torrent);
+        assert_eq!(item.can_remove, Some(false));
+        assert_eq!(item.can_move_files, Some(false));
+    }
+
+    #[test]
+    fn can_remove_is_false_while_seeding_towards_an_unmet_per_torrent_ratio() {
+        let torrent = TransmissionTorrent {
+            seed_ratio_mode: Some(1),
+            seed_ratio_limit: Some(2.0),
+            uploaded_ever: 500,
+            ..complete_torrent(STATUS_SEEDING)
+        };
+        assert_eq!(
+            derive_can_remove(
+                &SessionConfig::default(),
+                &torrent,
+                DownloadItemState::Completed,
+                Some(0.5)
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_true_when_stopped_with_a_met_per_torrent_ratio() {
+        let torrent = TransmissionTorrent {
+            seed_ratio_mode: Some(1),
+            seed_ratio_limit: Some(1.0),
+            ..complete_torrent(STATUS_STOPPED)
+        };
+        assert_eq!(
+            derive_can_remove(
+                &SessionConfig::default(),
+                &torrent,
+                DownloadItemState::Completed,
+                Some(1.5)
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn can_remove_is_unknown_when_the_torrent_seeds_without_a_limit() {
+        // seedRatioMode 2 = seed regardless of ratio; the global idle limit is off.
+        let torrent = TransmissionTorrent {
+            seed_ratio_mode: Some(2),
+            seed_idle_mode: Some(2),
+            ..complete_torrent(STATUS_STOPPED)
+        };
+        assert_eq!(
+            derive_can_remove(
+                &SessionConfig::default(),
+                &torrent,
+                DownloadItemState::Completed,
+                Some(9.0)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn can_remove_is_unknown_when_the_global_ratio_limit_is_disabled() {
+        let session = SessionConfig {
+            seed_ratio_limited: Some(false),
+            seed_ratio_limit: Some(2.0),
+            ..SessionConfig::default()
+        };
+        let torrent = TransmissionTorrent {
+            seed_ratio_mode: Some(0),
+            seed_idle_mode: Some(0),
+            ..complete_torrent(STATUS_STOPPED)
+        };
+        assert_eq!(
+            derive_can_remove(&session, &torrent, DownloadItemState::Completed, Some(9.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn can_remove_follows_the_session_ratio_limit_in_global_mode() {
+        let session = SessionConfig {
+            seed_ratio_limited: Some(true),
+            seed_ratio_limit: Some(1.0),
+            ..SessionConfig::default()
+        };
+        let torrent = TransmissionTorrent {
+            seed_ratio_mode: Some(0),
+            seed_idle_mode: Some(2),
+            ..complete_torrent(STATUS_STOPPED)
+        };
+        assert_eq!(
+            derive_can_remove(&session, &torrent, DownloadItemState::Completed, Some(1.2)),
+            Some(true)
+        );
+        assert_eq!(
+            derive_can_remove(&session, &torrent, DownloadItemState::Completed, Some(0.2)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn per_torrent_idle_limit_doubles_as_the_seed_time_limit() {
+        let met = TransmissionTorrent {
+            seed_ratio_mode: Some(2),
+            seed_idle_mode: Some(1),
+            seed_idle_limit: Some(30),
+            seconds_seeding: 3_600,
+            ..complete_torrent(STATUS_SEEDING)
+        };
+        let unmet = TransmissionTorrent {
+            seconds_seeding: 60,
+            ..complete_torrent(STATUS_SEEDING)
+        };
+        let unmet = TransmissionTorrent {
+            seed_ratio_mode: Some(2),
+            seed_idle_mode: Some(1),
+            seed_idle_limit: Some(30),
+            ..unmet
+        };
+        assert_eq!(
+            idle_limit_state(&SessionConfig::default(), &met),
+            SeedLimitState::Met
+        );
+        assert_eq!(
+            idle_limit_state(&SessionConfig::default(), &unmet),
+            SeedLimitState::Unmet
+        );
+    }
+
+    #[test]
+    fn met_limit_without_transmission_stopping_the_torrent_is_unknown() {
+        let torrent = TransmissionTorrent {
+            seed_ratio_mode: Some(1),
+            seed_ratio_limit: Some(1.0),
+            ..complete_torrent(STATUS_SEEDING)
+        };
+        assert_eq!(
+            derive_can_remove(
+                &SessionConfig::default(),
+                &torrent,
+                DownloadItemState::Completed,
+                Some(4.0)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn can_move_files_tracks_data_completeness_not_seeding() {
+        let torrent = TransmissionTorrent {
+            seed_ratio_mode: Some(1),
+            seed_ratio_limit: Some(9.0),
+            ..complete_torrent(STATUS_SEEDING)
+        };
+        let item = item(&SessionConfig::default(), torrent);
+        assert_eq!(item.can_move_files, Some(true));
+        assert_eq!(item.can_remove, Some(false));
+    }
+
+    #[test]
+    fn is_private_maps_present_true_present_false_and_absent() {
+        let map = |raw: &str| {
+            let torrent: TransmissionTorrent = serde_json::from_str(raw).unwrap();
+            item(&SessionConfig::default(), torrent)
+                .torrent
+                .unwrap()
+                .is_private
+        };
+        assert_eq!(
+            map(r#"{"hashString":"a1","name":"n","isPrivate":true}"#),
+            Some(true)
+        );
+        assert_eq!(
+            map(r#"{"hashString":"a1","name":"n","isPrivate":false}"#),
+            Some(false)
+        );
+        assert_eq!(map(r#"{"hashString":"a1","name":"n"}"#), None);
+    }
+
+    #[test]
+    fn an_undocumented_status_code_keeps_polling_instead_of_warning() {
+        // Transmission reports real faults through `errorString`; a status code
+        // outside 0..=6 is a newer Transmission, not a failure, and must not
+        // park the row in a state nothing clears.
+        let torrent = TransmissionTorrent {
+            total_size: 1_000,
+            left_until_done: 400,
+            is_finished: false,
+            status: 42,
+            ..TransmissionTorrent::default()
+        };
+        assert_eq!(map_state(&torrent), DownloadItemState::Downloading);
+
+        // An error string still wins, whatever the status code.
+        let errored = TransmissionTorrent {
+            error_string: "No data found!".to_string(),
+            ..torrent
+        };
+        assert_eq!(map_state(&errored), DownloadItemState::Warning);
+    }
+
+    #[test]
+    fn observed_seed_state_comes_from_the_torrent_get_payload() {
+        let torrent: TransmissionTorrent = serde_json::from_str(
+            r#"{"hashString":"a1","name":"n","secondsSeeding":7200,"uploadedEver":300,"downloadedEver":200}"#,
+        )
+        .unwrap();
+        let torrent = item(&SessionConfig::default(), torrent).torrent.unwrap();
+        assert_eq!(torrent.seed_time_seconds, Some(7_200));
+        assert_eq!(torrent.seed_ratio, Some(1.5));
+    }
+
+    #[test]
+    fn global_idle_mode_compares_against_the_session_idle_value() {
+        let session = SessionConfig {
+            idle_seeding_limit_enabled: Some(true),
+            idle_seeding_limit: Some(30),
+            ..SessionConfig::default()
+        };
+        // A user-stopped torrent below the session idle limit must not read as limit-met.
+        let unmet = TransmissionTorrent {
+            seed_ratio_mode: Some(2),
+            seed_idle_mode: Some(0),
+            seconds_seeding: 60,
+            ..complete_torrent(STATUS_STOPPED)
+        };
+        assert_eq!(
+            derive_can_remove(&session, &unmet, DownloadItemState::Completed, Some(9.0)),
+            Some(false)
+        );
+        let met = TransmissionTorrent {
+            seconds_seeding: 3_600,
+            ..unmet
+        };
+        assert_eq!(
+            derive_can_remove(&session, &met, DownloadItemState::Completed, Some(9.0)),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn global_idle_mode_without_a_session_value_is_unknown() {
+        let session = SessionConfig {
+            idle_seeding_limit_enabled: Some(true),
+            ..SessionConfig::default()
+        };
+        let torrent = TransmissionTorrent {
+            seed_ratio_mode: Some(2),
+            seed_idle_mode: Some(0),
+            seconds_seeding: 3_600,
+            ..complete_torrent(STATUS_STOPPED)
+        };
+        assert_eq!(
+            derive_can_remove(&session, &torrent, DownloadItemState::Completed, Some(9.0)),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod extism_host_stubs {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn alloc(_len: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn config_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_headers() -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_request(_request: u64, _body: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn http_status_code() -> u64 {
+        200
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn length_unsafe(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u64(_offset: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn load_u8(_offset: u64) -> u8 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u64(_offset: u64, _value: u64) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn store_u8(_offset: u64, _value: u8) {}
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_get(_ptr: u64) -> u64 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn var_set(_ptr: u64, _value: u64) {}
 }
 
 scryer_plugin_pdk::scryer_download_client_bridge_main!(

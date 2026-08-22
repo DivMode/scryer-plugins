@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use extism_pdk::*;
+use indexer_command_compat::{LogLevel, log};
 use newznab_common::{
     Capabilities, IndexerCategoryModel, IndexerCategoryValueKind, IndexerDescriptor,
     IndexerFeedMode, IndexerLimitCapabilities, IndexerProtocol, IndexerResponseFeatures,
     IndexerSearchInput, IndexerSourceKind, NewznabHitBudget, NewznabHttpBehavior, PluginDescriptor,
-    PluginResult, PluginSearchSubjectKind, ProviderDescriptor, SDK_VERSION, SearchRequest,
-    SearchResponse, SearchResult, current_sdk_constraint, is_hit_budget_exhausted_error,
-    polite_http_get,
+    PluginSearchSubjectKind, ProviderDescriptor, SDK_VERSION, SearchRequest, SearchResponse,
+    SearchResult, current_sdk_constraint, is_hit_budget_exhausted_error, polite_http_get,
 };
+use scryer_plugin_pdk::*;
 use scryer_plugin_sdk::{ConfigFieldDef, ConfigFieldRole, ConfigFieldType, ConfigFieldValueSource};
 use serde::Deserialize;
 use url::Url;
@@ -39,7 +39,7 @@ struct LegacyAniNzbConfig {
 }
 
 impl LegacyAniNzbConfig {
-    fn from_extism() -> Self {
+    fn from_host() -> Self {
         Self {
             base_url: config_optional("base_url"),
             api_key_present: config::get("api_key")
@@ -70,8 +70,8 @@ struct AniNzbConfig {
 }
 
 impl AniNzbConfig {
-    fn from_extism() -> Self {
-        let legacy = LegacyAniNzbConfig::from_extism();
+    fn from_host() -> Self {
+        let legacy = LegacyAniNzbConfig::from_host();
         if legacy.is_present() {
             log!(
                 LogLevel::Debug,
@@ -145,11 +145,6 @@ struct AniNzbApiItem {
     screenshots: Option<Vec<String>>,
     #[serde(default)]
     thumbnails: Option<Vec<String>>,
-}
-
-#[plugin_fn]
-pub fn scryer_describe(_input: String) -> FnResult<String> {
-    Ok(serde_json::to_string(&build_descriptor())?)
 }
 
 fn build_descriptor() -> PluginDescriptor {
@@ -240,22 +235,18 @@ fn legacy_config_fields() -> Vec<ConfigFieldDef> {
     }]
 }
 
-#[plugin_fn]
-pub fn scryer_indexer_search(input: String) -> FnResult<String> {
-    let request: SearchRequest = serde_json::from_str(&input)?;
+fn search(request: SearchRequest) -> FnResult<SearchResponse> {
     if request_is_movie_shaped(&request) {
-        return Ok(serde_json::to_string(&PluginResult::Ok(
-            SearchResponse::default(),
-        ))?);
+        return Ok(SearchResponse::default());
     }
 
-    let config = AniNzbConfig::from_extism();
+    let config = AniNzbConfig::from_host();
     let response = match execute_api_search(&config, &request) {
         Ok(response) => response,
         Err(error) if is_hit_budget_exhausted_error(&error) => SearchResponse::default(),
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(error),
     };
-    Ok(serde_json::to_string(&PluginResult::Ok(response))?)
+    Ok(response)
 }
 
 fn execute_api_search(
@@ -573,6 +564,8 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let year = year + if month <= 2 { 1 } else { 0 };
     (year, month, day)
 }
+
+indexer_command_compat::scryer_indexer_main!(descriptor = build_descriptor, search = search,);
 
 #[cfg(test)]
 mod tests {

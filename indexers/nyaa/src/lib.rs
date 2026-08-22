@@ -1,14 +1,9 @@
-use extism_pdk::*;
 use rss_indexer_common::*;
+use scryer_plugin_pdk::*;
 
 const PROVIDER_ID: &str = "nyaa";
 const DEFAULT_ADDITIONAL_PARAMS: &str = "&cats=1_0&filter=1";
 const DEFAULT_USER_AGENT: &str = "Scryer Nyaa Indexer/0.1";
-
-#[plugin_fn]
-pub fn scryer_describe(_input: String) -> FnResult<String> {
-    Ok(serde_json::to_string(&build_descriptor())?)
-}
 
 fn build_descriptor() -> PluginDescriptor {
     build_indexer_descriptor(DescriptorSpec {
@@ -51,9 +46,7 @@ fn build_descriptor() -> PluginDescriptor {
     })
 }
 
-#[plugin_fn]
-pub fn scryer_indexer_search(input: String) -> FnResult<String> {
-    let req: SearchRequest = serde_json::from_str(&input)?;
+fn search(req: SearchRequest) -> FnResult<SearchResponse> {
     let base_url = required_config("base_url")?;
     let additional_params =
         config_value("additional_params").unwrap_or_else(|| DEFAULT_ADDITIONAL_PARAMS.to_string());
@@ -64,7 +57,7 @@ pub fn scryer_indexer_search(input: String) -> FnResult<String> {
         &req,
         anime_standard_format_search,
     );
-    let http_config = RssHttpConfig::from_extism(DEFAULT_USER_AGENT);
+    let http_config = RssHttpConfig::from_host(DEFAULT_USER_AGENT);
     let mut options = RssParseOptions::torrent(PROVIDER_ID);
     options.use_guid_info_url = true;
     options.size_element_name = Some("size");
@@ -75,7 +68,7 @@ pub fn scryer_indexer_search(input: String) -> FnResult<String> {
     options.calculate_peers_as_sum = true;
 
     let response = execute_rss_urls(PROVIDER_ID, &urls, &http_config, &req, options)?;
-    Ok(serde_json::to_string(&PluginResult::Ok(response))?)
+    Ok(response)
 }
 
 fn config_fields() -> Vec<ConfigFieldDef> {
@@ -190,6 +183,8 @@ fn prepare_query(query: &str) -> String {
     query.trim().replace(' ', "+")
 }
 
+indexer_command_compat::scryer_indexer_main!(descriptor = build_descriptor, search = search,);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,8 +192,8 @@ mod tests {
     #[test]
     fn descriptor_is_id_free_and_movie_anime_text_capable_for_scryer_dispatch() {
         let descriptor = build_descriptor();
-        assert_eq!(descriptor.sdk_version, "3.1.0");
-        assert_eq!(descriptor.sdk_constraint, ">=3.1.0, <4.0.0");
+        assert_eq!(descriptor.sdk_version, SDK_VERSION);
+        assert_eq!(descriptor.sdk_constraint, current_sdk_constraint());
 
         let ProviderDescriptor::Indexer(indexer) = descriptor.provider else {
             panic!("expected indexer descriptor");

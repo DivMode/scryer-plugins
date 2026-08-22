@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 
 use chrono::DateTime;
-use extism_pdk::*;
+use scryer_plugin_pdk::*;
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldRole, ConfigFieldType, IndexerCapabilities as Capabilities,
     IndexerCategoryModel, IndexerCategoryValueKind, IndexerDescriptor, IndexerFeedMode,
     IndexerLimitCapabilities, IndexerProtocol, IndexerResponseFeatures, IndexerSearchInput,
-    IndexerSourceKind, IndexerTorrentCapabilities, PluginDescriptor, PluginResult,
+    IndexerSourceKind, IndexerTorrentCapabilities, PluginDescriptor,
     PluginSearchRequest as SearchRequest, PluginSearchResponse as SearchResponse,
     PluginSearchResult as SearchResult, ProviderDescriptor, SDK_VERSION,
 };
@@ -17,9 +17,8 @@ const DEFAULT_BASE_URL: &str = "https://api.broadcasthe.net/";
 const PAGE_SIZE: usize = 100;
 const MAX_PAGES: usize = 10;
 
-#[plugin_fn]
-pub fn scryer_describe(_input: String) -> FnResult<String> {
-    let descriptor = PluginDescriptor {
+fn build_descriptor() -> PluginDescriptor {
+    PluginDescriptor {
         id: "broadcasthe-net".to_string(),
         name: "BroadcasTheNet Indexer".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -96,14 +95,10 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
             allowed_hosts: vec![],
             rate_limit_seconds: Some(5),
         }),
-    };
-
-    Ok(serde_json::to_string(&descriptor)?)
+    }
 }
 
-#[plugin_fn]
-pub fn scryer_indexer_search(input: String) -> FnResult<String> {
-    let req: SearchRequest = serde_json::from_str(&input)?;
+fn search(req: SearchRequest) -> FnResult<SearchResponse> {
     let base_url = config_value("base_url").unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
     let api_key = required_config("api_key")?;
     let limit = request_limit(&req);
@@ -135,10 +130,10 @@ pub fn scryer_indexer_search(input: String) -> FnResult<String> {
     }
 
     let results = dedupe_results(results).into_iter().take(limit).collect();
-    Ok(serde_json::to_string(&PluginResult::Ok(SearchResponse {
+    Ok(SearchResponse {
         results,
         ..Default::default()
-    }))?)
+    })
 }
 
 fn config_fields() -> Vec<ConfigFieldDef> {
@@ -652,3 +647,5 @@ where
         }
     }
 }
+
+indexer_command_compat::scryer_indexer_main!(descriptor = build_descriptor, search = search,);

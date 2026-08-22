@@ -1,17 +1,17 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use extism_pdk::*;
 #[cfg(not(test))]
 use newznab_common::hit_budget_snapshot;
 use newznab_common::{
     Capabilities, ConfigFieldDef, ConfigFieldType, IndexerCategoryModel, IndexerCategoryValueKind,
     IndexerDescriptor, IndexerFeedMode, IndexerLimitCapabilities, IndexerProtocol,
     IndexerResponseFeatures, IndexerSearchInput, IndexerSourceKind, NewznabConfig,
-    NewznabHitBudget, NewznabHttpBehavior, PluginDescriptor, PluginResult, ProviderDescriptor,
-    SDK_VERSION, SearchRequest, SearchResponse, current_sdk_constraint, execute_full_search,
-    execute_raw_search, is_hit_budget_exhausted_error, standard_config_fields,
+    NewznabHitBudget, NewznabHttpBehavior, PluginDescriptor, ProviderDescriptor, SDK_VERSION,
+    SearchRequest, SearchResponse, current_sdk_constraint, execute_full_search, execute_raw_search,
+    is_hit_budget_exhausted_error, standard_config_fields,
 };
+use scryer_plugin_pdk::*;
 use serde_json::json;
 
 const PROVIDER_ID: &str = "amenzb";
@@ -23,11 +23,6 @@ const DEFAULT_DAILY_HIT_CAP: u32 = 9_000;
 const DEFAULT_CATEGORY: &str = "5070";
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
     (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
-
-#[plugin_fn]
-pub fn scryer_describe(_input: String) -> FnResult<String> {
-    Ok(serde_json::to_string(&build_descriptor())?)
-}
 
 fn build_descriptor() -> PluginDescriptor {
     PluginDescriptor {
@@ -137,10 +132,8 @@ fn build_descriptor() -> PluginDescriptor {
     }
 }
 
-#[plugin_fn]
-pub fn scryer_indexer_search(input: String) -> FnResult<String> {
-    let req: SearchRequest = serde_json::from_str(&input)?;
-    let ame_config = AmeConfig::from_extism()?;
+fn search(req: SearchRequest) -> FnResult<SearchResponse> {
+    let ame_config = AmeConfig::from_host()?;
 
     let response = if let Some(info_hash) = request_id(&req, "info_hash")
         .or_else(|| request_id(&req, "info_hash_v1"))
@@ -169,7 +162,7 @@ pub fn scryer_indexer_search(input: String) -> FnResult<String> {
         execute_full_search(&config, &req, amenzb_metadata_extractor)?
     };
 
-    Ok(serde_json::to_string(&PluginResult::Ok(response))?)
+    Ok(response)
 }
 
 fn execute_raw_search_gracefully(
@@ -196,6 +189,8 @@ fn empty_hit_budget_response(config: &NewznabConfig) -> Result<SearchResponse, E
         grab_max: None,
     })
 }
+
+indexer_command_compat::scryer_indexer_main!(descriptor = build_descriptor, search = search,);
 
 #[cfg(test)]
 fn empty_hit_budget_response(config: &NewznabConfig) -> Result<SearchResponse, Error> {
@@ -232,8 +227,8 @@ struct AmeConfig {
 }
 
 impl AmeConfig {
-    fn from_extism() -> Result<Self, Error> {
-        let mut base = NewznabConfig::from_extism()?;
+    fn from_host() -> Result<Self, Error> {
+        let mut base = NewznabConfig::from_host()?;
         if base.base_url.trim().is_empty() {
             base.base_url = AMENZB_BASE_URL.to_string();
         }

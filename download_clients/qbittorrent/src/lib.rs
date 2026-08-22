@@ -109,9 +109,22 @@ struct QbTorrent {
     seeding_time: Option<i64>,
     #[serde(default)]
     private: Option<bool>,
+    /// Per-torrent share ratio limit. `-2` defers to the global limit, `-1` means unlimited.
+    /// Absent on qBittorrent builds that predate the field: treated as "defer to global".
+    #[serde(default)]
+    ratio_limit: Option<f64>,
+    /// Per-torrent seeding time limit in minutes (`-2` global, `-1` unlimited).
+    #[serde(default)]
+    seeding_time_limit: Option<i64>,
+    /// Per-torrent inactive seeding time limit in minutes (`-2` global, `-1` unlimited).
+    #[serde(default)]
+    inactive_seeding_time_limit: Option<i64>,
+    /// Unix seconds of the last piece transfer, used for the inactive seeding limit.
+    #[serde(default)]
+    last_activity: Option<i64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 struct QbPreferences {
     #[serde(default)]
     save_path: Option<String>,
@@ -119,6 +132,18 @@ struct QbPreferences {
     auto_tmm_enabled: Option<bool>,
     #[serde(default)]
     queueing_enabled: Option<bool>,
+    #[serde(default)]
+    max_ratio_enabled: Option<bool>,
+    #[serde(default)]
+    max_ratio: Option<f64>,
+    #[serde(default)]
+    max_seeding_time_enabled: Option<bool>,
+    #[serde(default)]
+    max_seeding_time: Option<i64>,
+    #[serde(default)]
+    max_inactive_seeding_time_enabled: Option<bool>,
+    #[serde(default)]
+    max_inactive_seeding_time: Option<i64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -392,11 +417,35 @@ fn handle_download_add(
 pub fn scryer_download_list_queue(_input: String) -> FnResult<String> {
     let config = QbittorrentConfig::from_extism()?;
     let torrents = list_torrents(&config, Some("all"))?;
+    let preferences = seed_preferences(&config, &torrents);
     let items = torrents
         .into_iter()
-        .map(torrent_to_item)
+        .map(|torrent| torrent_to_item_with_preferences(torrent, preferences.as_ref()))
         .collect::<Vec<_>>();
     Ok(serde_json::to_string(&PluginResult::Ok(items))?)
+}
+
+/// Fetches `/app/preferences` once per listing, and only when at least one torrent actually
+/// defers to a global seeding limit. Failures are non-fatal: without globals the affected
+/// axes report `Unknown`, which maps to `can_remove: None` rather than a guess.
+fn seed_preferences(config: &QbittorrentConfig, torrents: &[QbTorrent]) -> Option<QbPreferences> {
+    let needs_globals = torrents
+        .iter()
+        .any(|torrent| is_completed_state(&torrent.state) && defers_to_global_limits(torrent));
+    if !needs_globals {
+        return None;
+    }
+    get_json::<QbPreferences>(config, "/app/preferences").ok()
+}
+
+/// Only `-2` (or an absent field) defers to the global limits; `-1` means unlimited and
+/// never consults them.
+fn defers_to_global_limits(torrent: &QbTorrent) -> bool {
+    torrent.ratio_limit.is_none_or(|limit| limit == -2.0)
+        || torrent.seeding_time_limit.is_none_or(|limit| limit == -2)
+        || torrent
+            .inactive_seeding_time_limit
+            .is_none_or(|limit| limit == -2)
 }
 
 pub fn scryer_download_list_completed(_input: String) -> FnResult<String> {
@@ -416,9 +465,10 @@ fn completed_downloads(config: &QbittorrentConfig) -> Result<Vec<PluginCompleted
 
 fn completed_history_items(config: &QbittorrentConfig) -> Result<Vec<PluginDownloadItem>, Error> {
     let torrents = list_completed_torrents(config)?;
+    let preferences = seed_preferences(config, &torrents);
     Ok(torrents
         .into_iter()
-        .map(torrent_to_item)
+        .map(|torrent| torrent_to_item_with_preferences(torrent, preferences.as_ref()))
         .collect::<Vec<_>>())
 }
 
@@ -1749,7 +1799,179 @@ fn nibble_to_hex(value: u8) -> char {
     }
 }
 
-fn torrent_to_item(torrent: QbTorrent) -> PluginDownloadItem {
+/// Whether the torrent has satisfied a seeding obligation the client itself enforces.
+///
+/// `Unknown` means qBittorrent exposes no usable limit for this torrent (no per-torrent
+/// limit and no enabled global limit, or the value the limit is compared against is not
+/// present in the API response). Callers must map `Unknown` to `can_remove: None` so that
+/// Scryer-side (Tier B) goal evaluation decides instead of the plugin guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeedLimitState {
+    Met,
+    Unmet,
+    Unknown,
+}
+
+fn combine_seed_limit_states(states: &[SeedLimitState]) -> SeedLimitState {
+    if states.contains(&SeedLimitState::Met) {
+        SeedLimitState::Met
+    } else if states.contains(&SeedLimitState::Unmet) {
+        SeedLimitState::Unmet
+    } else {
+        SeedLimitState::Unknown
+    }
+}
+
+/// Resolves a qBittorrent two-level limit: a per-torrent value `>= 0` wins, `-2` defers to
+/// the global value when the matching global toggle is enabled, and `-1` (or a disabled
+/// global) means "no limit".
+fn resolve_effective_limit<T: PartialOrd + Copy>(
+    per_torrent: Option<T>,
+    defer_sentinel: T,
+    zero: T,
+    global_enabled: Option<bool>,
+    global_value: Option<T>,
+) -> Option<T> {
+    match per_torrent {
+        Some(value) if value >= zero => Some(value),
+        Some(value) if value == defer_sentinel => {
+            if global_enabled.unwrap_or(false) {
+                global_value
+            } else {
+                None
+            }
+        }
+        Some(_) => None,
+        // Field absent from this qBittorrent build: qBittorrent's own default is "use global".
+        None => {
+            if global_enabled.unwrap_or(false) {
+                global_value
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn ratio_limit_state(torrent: &QbTorrent, preferences: Option<&QbPreferences>) -> SeedLimitState {
+    let Some(limit) = resolve_effective_limit(
+        torrent.ratio_limit,
+        -2.0_f64,
+        0.0_f64,
+        preferences.and_then(|prefs| prefs.max_ratio_enabled),
+        preferences.and_then(|prefs| prefs.max_ratio),
+    ) else {
+        return SeedLimitState::Unknown;
+    };
+    if !limit.is_finite() {
+        return SeedLimitState::Unknown;
+    }
+    match torrent.ratio.filter(|value| value.is_finite()) {
+        // qBittorrent's own tolerance (see Sonarr QBittorrent.HasReachedSeedLimit).
+        Some(ratio) if limit - ratio <= 0.001 => SeedLimitState::Met,
+        Some(_) => SeedLimitState::Unmet,
+        None => SeedLimitState::Unknown,
+    }
+}
+
+fn seeding_time_limit_state(
+    torrent: &QbTorrent,
+    preferences: Option<&QbPreferences>,
+) -> SeedLimitState {
+    let Some(limit_minutes) = resolve_effective_limit(
+        torrent.seeding_time_limit,
+        -2_i64,
+        0_i64,
+        preferences.and_then(|prefs| prefs.max_seeding_time_enabled),
+        preferences.and_then(|prefs| prefs.max_seeding_time),
+    ) else {
+        return SeedLimitState::Unknown;
+    };
+    // `seeding_time` is present on the `torrents/info` payload since qBittorrent 4.4; on
+    // older builds the axis is simply unknowable from the list call and we refuse to guess
+    // rather than fanning out a per-torrent properties request on every poll.
+    match torrent.seeding_time {
+        Some(seconds) if seconds >= limit_minutes.saturating_mul(60) => SeedLimitState::Met,
+        Some(_) => SeedLimitState::Unmet,
+        None => SeedLimitState::Unknown,
+    }
+}
+
+fn inactive_seeding_time_limit_state(
+    torrent: &QbTorrent,
+    preferences: Option<&QbPreferences>,
+    now_unix_seconds: i64,
+) -> SeedLimitState {
+    let Some(limit_minutes) = resolve_effective_limit(
+        torrent.inactive_seeding_time_limit,
+        -2_i64,
+        0_i64,
+        preferences.and_then(|prefs| prefs.max_inactive_seeding_time_enabled),
+        preferences.and_then(|prefs| prefs.max_inactive_seeding_time),
+    ) else {
+        return SeedLimitState::Unknown;
+    };
+    match torrent.last_activity.filter(|value| *value > 0) {
+        Some(last_activity)
+            if now_unix_seconds.saturating_sub(last_activity)
+                > limit_minutes.saturating_mul(60) =>
+        {
+            SeedLimitState::Met
+        }
+        Some(_) => SeedLimitState::Unmet,
+        None => SeedLimitState::Unknown,
+    }
+}
+
+fn seed_limit_state(
+    torrent: &QbTorrent,
+    preferences: Option<&QbPreferences>,
+    now_unix_seconds: i64,
+) -> SeedLimitState {
+    combine_seed_limit_states(&[
+        ratio_limit_state(torrent, preferences),
+        seeding_time_limit_state(torrent, preferences),
+        inactive_seeding_time_limit_state(torrent, preferences, now_unix_seconds),
+    ])
+}
+
+/// qBittorrent's "the client stopped this torrent after it finished downloading" states.
+/// qBittorrent 5 renamed `pausedUP` to `stoppedUP`; both are accepted.
+fn is_finished_seeding_state(state: &str) -> bool {
+    matches!(
+        state.trim().to_ascii_lowercase().as_str(),
+        "pausedup" | "stoppedup"
+    )
+}
+
+/// Honest `can_remove` for a qBittorrent torrent.
+///
+/// * `Some(true)` — qBittorrent stopped the torrent after download and one of its own
+///   seeding limits is satisfied.
+/// * `Some(false)` — the torrent is not finished, or a limit exists and is provably unmet.
+/// * `None` — qBittorrent enforces no limit here (or a limit value is unavailable), so the
+///   plugin cannot know; Scryer-side goal evaluation must decide.
+fn derive_can_remove(
+    torrent: &QbTorrent,
+    preferences: Option<&QbPreferences>,
+    now_unix_seconds: i64,
+) -> Option<bool> {
+    if !is_completed_state(&torrent.state) {
+        return Some(false);
+    }
+    match seed_limit_state(torrent, preferences, now_unix_seconds) {
+        SeedLimitState::Met if is_finished_seeding_state(&torrent.state) => Some(true),
+        // Limit satisfied but qBittorrent has not stopped the torrent yet; do not pre-empt it.
+        SeedLimitState::Met => None,
+        SeedLimitState::Unmet => Some(false),
+        SeedLimitState::Unknown => None,
+    }
+}
+
+fn torrent_to_item_with_preferences(
+    torrent: QbTorrent,
+    preferences: Option<&QbPreferences>,
+) -> PluginDownloadItem {
     let state = map_state(&torrent.state);
     let category = normalize_non_empty(torrent.category.clone());
     let remote_output_path = preferred_content_path(&torrent);
@@ -1765,6 +1987,8 @@ fn torrent_to_item(torrent: QbTorrent) -> PluginDownloadItem {
             }
         });
     let raw_state = normalize_non_empty(Some(torrent.state.clone()));
+    let can_remove = derive_can_remove(&torrent, preferences, now_unix_seconds());
+    let can_move_files = Some(is_completed_state(&torrent.state));
     PluginDownloadItem {
         client_item_id: normalize_hash(&torrent.hash),
         download_id: None,
@@ -1802,8 +2026,8 @@ fn torrent_to_item(torrent: QbTorrent) -> PluginDownloadItem {
         remaining_size_bytes: torrent.amount_left,
         eta_seconds: positive_i64(torrent.eta),
         progress_percent,
-        can_move_files: Some(is_completed_state(&torrent.state)),
-        can_remove: Some(true),
+        can_move_files,
+        can_remove,
         removed: Some(false),
         raw_state,
         completed_at: unix_to_rfc3339(torrent.completion_on),
@@ -2023,37 +2247,61 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 fn map_state(state: &str) -> DownloadItemState {
     match state.trim().to_ascii_lowercase().as_str() {
         "queueddl" => DownloadItemState::Queued,
-        "pauseddl" => DownloadItemState::Paused,
+        // qBittorrent 5 renamed `pausedDL` to `stoppedDL`.
+        "pauseddl" | "stoppeddl" => DownloadItemState::Paused,
         "metadl" | "forcedmetadl" | "stalleddl" | "forceddl" | "downloading" | "allocating" => {
             DownloadItemState::Downloading
         }
         "checkingup" | "checkingdl" | "checkingresumedata" => DownloadItemState::Verifying,
         "moving" => DownloadItemState::ImportPending,
-        "pausedup" | "queuedup" | "stalledup" | "uploading" | "forcedup" => {
+        // qBittorrent 5 renamed `pausedUP` to `stoppedUP`.
+        "pausedup" | "stoppedup" | "queuedup" | "stalledup" | "uploading" | "forcedup" => {
             DownloadItemState::Completed
         }
         // qBittorrent uses these states for recoverable client-side conditions.
         // Keep the torrent visible for operator diagnosis instead of triggering
         // Scryer's failed-download cleanup flow.
         "error" | "missingfiles" => DownloadItemState::Warning,
-        "unknown" => DownloadItemState::Error,
-        _ => DownloadItemState::Warning,
+        // `unknown` is qBittorrent's own "I could not determine this torrent's
+        // state" answer, and anything unmatched is a state a newer qBittorrent
+        // added. Neither is evidence of a failure, and neither should become a
+        // queue row that is never cleaned up: keep polling, like Sonarr's
+        // `default: // new status in API? default to downloading`
+        // (Download/Clients/QBittorrent/QBittorrent.cs:350-355). `state_message`
+        // carries the state string so the operator still sees what happened.
+        _ => DownloadItemState::Downloading,
     }
 }
 
+fn now_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
+
 fn state_message(state: &str) -> Option<String> {
-    match state.trim().to_ascii_lowercase().as_str() {
+    let normalized = state.trim().to_ascii_lowercase();
+    match normalized.as_str() {
         "missingfiles" => Some("qBittorrent reports missing files".to_string()),
         "error" => Some("qBittorrent reports a torrent error".to_string()),
         "moving" => Some("qBittorrent is moving torrent files".to_string()),
-        _ => None,
+        // Mirrors the state arms that `map_state` recognises; anything else is
+        // an unknown or newly added qBittorrent state, reported as Downloading
+        // with the raw state so the operator can see it.
+        "queueddl" | "pauseddl" | "stoppeddl" | "metadl" | "forcedmetadl" | "stalleddl"
+        | "forceddl" | "downloading" | "allocating" | "checkingup" | "checkingdl"
+        | "checkingresumedata" | "pausedup" | "stoppedup" | "queuedup" | "stalledup"
+        | "uploading" | "forcedup" => None,
+        "" => Some("qBittorrent reported no torrent state".to_string()),
+        other => Some(format!("Unknown qBittorrent download state: {other}")),
     }
 }
 
 fn is_completed_state(state: &str) -> bool {
     matches!(
         state.trim().to_ascii_lowercase().as_str(),
-        "pausedup" | "queuedup" | "stalledup" | "uploading" | "forcedup"
+        "pausedup" | "stoppedup" | "queuedup" | "stalledup" | "uploading" | "forcedup"
     )
 }
 
@@ -2413,7 +2661,7 @@ mod tests {
             content_path: Some("/downloads/movies/Movie.mkv".to_string()),
             ..QbTorrent::default()
         };
-        let item = torrent_to_item(torrent);
+        let item = torrent_to_item_with_preferences(torrent, None);
         assert_eq!(item.title, "Movie");
         assert_eq!(item.state, DownloadItemState::Completed);
         assert_eq!(
@@ -2808,11 +3056,327 @@ mod tests {
         }
     }
 
+    fn seeding_torrent(state: &str) -> QbTorrent {
+        QbTorrent {
+            hash: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            name: "Movie".to_string(),
+            state: state.to_string(),
+            ..QbTorrent::default()
+        }
+    }
+
+    const NOW: i64 = 1_700_000_000;
+
+    #[test]
+    fn can_remove_is_false_while_still_downloading() {
+        let torrent = QbTorrent {
+            ratio_limit: Some(1.0),
+            ratio: Some(0.0),
+            ..seeding_torrent("downloading")
+        };
+        let item = torrent_to_item_with_preferences(torrent, None);
+        assert_eq!(item.can_remove, Some(false));
+        assert_eq!(item.can_move_files, Some(false));
+    }
+
+    #[test]
+    fn can_remove_is_false_while_seeding_towards_an_unmet_per_torrent_ratio() {
+        let torrent = QbTorrent {
+            ratio_limit: Some(2.0),
+            ratio: Some(0.4),
+            ..seeding_torrent("uploading")
+        };
+        assert_eq!(derive_can_remove(&torrent, None, NOW), Some(false));
+    }
+
+    #[test]
+    fn can_remove_is_true_when_stopped_with_a_met_per_torrent_ratio() {
+        let torrent = QbTorrent {
+            ratio_limit: Some(2.0),
+            ratio: Some(2.0),
+            ..seeding_torrent("stoppedUP")
+        };
+        assert_eq!(derive_can_remove(&torrent, None, NOW), Some(true));
+    }
+
+    #[test]
+    fn can_remove_is_true_for_legacy_paused_up_with_a_met_ratio() {
+        let torrent = QbTorrent {
+            ratio_limit: Some(1.5),
+            ratio: Some(1.4995),
+            ..seeding_torrent("pausedUP")
+        };
+        assert_eq!(derive_can_remove(&torrent, None, NOW), Some(true));
+    }
+
+    #[test]
+    fn can_remove_is_unknown_when_the_torrent_has_no_seeding_obligation() {
+        let torrent = QbTorrent {
+            ratio_limit: Some(-1.0),
+            seeding_time_limit: Some(-1),
+            inactive_seeding_time_limit: Some(-1),
+            ratio: Some(9.0),
+            ..seeding_torrent("uploading")
+        };
+        assert_eq!(derive_can_remove(&torrent, None, NOW), None);
+    }
+
+    #[test]
+    fn can_remove_is_unknown_when_global_limits_are_disabled() {
+        let preferences = QbPreferences {
+            max_ratio_enabled: Some(false),
+            max_seeding_time_enabled: Some(false),
+            max_inactive_seeding_time_enabled: Some(false),
+            ..QbPreferences::default()
+        };
+        let torrent = QbTorrent {
+            ratio_limit: Some(-2.0),
+            seeding_time_limit: Some(-2),
+            inactive_seeding_time_limit: Some(-2),
+            ratio: Some(0.2),
+            seeding_time: Some(60),
+            ..seeding_torrent("stoppedUP")
+        };
+        assert_eq!(derive_can_remove(&torrent, Some(&preferences), NOW), None);
+    }
+
+    #[test]
+    fn can_remove_falls_back_to_the_global_ratio_limit() {
+        let preferences = QbPreferences {
+            max_ratio_enabled: Some(true),
+            max_ratio: Some(1.0),
+            ..QbPreferences::default()
+        };
+        let met = QbTorrent {
+            ratio_limit: Some(-2.0),
+            ratio: Some(1.2),
+            ..seeding_torrent("stoppedUP")
+        };
+        let unmet = QbTorrent {
+            ratio_limit: Some(-2.0),
+            ratio: Some(0.2),
+            ..seeding_torrent("stoppedUP")
+        };
+        assert_eq!(derive_can_remove(&met, Some(&preferences), NOW), Some(true));
+        assert_eq!(
+            derive_can_remove(&unmet, Some(&preferences), NOW),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn per_torrent_ratio_limit_overrides_the_global_one() {
+        let preferences = QbPreferences {
+            max_ratio_enabled: Some(true),
+            max_ratio: Some(0.1),
+            ..QbPreferences::default()
+        };
+        let torrent = QbTorrent {
+            ratio_limit: Some(3.0),
+            ratio: Some(0.5),
+            ..seeding_torrent("stoppedUP")
+        };
+        assert_eq!(
+            derive_can_remove(&torrent, Some(&preferences), NOW),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn can_remove_uses_the_seeding_time_limit_from_the_list_payload() {
+        let met = QbTorrent {
+            ratio_limit: Some(-1.0),
+            seeding_time_limit: Some(60),
+            seeding_time: Some(3_600),
+            ..seeding_torrent("stoppedUP")
+        };
+        let unmet = QbTorrent {
+            ratio_limit: Some(-1.0),
+            seeding_time_limit: Some(60),
+            seeding_time: Some(120),
+            ..seeding_torrent("uploading")
+        };
+        assert_eq!(derive_can_remove(&met, None, NOW), Some(true));
+        assert_eq!(derive_can_remove(&unmet, None, NOW), Some(false));
+    }
+
+    #[test]
+    fn seeding_time_limit_without_a_reported_seeding_time_is_unknown() {
+        let torrent = QbTorrent {
+            ratio_limit: Some(-1.0),
+            seeding_time_limit: Some(60),
+            seeding_time: None,
+            inactive_seeding_time_limit: Some(-1),
+            ..seeding_torrent("stoppedUP")
+        };
+        assert_eq!(
+            seeding_time_limit_state(&torrent, None),
+            SeedLimitState::Unknown
+        );
+        assert_eq!(derive_can_remove(&torrent, None, NOW), None);
+    }
+
+    #[test]
+    fn inactive_seeding_time_limit_is_honoured() {
+        let torrent = QbTorrent {
+            ratio_limit: Some(-1.0),
+            seeding_time_limit: Some(-1),
+            inactive_seeding_time_limit: Some(30),
+            last_activity: Some(NOW - 3_600),
+            ..seeding_torrent("stoppedUP")
+        };
+        assert_eq!(derive_can_remove(&torrent, None, NOW), Some(true));
+    }
+
+    #[test]
+    fn can_remove_is_unknown_when_the_limit_is_met_but_qbittorrent_is_still_seeding() {
+        let torrent = QbTorrent {
+            ratio_limit: Some(1.0),
+            ratio: Some(3.0),
+            ..seeding_torrent("uploading")
+        };
+        assert_eq!(derive_can_remove(&torrent, None, NOW), None);
+    }
+
+    #[test]
+    fn queued_up_is_completed_and_never_an_error_state() {
+        // qBittorrent 5.2 enables queueing by default, so finished torrents idle in queuedUP.
+        assert_eq!(map_state("queuedUP"), DownloadItemState::Completed);
+        assert!(is_completed_state("queuedUP"));
+    }
+
+    #[test]
+    fn qbittorrent_5_stopped_states_map_like_their_paused_predecessors() {
+        assert_eq!(map_state("stoppedUP"), DownloadItemState::Completed);
+        assert_eq!(map_state("stoppedDL"), DownloadItemState::Paused);
+        assert!(is_completed_state("stoppedUP"));
+        assert!(!is_completed_state("stoppedDL"));
+    }
+
+    #[test]
+    fn can_move_files_tracks_data_completeness_not_seeding() {
+        let torrent = QbTorrent {
+            ratio_limit: Some(5.0),
+            ratio: Some(0.1),
+            ..seeding_torrent("stoppedUP")
+        };
+        let item = torrent_to_item_with_preferences(torrent, None);
+        assert_eq!(item.can_move_files, Some(true));
+        assert_eq!(item.can_remove, Some(false));
+    }
+
+    #[test]
+    fn is_private_maps_present_true_present_false_and_absent() {
+        let raw_private = r#"[{"hash":"a1","name":"n","state":"uploading","private":true}]"#;
+        let raw_public = r#"[{"hash":"a1","name":"n","state":"uploading","private":false}]"#;
+        let raw_absent = r#"[{"hash":"a1","name":"n","state":"uploading"}]"#;
+
+        let private: Vec<QbTorrent> = serde_json::from_str(raw_private).unwrap();
+        let public: Vec<QbTorrent> = serde_json::from_str(raw_public).unwrap();
+        let absent: Vec<QbTorrent> = serde_json::from_str(raw_absent).unwrap();
+
+        let map = |torrents: Vec<QbTorrent>| {
+            torrent_to_item_with_preferences(torrents.into_iter().next().unwrap(), None)
+                .torrent
+                .unwrap()
+                .is_private
+        };
+
+        assert_eq!(map(private), Some(true));
+        assert_eq!(map(public), Some(false));
+        // Pre-5.0 qBittorrent omits the field entirely; never claim a torrent is public.
+        assert_eq!(map(absent), None);
+    }
+
+    #[test]
+    fn observed_seed_state_is_taken_from_the_list_payload() {
+        let raw =
+            r#"[{"hash":"a1","name":"n","state":"uploading","ratio":1.75,"seeding_time":7200}]"#;
+        let torrents: Vec<QbTorrent> = serde_json::from_str(raw).unwrap();
+        let item = torrent_to_item_with_preferences(torrents.into_iter().next().unwrap(), None);
+        let torrent = item.torrent.unwrap();
+        assert_eq!(torrent.seed_ratio, Some(1.75));
+        assert_eq!(torrent.seed_time_seconds, Some(7200));
+    }
+
+    #[test]
+    fn only_defer_sentinel_or_absent_limits_consult_the_global_preferences() {
+        let unlimited = QbTorrent {
+            ratio_limit: Some(-1.0),
+            seeding_time_limit: Some(-1),
+            inactive_seeding_time_limit: Some(-1),
+            ..seeding_torrent("stoppedUP")
+        };
+        assert!(!defers_to_global_limits(&unlimited));
+
+        let deferring = QbTorrent {
+            ratio_limit: Some(-2.0),
+            seeding_time_limit: Some(-1),
+            inactive_seeding_time_limit: Some(-1),
+            ..seeding_torrent("stoppedUP")
+        };
+        assert!(defers_to_global_limits(&deferring));
+
+        // Absent fields (older qBittorrent builds) default to "use global".
+        assert!(defers_to_global_limits(&seeding_torrent("stoppedUP")));
+    }
+
+    #[test]
+    fn share_limit_fields_deserialize_from_the_list_payload() {
+        let raw = r#"[{"hash":"a1","name":"n","state":"stoppedUP","ratio":2.5,"ratio_limit":2.0,"seeding_time_limit":-2,"inactive_seeding_time_limit":-2,"last_activity":1699999000}]"#;
+        let torrents: Vec<QbTorrent> = serde_json::from_str(raw).unwrap();
+        let torrent = torrents.into_iter().next().unwrap();
+        assert_eq!(torrent.ratio_limit, Some(2.0));
+        assert_eq!(torrent.seeding_time_limit, Some(-2));
+        assert_eq!(torrent.inactive_seeding_time_limit, Some(-2));
+        assert_eq!(torrent.last_activity, Some(1_699_999_000));
+        assert_eq!(derive_can_remove(&torrent, None, NOW), Some(true));
+    }
+
     #[test]
     fn qbit_error_states_remain_warnings_and_do_not_trigger_failed_download_cleanup() {
         assert_eq!(map_state("error"), DownloadItemState::Warning);
         assert_eq!(map_state("downloading"), DownloadItemState::Downloading);
         assert_eq!(map_state("uploading"), DownloadItemState::Completed);
+    }
+
+    #[test]
+    fn unknown_states_keep_polling_instead_of_warning_or_failing() {
+        // qBittorrent's own "state could not be determined" answer, and any
+        // state a newer qBittorrent adds, are not failures and must not park a
+        // queue row in a state nothing clears.
+        for state in ["unknown", "somethingNew", ""] {
+            assert_eq!(
+                map_state(state),
+                DownloadItemState::Downloading,
+                "state {state:?} should keep polling"
+            );
+            assert_ne!(map_state(state), DownloadItemState::Warning);
+            assert_ne!(map_state(state), DownloadItemState::Error);
+        }
+    }
+
+    #[test]
+    fn unknown_states_still_carry_an_operator_message() {
+        assert_eq!(
+            state_message("somethingNew").as_deref(),
+            Some("Unknown qBittorrent download state: somethingnew")
+        );
+        assert_eq!(
+            state_message("unknown").as_deref(),
+            Some("Unknown qBittorrent download state: unknown")
+        );
+        assert_eq!(
+            state_message("").as_deref(),
+            Some("qBittorrent reported no torrent state")
+        );
+        // Recognised states keep their existing messages (or none at all).
+        assert_eq!(state_message("downloading"), None);
+        assert_eq!(state_message("stoppedUP"), None);
+        assert_eq!(
+            state_message("missingFiles").as_deref(),
+            Some("qBittorrent reports missing files")
+        );
     }
 }
 
