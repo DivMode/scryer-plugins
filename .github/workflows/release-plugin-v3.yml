@@ -664,9 +664,44 @@ jobs:
       - name: Verify prepared plugin artifacts
         run: |
           set -euo pipefail
-          while IFS=$'\t' read -r plugin_id _; do
-            ./xtask/target/xtask-release/xtask official verify-prepared "prepared-plugins/${plugin_id}"
-          done < release-plan.tsv
+          readonly parallelism=4
+          declare -a active_pids=()
+          failed=0
+
+          wait_for_slot() {
+            while (( ${#active_pids[@]} >= parallelism )); do
+              if ! wait -n "${active_pids[@]}"; then
+                failed=1
+              fi
+              local -a remaining=()
+              local pid
+              for pid in "${active_pids[@]}"; do
+                if kill -0 "${pid}" 2>/dev/null; then
+                  remaining+=("${pid}")
+                fi
+              done
+              active_pids=("${remaining[@]}")
+            done
+          }
+
+          while IFS= read -r plugin_id; do
+            wait_for_slot
+            if (( failed )); then
+              break
+            fi
+            (
+              echo "Verifying prepared artifacts for ${plugin_id}"
+              ./xtask/target/xtask-release/xtask official verify-prepared "prepared-plugins/${plugin_id}"
+            ) &
+            active_pids+=("$!")
+          done < <(cut -f1 release-plan.tsv | sort -u)
+
+          for pid in "${active_pids[@]}"; do
+            if ! wait "${pid}"; then
+              failed=1
+            fi
+          done
+          (( ! failed ))
 
       - name: Prepare sign and publish central catalog v3
         run: |
