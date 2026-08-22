@@ -17,6 +17,10 @@ on:
       - .github/workflows/archive-extraction-conformance.yml
   workflow_dispatch:
 
+concurrency:
+  group: archive-extraction-conformance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
