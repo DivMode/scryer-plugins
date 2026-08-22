@@ -52,13 +52,13 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Build xtask
-        run: cargo build --locked --profile xtask-release --manifest-path xtask/Cargo.toml
+        run: cargo build --locked --manifest-path xtask/Cargo.toml
 
       - name: Upload xtask artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: plugin-ci-xtask-${{ github.run_id }}
-          path: xtask/target/xtask-release/xtask
+          path: xtask/target/debug/xtask
           if-no-files-found: error
           retention-days: 1
 
@@ -82,11 +82,11 @@ jobs:
       - name: Restore xtask binary
         run: |
           set -euo pipefail
-          install -d xtask/target/xtask-release
-          install -m 0755 xtask-artifact/xtask xtask/target/xtask-release/xtask
+          install -d xtask/target/debug
+          install -m 0755 xtask-artifact/xtask xtask/target/debug/xtask
 
       - name: Check formatting
-        run: ./xtask/target/xtask-release/xtask ci fmt
+        run: ./xtask/target/debug/xtask ci fmt
 
   clippy:
     needs: [plan, build-xtask]
@@ -124,12 +124,12 @@ jobs:
         if: ${{ matrix.plugin_id != '' }}
         run: |
           set -euo pipefail
-          install -d xtask/target/xtask-release
-          install -m 0755 xtask-artifact/xtask xtask/target/xtask-release/xtask
+          install -d xtask/target/debug
+          install -m 0755 xtask-artifact/xtask xtask/target/debug/xtask
 
       - name: Run strict clippy
         if: ${{ matrix.plugin_id != '' }}
-        run: ./xtask/target/xtask-release/xtask ci clippy --plugin-id "${{ matrix.plugin_id }}"
+        run: ./xtask/target/debug/xtask ci clippy --plugin-id "${{ matrix.plugin_id }}"
 
       - name: Install WASI SDK for enhanced subtitle sync
         if: ${{ matrix.plugin_id == 'enhanced-subtitle-sync' }}
@@ -160,11 +160,11 @@ jobs:
 
       - name: Prefetch plugin release dependencies
         if: ${{ matrix.plugin_id != '' }}
-        run: ./xtask/target/xtask-release/xtask official prefetch "${{ matrix.plugin_id }}"
+        run: ./xtask/target/debug/xtask official prefetch "${{ matrix.plugin_id }}"
 
       - name: Validate official plugins through the release Wasm path
         if: ${{ matrix.plugin_id != '' }}
-        run: ./xtask/target/xtask-release/xtask plugin validate-all --plugin-id "${{ matrix.plugin_id }}"
+        run: ./xtask/target/debug/xtask plugin validate-all --plugin-id "${{ matrix.plugin_id }}"
 
   clippy-xtask:
     needs: plan
@@ -184,7 +184,7 @@ jobs:
         run: rustup component add clippy --toolchain "$(rustup show active-toolchain | awk '{print $1}')"
 
       - name: Run strict clippy for xtask
-        run: cargo clippy --profile xtask-release --all-targets --all-features --locked --manifest-path xtask/Cargo.toml -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked --manifest-path xtask/Cargo.toml -- -D warnings
 
   audit:
     needs: [plan, build-xtask]
@@ -220,8 +220,8 @@ jobs:
         if: ${{ needs.plan.outputs.mode != 'none' }}
         run: |
           set -euo pipefail
-          install -d xtask/target/xtask-release
-          install -m 0755 xtask-artifact/xtask xtask/target/xtask-release/xtask
+          install -d xtask/target/debug
+          install -m 0755 xtask-artifact/xtask xtask/target/debug/xtask
 
       - name: Run cargo audit
         if: ${{ needs.plan.outputs.mode != 'none' }}
@@ -236,4 +236,4 @@ jobs:
               scope_args+=(--plugin-id "$plugin_id")
             done
           fi
-          ./xtask/target/xtask-release/xtask ci audit "${scope_args[@]}"
+          ./xtask/target/debug/xtask ci audit "${scope_args[@]}"

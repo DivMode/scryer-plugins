@@ -178,6 +178,35 @@ fn archive_crc32_unsupported(
     Ok(())
 }
 
+fn native_host_call_unsupported(
+    _current: &mut CurrentPlugin,
+    _input: &[Val],
+    output: &mut [Val],
+    _state: UserData<()>,
+) -> Result<(), ExtismError> {
+    output[0] = Val::I32(0);
+    Ok(())
+}
+
+fn native_host_response_unavailable(
+    _current: &mut CurrentPlugin,
+    _input: &[Val],
+    output: &mut [Val],
+    _state: UserData<()>,
+) -> Result<(), ExtismError> {
+    output[0] = Val::I32(-1);
+    Ok(())
+}
+
+fn native_host_response_drop_unsupported(
+    _current: &mut CurrentPlugin,
+    _input: &[Val],
+    _output: &mut [Val],
+    _state: UserData<()>,
+) -> Result<(), ExtismError> {
+    Ok(())
+}
+
 #[derive(Clone)]
 struct RustupToolchain {
     rustup: PathBuf,
@@ -3645,6 +3674,38 @@ fn instantiate_plugin_from_wasm(wasm_path: &Path, timeout: Duration) -> Result<e
             [ValType::I64],
             socket_stubs.clone(),
             process_unsupported,
+        )
+        .with_function_in_namespace(
+            HOST_ABI_MODULE,
+            "scryer_host_call",
+            [ValType::I32, ValType::I32],
+            [ValType::I32],
+            socket_stubs.clone(),
+            native_host_call_unsupported,
+        )
+        .with_function_in_namespace(
+            HOST_ABI_MODULE,
+            "scryer_host_response_len",
+            [ValType::I32],
+            [ValType::I32],
+            socket_stubs.clone(),
+            native_host_response_unavailable,
+        )
+        .with_function_in_namespace(
+            HOST_ABI_MODULE,
+            "scryer_host_response_read",
+            [ValType::I32, ValType::I32, ValType::I32],
+            [ValType::I32],
+            socket_stubs.clone(),
+            native_host_response_unavailable,
+        )
+        .with_function_in_namespace(
+            HOST_ABI_MODULE,
+            "scryer_host_response_drop",
+            [ValType::I32],
+            [],
+            socket_stubs.clone(),
+            native_host_response_drop_unsupported,
         )
         .with_function_in_namespace(
             "extism:host/user",
