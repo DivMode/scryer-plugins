@@ -12,6 +12,7 @@ use scryer_plugin_sdk::{
     PluginErrorCode, PluginResult, PluginTorrentItem, ProviderDescriptor, SDK_VERSION,
 };
 use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
 
 const IMPORTED_VIEW: &str = "scryer_imported";
 const SEED_CONFIG_VAR_PREFIX: &str = "rtorrent.seed_config.";
@@ -159,10 +160,12 @@ pub fn scryer_download_add(input: String) -> FnResult<String> {
         config.older_priority
     };
     let mut args = vec![XmlValue::String(String::new())];
+    let mut torrent_file: Option<Vec<u8>> = None;
     let method = if let Some(bytes) = request.source.torrent_bytes_base64.as_deref() {
         let decoded = STANDARD
             .decode(bytes)
             .map_err(|error| Error::msg(format!("invalid torrent_bytes_base64: {error}")))?;
+        torrent_file = Some(decoded.clone());
         args.push(XmlValue::Base64(decoded));
         if config.add_stopped {
             "load.raw"
@@ -193,14 +196,32 @@ pub fn scryer_download_add(input: String) -> FnResult<String> {
     if int_response(&response)? != 0 {
         return Err(Error::msg("rTorrent did not accept the torrent"));
     }
-    let hash = request
+    // Scryer does not always populate the release info hash even when the
+    // indexer reported one (observed 2026-08-22: v1=None hint=None for a BTN
+    // release whose search result carried the hash). The .torrent we just
+    // uploaded contains it, so derive it rather than failing the add.
+    let hash = match request
         .release
         .info_hash_v1
         .as_deref()
         .or(request.release.info_hash_hint.as_deref())
         .map(normalize_hash)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| Error::msg("rTorrent add requires an info hash from the release"))?;
+    {
+        Some(value) => value,
+        None => match torrent_file.as_deref().and_then(infohash_v1_from_torrent) {
+            Some(value) => value,
+            None => {
+                return Ok(serde_json::to_string(&plugin_error::<
+                    PluginDownloadClientAddResponse,
+                >(
+                    PluginErrorCode::Permanent,
+                    "rTorrent add requires an info hash: none on the release and \
+                     it could not be derived from the .torrent",
+                ))?);
+            }
+        },
+    };
     store_seed_config(&hash, &request)?;
     Ok(serde_json::to_string(&PluginResult::Ok(
         PluginDownloadClientAddResponse {
@@ -992,3 +1013,54 @@ scryer_plugin_pdk::scryer_download_client_bridge_main!(
     status = scryer_download_status,
     test_connection = scryer_download_test_connection,
 );
+
+/// Return the byte range of one bencode value starting at `i`.
+fn bencode_end(bytes: &[u8], i: usize) -> Option<usize> {
+    match *bytes.get(i)? {
+        b'i' => {
+            let mut j = i + 1;
+            while *bytes.get(j)? != b'e' {
+                j += 1;
+            }
+            Some(j + 1)
+        }
+        b'l' | b'd' => {
+            let mut j = i + 1;
+            while *bytes.get(j)? != b'e' {
+                j = bencode_end(bytes, j)?;
+            }
+            Some(j + 1)
+        }
+        b'0'..=b'9' => {
+            let mut j = i;
+            while *bytes.get(j)? != b':' {
+                j += 1;
+            }
+            let len: usize = std::str::from_utf8(&bytes[i..j]).ok()?.parse().ok()?;
+            Some(j + 1 + len)
+        }
+        _ => None,
+    }
+}
+
+/// SHA-1 of the raw bencoded `info` value — the BitTorrent v1 info hash.
+fn infohash_v1_from_torrent(bytes: &[u8]) -> Option<String> {
+    if *bytes.first()? != b'd' {
+        return None;
+    }
+    let mut i = 1usize;
+    while i < bytes.len() && bytes[i] != b'e' {
+        let key_start = i;
+        let key_end = bencode_end(bytes, key_start)?;
+        let colon = bytes[key_start..key_end].iter().position(|b| *b == b':')? + key_start;
+        let key = &bytes[colon + 1..key_end];
+        let value_end = bencode_end(bytes, key_end)?;
+        if key == b"info" {
+            let mut hasher = Sha1::new();
+            hasher.update(&bytes[key_end..value_end]);
+            return Some(format!("{:x}", hasher.finalize()));
+        }
+        i = value_end;
+    }
+    None
+}
