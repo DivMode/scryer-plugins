@@ -2556,6 +2556,10 @@ fn parse_newznab_xml(
                                 &mut enclosure_type,
                             );
                         }
+                        name if name == "attr" || name.ends_with(":attr") => {
+                            push_attr_element(e, &mut attrs);
+                            current_tag = None;
+                        }
                         _ => {
                             current_tag = None;
                         }
@@ -2599,22 +2603,7 @@ fn parse_newznab_xml(
                 let local_name = String::from_utf8_lossy(qname.as_ref());
                 let is_attr = local_name == "attr" || local_name.ends_with(":attr");
                 if is_attr {
-                    let mut attr_name = None;
-                    let mut attr_value = None;
-                    for a in e.attributes().flatten() {
-                        match a.key.as_ref() {
-                            b"name" => {
-                                attr_name = String::from_utf8(a.value.to_vec()).ok();
-                            }
-                            b"value" => {
-                                attr_value = String::from_utf8(a.value.to_vec()).ok();
-                            }
-                            _ => {}
-                        }
-                    }
-                    if let (Some(n), Some(v)) = (attr_name, attr_value) {
-                        attrs.push((n, v));
-                    }
+                    push_attr_element(e, &mut attrs);
                 } else if qname.as_ref() == b"enclosure" {
                     parse_enclosure_attrs(
                         e,
@@ -2730,6 +2719,29 @@ fn parse_newznab_xml(
     }
 
     (results, api_limits)
+}
+
+/// `<newznab:attr>` / `<torznab:attr>` carries its payload in attributes and
+/// has no content, but a feed is free to write it as `<attr … />` or as an
+/// open/close pair — XML makes no distinction, and Go's `encoding/xml` (and
+/// some indexers) only ever write the pair. Collect it from either shape.
+fn push_attr_element(e: &quick_xml::events::BytesStart<'_>, attrs: &mut Vec<(String, String)>) {
+    let mut attr_name = None;
+    let mut attr_value = None;
+    for a in e.attributes().flatten() {
+        match a.key.as_ref() {
+            b"name" => {
+                attr_name = String::from_utf8(a.value.to_vec()).ok();
+            }
+            b"value" => {
+                attr_value = String::from_utf8(a.value.to_vec()).ok();
+            }
+            _ => {}
+        }
+    }
+    if let (Some(n), Some(v)) = (attr_name, attr_value) {
+        attrs.push((n, v));
+    }
 }
 
 fn parse_enclosure_attrs(
@@ -4425,6 +4437,33 @@ mod tests {
                 .get("password_protected")
                 .and_then(|value| value.as_bool()),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn xml_reads_attr_elements_written_as_open_close_pairs() {
+        // Go's encoding/xml and some indexers never emit `<attr … />`; the pair
+        // form is the same element and must yield the same attributes.
+        let body = r#"<?xml version="1.0"?>
+<rss xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+<channel>
+  <item>
+    <title>Torrent.Release.1080p</title>
+    <enclosure url="https://example.com/dl/release.torrent" length="1234" type="application/x-bittorrent"></enclosure>
+    <torznab:attr name="seeders" value="7"></torznab:attr>
+    <torznab:attr name="peers" value="9"></torznab:attr>
+    <newznab:attr name="grabs" value="3"></newznab:attr>
+  </item>
+</channel>
+</rss>"#;
+        let (results, _) = parse_newznab_xml(body, 100, extract_torrent_test_metadata);
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert_eq!(r.seeders, Some(7));
+        assert_eq!(r.peers, Some(9));
+        assert_eq!(
+            r.download_url.as_deref(),
+            Some("https://example.com/dl/release.torrent")
         );
     }
 
