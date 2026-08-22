@@ -45,9 +45,12 @@ For official plugins:
 
 Official plugin publishing is a two-tier tag flow:
 
-- `cargo xtask release-changed` creates only the changed `plugins-v3/<plugin-id>/v*`
-  version tags
-- the same command then creates one signed `plugins-v3/release/*` tag last
+- `cargo xtask release-changed --prepare` creates and pushes a version-bump commit
+  only from a clean `release/*` branch; its pull request owns quality validation
+- after the PR merges, `cargo xtask release-publish-tags --pr <number>` creates
+  signed `plugins-v3/<plugin-id>/v*` tags at that exact merged `main` commit
+- the tag-publishing command creates one signed `plugins-v3/release/*` tag last,
+  in a separate push
 - GitHub Actions watches only the repo release tag and publishes the plugin tags
   that point at that exact commit
 - each published plugin version release includes its catalog-v3 snippet next

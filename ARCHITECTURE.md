@@ -6,8 +6,9 @@ For humans and agents alike:
 
 - `cargo xtask` is the canonical interface for repo automation
 - `cargo xtask ci strict` is the canonical repo validation pass for format, audit, and strict clippy
-- `cargo xtask release-changed` is the canonical official release path
-- `cargo xtask release <plugin-id>` remains available for one-off official release prep
+- `cargo xtask release-changed --prepare` prepares the canonical official release PR
+- `cargo xtask release <plugin-id> --prepare` remains available for one-off official release prep
+- `cargo xtask release-publish-tags --pr <number>` creates publication tags after that PR merges
 - `cargo xtask catalog render-v3` is the local central catalog validation/render pass
 - `cargo xtask plugin validate <path>` is the current SDK ABI check for a plugin crate
 - `cargo xtask plugin new <kind> <name>` is the scaffold path for new plugin crates
@@ -35,6 +36,9 @@ Operational rules:
   the watched orchestration tag family is `plugins-v3/release/*`
 - GitHub Actions must only watch `plugins-v3/release/*`; per-plugin version tags
   are inventory for the batch publisher, not direct workflow triggers
+- release preparation runs only from a clean `release/*` branch and pushes the
+  version-bump commit for PR validation; signed tags are created only from the
+  merged `main` commit
 - plugin releases append immutable `releases[]` entries instead of overwriting one flat row
 - Scryer owns built-in pinning; this repo can publish official plugins, but it
   no longer declares built-in candidates
