@@ -6,9 +6,9 @@ use scryer_plugin_sdk::{
     DownloadClientDescriptor, DownloadControlAction, DownloadInputKind, DownloadIsolationMode,
     DownloadItemState, DownloadTorrentCapabilities, PluginCompletedDownload, PluginDescriptor,
     PluginDownloadClientAddRequest, PluginDownloadClientAddResponse,
-    PluginDownloadClientControlRequest, PluginDownloadClientStatus, PluginDownloadItem,
-    PluginDownloadOutputKind, PluginError, PluginErrorCode, PluginResult, PluginTorrentItem,
-    ProviderDescriptor, SDK_VERSION,
+    PluginDownloadClientControlRequest, PluginDownloadClientMarkImportedRequest,
+    PluginDownloadClientStatus, PluginDownloadItem, PluginDownloadOutputKind, PluginError,
+    PluginErrorCode, PluginResult, PluginTorrentItem, ProviderDescriptor, SDK_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,6 +19,7 @@ const SEED_CONFIG_VAR_PREFIX: &str = "rqbit.seed_config.";
 #[derive(Debug, Clone)]
 struct RqbitConfig {
     base_url: String,
+    directory: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -136,7 +137,7 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
                 resume: false,
                 remove: true,
                 remove_with_data: true,
-                mark_imported: true,
+                mark_imported: false,
                 prepare_for_import: false,
                 client_status: true,
                 queue_priority: false,
@@ -197,7 +198,7 @@ pub fn scryer_download_add(input: String) -> FnResult<String> {
         ))?);
     };
 
-    let response = post_bytes(&config, "/torrents?overwrite=true", body)?;
+    let response = post_bytes(&config, &add_torrent_path(&config), body)?;
     let parsed: PostTorrentResponse = serde_json::from_str(&response)
         .map_err(|error| Error::msg(format!("RQBit add response parse failed: {error}")))?;
     let hash = parsed
@@ -227,7 +228,7 @@ pub fn scryer_download_list_queue(_input: String) -> FnResult<String> {
     let config = RqbitConfig::from_extism()?;
     let items = list_torrents(&config)?
         .into_iter()
-        .filter(is_visible_torrent)
+        .filter(|torrent| is_visible_torrent(&config, torrent))
         .map(torrent_to_item)
         .collect::<Vec<_>>();
     Ok(serde_json::to_string(&PluginResult::Ok(items))?)
@@ -237,7 +238,7 @@ pub fn scryer_download_list_history(_input: String) -> FnResult<String> {
     let config = RqbitConfig::from_extism()?;
     let items = list_torrents(&config)?
         .into_iter()
-        .filter(is_visible_torrent)
+        .filter(|torrent| is_visible_torrent(&config, torrent))
         .map(torrent_to_item)
         .collect::<Vec<_>>();
     Ok(serde_json::to_string(&PluginResult::Ok(items))?)
@@ -247,7 +248,7 @@ pub fn scryer_download_list_completed(_input: String) -> FnResult<String> {
     let config = RqbitConfig::from_extism()?;
     let downloads = list_torrents(&config)?
         .into_iter()
-        .filter(is_visible_torrent)
+        .filter(|torrent| is_visible_torrent(&config, torrent))
         .filter(|torrent| torrent.stats.finished)
         .map(torrent_to_completed)
         .collect::<Vec<_>>();
@@ -285,8 +286,12 @@ pub fn scryer_download_control(input: String) -> FnResult<String> {
     Ok(serde_json::to_string(&PluginResult::Ok(()))?)
 }
 
-pub fn scryer_download_mark_imported(_input: String) -> FnResult<String> {
-    Ok(serde_json::to_string(&PluginResult::Ok(()))?)
+pub fn scryer_download_mark_imported(input: String) -> FnResult<String> {
+    let _: PluginDownloadClientMarkImportedRequest = serde_json::from_str(&input)?;
+    Ok(serde_json::to_string(&plugin_error::<()>(
+        PluginErrorCode::Unsupported,
+        "RQBit has no category, label, or imported view to mark after import",
+    ))?)
 }
 
 pub fn scryer_download_status(_input: String) -> FnResult<String> {
@@ -297,7 +302,7 @@ pub fn scryer_download_status(_input: String) -> FnResult<String> {
         PluginDownloadClientStatus {
             version: Some(root.version),
             is_localhost: Some(is_localhost_url(&config.base_url)),
-            remote_output_roots: Vec::new(),
+            remote_output_roots: output_roots(&config),
             removes_completed_downloads: Some(false),
             sorting_mode: Some("rqbit-rest".to_string()),
             warnings: Vec::new(),
@@ -331,10 +336,14 @@ impl RqbitConfig {
         } else {
             "http"
         };
+        let directory = config_value("directory")
+            .map(|value| normalize_directory(&value))
+            .filter(|value| !value.is_empty());
         Ok(Self {
             base_url: format!("{scheme}://{host}:{port}/{}", url_base.trim_matches('/'))
                 .trim_end_matches('/')
                 .to_string(),
+            directory,
         })
     }
 }
@@ -356,9 +365,46 @@ impl TorrentWithStats {
     }
 }
 
-fn is_visible_torrent(torrent: &TorrentWithStats) -> bool {
+fn is_visible_torrent(config: &RqbitConfig, torrent: &TorrentWithStats) -> bool {
     let path = torrent.output_path();
-    !path.trim().is_empty() && !path.starts_with('.')
+    !path.trim().is_empty()
+        && !path.starts_with('.')
+        && config
+            .directory
+            .as_deref()
+            .is_none_or(|directory| path_is_within_directory(&path, directory))
+}
+
+fn normalize_directory(path: &str) -> String {
+    let path = path.trim();
+    if path == "/" {
+        "/".to_string()
+    } else {
+        path.trim_end_matches('/').to_string()
+    }
+}
+
+fn path_is_within_directory(path: &str, directory: &str) -> bool {
+    let path = normalize_directory(path);
+    let directory = normalize_directory(directory);
+    directory == "/"
+        || path == directory
+        || path
+            .strip_prefix(&directory)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn add_torrent_path(config: &RqbitConfig) -> String {
+    let Some(directory) = config.directory.as_deref() else {
+        return "/torrents?overwrite=true".to_string();
+    };
+    let encoded_directory =
+        percent_encoding::utf8_percent_encode(directory, percent_encoding::NON_ALPHANUMERIC);
+    format!("/torrents?overwrite=true&output_folder={encoded_directory}")
+}
+
+fn output_roots(config: &RqbitConfig) -> Vec<String> {
+    config.directory.iter().cloned().collect()
 }
 
 fn config_fields() -> Vec<ConfigFieldDef> {
@@ -388,6 +434,16 @@ fn config_fields() -> Vec<ConfigFieldDef> {
             None,
         ),
         connection_field("url_base", "URL Base", false, Some("/"), None),
+        field(
+            "directory",
+            "Directory",
+            ConfigFieldType::Path,
+            false,
+            None,
+            Some(
+                "Optional rqbit output root. When set, Scryer sends downloads there and only lists torrents in that directory.",
+            ),
+        ),
     ]
 }
 
@@ -471,6 +527,7 @@ fn torrent_to_item(torrent: TorrentWithStats) -> PluginDownloadItem {
         .flatten()
         .map(|finished_at| now.saturating_sub(finished_at).max(0));
     let path = torrent.output_path();
+    let completed_at = reported_completed_at(&torrent);
 
     PluginDownloadItem {
         client_item_id: hash.clone(),
@@ -503,13 +560,14 @@ fn torrent_to_item(torrent: TorrentWithStats) -> PluginDownloadItem {
         can_remove,
         removed: Some(false),
         raw_state: Some(torrent.stats.state.clone()),
-        completed_at: None,
+        completed_at,
     }
 }
 
 fn torrent_to_completed(torrent: TorrentWithStats) -> PluginCompletedDownload {
     let hash = normalize_hash(&torrent.info_hash);
     let path = torrent.output_path();
+    let completed_at = reported_completed_at(&torrent);
     PluginCompletedDownload {
         client_item_id: hash.clone(),
         download_id: None,
@@ -524,9 +582,17 @@ fn torrent_to_completed(torrent: TorrentWithStats) -> PluginCompletedDownload {
         }),
         content_paths: vec![path],
         size_bytes: Some(torrent.stats.total_bytes),
-        completed_at: None,
+        completed_at,
         parameters: Vec::new(),
     }
+}
+
+fn reported_completed_at(torrent: &TorrentWithStats) -> Option<String> {
+    torrent
+        .stats
+        .finished_at_seconds
+        .filter(|value| *value > 0)
+        .map(|value| value.to_string())
 }
 
 /// Honest `can_remove` for rqbit.
@@ -789,6 +855,13 @@ mod tests {
 
     const NOW: i64 = 1_700_000_000;
 
+    fn config(directory: Option<&str>) -> RqbitConfig {
+        RqbitConfig {
+            base_url: "http://rqbit:3030".to_string(),
+            directory: directory.map(normalize_directory),
+        }
+    }
+
     fn finished_torrent() -> TorrentWithStats {
         TorrentWithStats {
             id: 1,
@@ -844,6 +917,124 @@ mod tests {
 
     fn parse_torrent(json: &str) -> TorrentWithStats {
         serde_json::from_str(json).expect("rqbit torrent JSON should parse")
+    }
+
+    #[test]
+    fn descriptor_does_not_advertise_post_import_marking() {
+        let descriptor: PluginDescriptor =
+            serde_json::from_str(&scryer_describe(String::new()).expect("describe rqbit"))
+                .expect("parse rqbit descriptor");
+        let ProviderDescriptor::DownloadClient(client) = descriptor.provider else {
+            panic!("rqbit must be a download client");
+        };
+
+        assert!(!client.capabilities.mark_imported);
+        assert!(
+            !client
+                .capabilities
+                .torrent
+                .expect("torrent capabilities")
+                .supports_post_import_isolation
+        );
+    }
+
+    #[test]
+    fn mark_imported_reports_unsupported_after_validating_the_request() {
+        let result: PluginResult<()> = serde_json::from_str(
+            &scryer_download_mark_imported(
+                r#"{"client_item_id":"abcdef0123456789abcdef0123456789abcdef01"}"#.to_string(),
+            )
+            .expect("mark imported response"),
+        )
+        .expect("parse mark imported response");
+
+        let PluginResult::Err(error) = result else {
+            panic!("rqbit mark imported must be unsupported");
+        };
+        assert_eq!(error.code, PluginErrorCode::Unsupported);
+    }
+
+    #[test]
+    fn add_path_preserves_legacy_behavior_without_directory() {
+        assert_eq!(add_torrent_path(&config(None)), "/torrents?overwrite=true");
+    }
+
+    #[test]
+    fn add_path_encodes_configured_directory() {
+        assert_eq!(
+            add_torrent_path(&config(Some("/downloads/Scryer TV"))),
+            "/torrents?overwrite=true&output_folder=%2Fdownloads%2FScryer%20TV"
+        );
+    }
+
+    #[test]
+    fn directory_scope_accepts_only_the_configured_root_or_descendants() {
+        let scoped = config(Some("/downloads/scryer"));
+        assert!(is_visible_torrent(
+            &scoped,
+            &torrent("/downloads/scryer", "Movie")
+        ));
+        assert!(is_visible_torrent(
+            &scoped,
+            &torrent("/downloads/scryer/Show", "Episode")
+        ));
+        assert!(!is_visible_torrent(
+            &scoped,
+            &torrent("/downloads/scryer-old", "Movie")
+        ));
+        assert!(!is_visible_torrent(
+            &scoped,
+            &torrent("./downloads/scryer", "Movie")
+        ));
+    }
+
+    #[test]
+    fn legacy_scope_keeps_non_hidden_torrents_visible() {
+        assert!(is_visible_torrent(
+            &config(None),
+            &torrent("/downloads/other-client", "Movie")
+        ));
+        assert!(!is_visible_torrent(
+            &config(None),
+            &torrent("./downloads", "Movie")
+        ));
+    }
+
+    #[test]
+    fn configured_directory_is_the_only_remote_output_root() {
+        assert_eq!(
+            output_roots(&config(Some("/downloads/scryer"))),
+            vec!["/downloads/scryer"]
+        );
+        assert!(output_roots(&config(None)).is_empty());
+    }
+
+    #[test]
+    fn reported_finished_at_is_exported_without_a_local_fallback() {
+        let mut queue_torrent = finished_torrent();
+        queue_torrent.stats.finished_at_seconds = Some(1_699_999_000);
+        assert_eq!(
+            torrent_to_item(queue_torrent).completed_at.as_deref(),
+            Some("1699999000")
+        );
+
+        let mut completed_torrent = finished_torrent();
+        completed_torrent.stats.finished_at_seconds = Some(1_700_000_000);
+        assert_eq!(
+            torrent_to_completed(completed_torrent)
+                .completed_at
+                .as_deref(),
+            Some("1700000000")
+        );
+
+        let mut without_reported_time = finished_torrent();
+        without_reported_time.stats.finished_at_seconds = Some(0);
+        assert_eq!(torrent_to_item(without_reported_time).completed_at, None);
+    }
+
+    #[test]
+    fn mark_imported_rejects_an_invalid_request() {
+        assert!(scryer_download_mark_imported("not json".to_string()).is_err());
     }
 
     #[test]
