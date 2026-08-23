@@ -194,33 +194,37 @@ fn build_queries(req: &SearchRequest) -> Vec<BtnQuery> {
     // Queries are tiers, tried in order; the caller stops at the first tier
     // that returns anything. Measured against BTN 2026-08-22:
     //
-    //   Devil May Cry (tvdb 440193)      Name "S01%E01%"  -> 1   "S01%E001%" -> 0
-    //   Renegade Immortal (tvdb 433335)  Name "S01%E99%"  -> 0   "S01%E099%" -> 1
+    //   Devil May Cry (tvdb 440193)      Name "S01%E01%" -> 1   "S01%E%01%" -> 1
+    //   Renegade Immortal (tvdb 433335)  Name "S01%E99%" -> 0   "S01%E%99%" -> 1
     //
     // Long-running series using absolute numbering are uploaded as S01E099;
     // "E99" does not occur anywhere in "E099", so a two-digit pattern cannot
-    // match them. Neither width works for both series, hence two tiers.
+    // match them. Name is an anchored LIKE against the group name, so a
+    // wildcard after the "E" covers both widths in a single request instead of
+    // spending a second one on the zero-padded form. The trailing "%" has to
+    // stay: it is what matches multi-episode groups ("S01E01E02") and variant
+    // groups ("S01E01 - Extended").
     //
-    // BTN also ignores its own Season/Episode filters for some series
-    // (Renegade Immortal returns all 161 torrents regardless), so those are
-    // the last resort only: paging that many results overran Scryer's search
-    // timeout.
+    // BTN ignores its own Season/Episode filters entirely: a query carrying
+    // them returns exactly what the same query without them returns (verified
+    // on tvdb 433335, 121361 and 440193). That tier is therefore a
+    // whole-series sweep, and stays last because paging 161 torrents overran
+    // Scryer's search timeout.
     match (req.season, req.episode) {
         (Some(season), Some(episode)) => {
+            // Episodes >= 100 already render as three digits, where the
+            // wildcard would only broaden the match for nothing.
+            let name = if episode < 100 {
+                format!("S{season:02}%E%{episode:02}%")
+            } else {
+                format!("S{season:02}%E{episode:02}%")
+            };
+
             queries.push(BtnQuery {
                 category: Some("Episode".to_string()),
-                name: Some(format!("S{season:02}%E{episode:02}%")),
+                name: Some(name),
                 ..base.clone()
             });
-            // Episodes >= 100 already render as three digits; re-querying is
-            // an identical request, so skip it.
-            if episode < 100 {
-                queries.push(BtnQuery {
-                    category: Some("Episode".to_string()),
-                    name: Some(format!("S{season:02}%E{episode:03}%")),
-                    ..base.clone()
-                });
-            }
             queries.push(BtnQuery {
                 category: Some("Episode".to_string()),
                 season: Some(season.to_string()),
@@ -649,3 +653,72 @@ where
 }
 
 indexer_command_compat::scryer_indexer_main!(descriptor = build_descriptor, search = search,);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn episode_request(season: u32, episode: u32) -> SearchRequest {
+        SearchRequest {
+            ids: HashMap::from([("tvdb_id".to_string(), "433335".to_string())]),
+            season: Some(season),
+            episode: Some(episode),
+            ..SearchRequest::default()
+        }
+    }
+
+    #[test]
+    fn episode_search_matches_both_paddings_in_one_name_query() {
+        let queries = build_queries(&episode_request(1, 99));
+
+        // One Name query, then the whole-series sweep. The zero-padded form no
+        // longer costs a request of its own.
+        assert_eq!(queries.len(), 2);
+        assert_eq!(queries[0].name.as_deref(), Some("S01%E%99%"));
+        assert_eq!(queries[1].name, None);
+        assert_eq!(queries[1].episode.as_deref(), Some("99"));
+    }
+
+    #[test]
+    fn episode_search_wildcards_every_number_below_one_hundred() {
+        for (episode, expected) in [(1, "S01%E%01%"), (9, "S01%E%09%"), (97, "S01%E%97%")] {
+            let queries = build_queries(&episode_request(1, episode));
+            assert_eq!(queries[0].name.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn episode_search_leaves_three_digit_numbers_unwildcarded() {
+        for (episode, expected) in [(100, "S01%E100%"), (101, "S01%E101%"), (999, "S01%E999%")] {
+            let queries = build_queries(&episode_request(1, episode));
+            assert_eq!(queries.len(), 2);
+            assert_eq!(queries[0].name.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn season_search_is_unchanged() {
+        let req = SearchRequest {
+            ids: HashMap::from([("tvdb_id".to_string(), "433335".to_string())]),
+            season: Some(1),
+            ..SearchRequest::default()
+        };
+
+        let queries = build_queries(&req);
+
+        assert_eq!(queries.len(), 2);
+        assert_eq!(queries[0].name.as_deref(), Some("Season 1%"));
+        assert_eq!(queries[1].name.as_deref(), Some("S01E%"));
+    }
+
+    #[test]
+    fn search_without_a_series_id_issues_no_query() {
+        let req = SearchRequest {
+            season: Some(1),
+            episode: Some(99),
+            ..SearchRequest::default()
+        };
+
+        assert!(build_queries(&req).is_empty());
+    }
+}
