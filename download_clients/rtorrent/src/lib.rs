@@ -284,27 +284,34 @@ pub fn scryer_download_mark_imported(input: String) -> FnResult<String> {
             .clone()
             .unwrap_or_else(|| request.client_item_id.clone()),
     );
-    if !config.post_import_category.is_empty()
-        && config.post_import_category != config.category
-        && let Ok(response) = call_document(
+    if !config.post_import_category.is_empty() && config.post_import_category != config.category {
+        let response = call_document(
             &config,
             "d.custom1.set",
             &[
                 XmlValue::String(hash.clone()),
                 XmlValue::String(config.post_import_category.clone()),
             ],
-        )
-    {
-        let _ = string_response(&response);
+        )?;
+        if int_response(&response)? != 0 {
+            return Err(Error::msg(
+                "rTorrent did not update the imported torrent category",
+            ));
+        }
     }
-    let _ = call_document(
+    let response = call_document(
         &config,
         "d.views.push_back_unique",
         &[
             XmlValue::String(hash),
             XmlValue::String(IMPORTED_VIEW.to_string()),
         ],
-    );
+    )?;
+    if int_response(&response)? != 0 {
+        return Err(Error::msg(
+            "rTorrent did not add the imported torrent to the imported view",
+        ));
+    }
     Ok(serde_json::to_string(&PluginResult::Ok(()))?)
 }
 
@@ -320,7 +327,9 @@ pub fn scryer_download_status(_input: String) -> FnResult<String> {
             } else {
                 vec![config.directory]
             },
-            removes_completed_downloads: Some(!config.post_import_category.is_empty()),
+            // Moving an imported torrent into another category retains it in rTorrent. Reporting
+            // otherwise prevents the host from calling `mark_imported` to perform that move.
+            removes_completed_downloads: Some(false),
             sorting_mode: Some("rtorrent-xmlrpc".to_string()),
             warnings: vec![
                 "Remove with data is unavailable because Scryer's rTorrent implementation deletes files through the host filesystem".to_string(),
