@@ -8,7 +8,8 @@ use scryer_plugin_sdk::{
     DownloadIsolationMode, DownloadItemState, DownloadTorrentCapabilities, PluginCompletedDownload,
     PluginDescriptor, PluginDownloadClientAddRequest, PluginDownloadClientAddResponse,
     PluginDownloadClientControlRequest, PluginDownloadClientMarkImportedRequest,
-    PluginDownloadClientStatus, PluginDownloadItem, PluginDownloadOutputKind, PluginError,
+    PluginDownloadClientStatus, PluginDownloadItem, PluginDownloadListRecentCompletedRequest,
+    PluginDownloadOutputKind, PluginError,
     PluginErrorCode, PluginResult, PluginTorrentItem, ProviderDescriptor, SDK_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -224,23 +225,59 @@ pub fn scryer_download_list_queue(_input: String) -> FnResult<String> {
 
 pub fn scryer_download_list_history(_input: String) -> FnResult<String> {
     let config = RTorrentConfig::from_extism()?;
-    let items = list_torrents(&config)?
+    let mut torrents = list_torrents(&config)?
         .into_iter()
         .filter(|torrent| torrent_matches_scope(&config, torrent))
-        .map(torrent_to_item)
         .collect::<Vec<_>>();
+    // Hosts read a bounded first page of this list as "recent activity",
+    // and rTorrent yields session order (oldest first). Without newest-first
+    // ordering, a client holding more than one page of torrents never
+    // surfaces its newest completions to the download tracker, so automatic
+    // import silently stalls. Mirrors the qBittorrent completion-backlog fix.
+    sort_newest_finished_first(&mut torrents);
+    let items = torrents.into_iter().map(torrent_to_item).collect::<Vec<_>>();
     Ok(serde_json::to_string(&PluginResult::Ok(items))?)
 }
 
 pub fn scryer_download_list_completed(_input: String) -> FnResult<String> {
     let config = RTorrentConfig::from_extism()?;
-    let downloads = list_torrents(&config)?
+    Ok(serde_json::to_string(&PluginResult::Ok(completed_downloads(
+        &config, None,
+    )?))?)
+}
+
+pub fn scryer_download_list_recent_completed(input: String) -> FnResult<String> {
+    let request: PluginDownloadListRecentCompletedRequest = serde_json::from_str(&input)?;
+    let config = RTorrentConfig::from_extism()?;
+    Ok(serde_json::to_string(&PluginResult::Ok(completed_downloads(
+        &config,
+        Some(request.limit),
+    )?))?)
+}
+
+fn completed_downloads(
+    config: &RTorrentConfig,
+    limit: Option<usize>,
+) -> Result<Vec<PluginCompletedDownload>, Error> {
+    let mut torrents = list_torrents(config)?
         .into_iter()
-        .filter(|torrent| torrent_matches_scope(&config, torrent))
+        .filter(|torrent| torrent_matches_scope(config, torrent))
         .filter(|torrent| torrent.is_finished)
-        .map(torrent_to_completed)
         .collect::<Vec<_>>();
-    Ok(serde_json::to_string(&PluginResult::Ok(downloads))?)
+    // Same contract as history: bounded consumers keep a prefix of this
+    // list, so the newest completions must come first or a backlog of old
+    // finished torrents permanently pins the feedback window.
+    sort_newest_finished_first(&mut torrents);
+    if let Some(limit) = limit {
+        torrents.truncate(limit);
+    }
+    Ok(torrents.into_iter().map(torrent_to_completed).collect())
+}
+
+/// Newest finished first; entries without a finished timestamp
+/// (`d.timestamp.finished` == 0) sort last, keeping their session order.
+fn sort_newest_finished_first(torrents: &mut [RTorrentTorrent]) {
+    torrents.sort_by_key(|torrent| std::cmp::Reverse(torrent.finished_time));
 }
 
 pub fn scryer_download_control(input: String) -> FnResult<String> {
@@ -1293,7 +1330,7 @@ scryer_plugin_pdk::scryer_download_client_bridge_main!(
     list_queue = scryer_download_list_queue,
     list_history = scryer_download_list_history,
     list_completed = scryer_download_list_completed,
-    list_recent_completed = None,
+    list_recent_completed = Some(scryer_download_list_recent_completed),
     control = scryer_download_control,
     mark_imported = scryer_download_mark_imported,
     status = scryer_download_status,
