@@ -180,6 +180,7 @@ fn build_descriptor_json() -> Result<String, Error> {
                 remove: true,
                 remove_with_data: true,
                 mark_imported: true,
+                mark_imported_non_destructive: true,
                 prepare_for_import: false,
                 client_status: true,
                 queue_priority: false,
@@ -636,6 +637,14 @@ fn control_endpoint(action: DownloadControlAction, version: &str) -> &'static st
 }
 
 pub fn scryer_download_mark_imported(input: String) -> FnResult<String> {
+    mark_imported_non_destructive(input)
+}
+
+pub fn scryer_download_mark_imported_non_destructive(input: String) -> FnResult<String> {
+    mark_imported_non_destructive(input)
+}
+
+fn mark_imported_non_destructive(input: String) -> FnResult<String> {
     let request: PluginDownloadClientMarkImportedRequest = serde_json::from_str(&input)?;
     let hash = normalize_hash(
         &request
@@ -2070,6 +2079,7 @@ fn torrent_to_completed_download(torrent: QbTorrent) -> Option<PluginCompletedDo
         download_id: None,
         info_hash: Some(hash),
         name: torrent.name.clone(),
+        release_name: None,
         dest_dir,
         category: normalize_non_empty(torrent.category.clone()),
         output_kind: Some(output_kind),
@@ -2417,6 +2427,10 @@ mod tests {
         );
         assert_eq!(
             value["provider"]["capabilities"]["torrent"]["supports_post_import_isolation"],
+            true
+        );
+        assert_eq!(
+            value["provider"]["capabilities"]["mark_imported_non_destructive"],
             true
         );
     }
@@ -3545,6 +3559,7 @@ scryer_plugin_pdk::scryer_download_client_bridge_main!(
     list_recent_completed = Some(scryer_download_list_recent_completed),
     control = scryer_download_control,
     mark_imported = scryer_download_mark_imported,
+    mark_imported_non_destructive = Some(scryer_download_mark_imported_non_destructive),
     status = scryer_download_status,
     test_connection = scryer_download_test_connection,
 );
