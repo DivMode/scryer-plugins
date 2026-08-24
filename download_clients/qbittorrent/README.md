@@ -25,7 +25,8 @@ or time limits. It also forwards qBittorrent's sequential, first/last-piece,
 content-layout, auto-management, and skip-checking options when Scryer
 supplies them.
 
-**post_import_action** is retain, tag_imported (the default), remove, or
-remove_with_data. Tag-imported uses **imported_tag**, defaulting to
-scryer:imported. Choose a destructive cleanup action only when the import has
-made a safe, independent library copy.
+Enable **tag_after_import** to apply **imported_tag**, defaulting to
+`scryer:imported`, after Scryer verifies an import. This marker is
+non-destructive; Scryer's seeding profile remains responsible for eventual
+pause or removal. Legacy **post_import_action** values remain readable:
+`retain` disables tagging, while all other legacy values enable it.
