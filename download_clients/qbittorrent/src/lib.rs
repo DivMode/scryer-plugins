@@ -10,9 +10,10 @@ use scryer_plugin_sdk::{
     DownloadItemState, DownloadTorrentCapabilities, PluginCompletedDownload, PluginDescriptor,
     PluginDownloadClientAddRequest, PluginDownloadClientAddResponse,
     PluginDownloadClientControlRequest, PluginDownloadClientMarkImportedRequest,
-    PluginDownloadClientStatus, PluginDownloadItem, PluginDownloadOutputKind, PluginError,
-    PluginErrorCode, PluginResult, PluginTorrentContentLayout, PluginTorrentInitialState,
-    PluginTorrentItem, ProviderDescriptor, SDK_VERSION,
+    PluginDownloadClientStatus, PluginDownloadItem, PluginDownloadListRecentCompletedRequest,
+    PluginDownloadOutputKind, PluginError, PluginErrorCode, PluginResult,
+    PluginTorrentContentLayout, PluginTorrentInitialState, PluginTorrentItem, ProviderDescriptor,
+    SDK_VERSION,
 };
 use serde::Deserialize;
 use sha1::{Digest, Sha1};
@@ -45,14 +46,6 @@ enum RoutingMode {
     Tag,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PostImportAction {
-    Retain,
-    TagImported,
-    Remove,
-    RemoveWithData,
-}
-
 #[derive(Debug, Clone)]
 struct QbittorrentConfig {
     webui_url: String,
@@ -67,7 +60,7 @@ struct QbittorrentConfig {
     force_start: bool,
     skip_checking: bool,
     imported_tag: String,
-    post_import_action: PostImportAction,
+    tag_after_import: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -451,16 +444,52 @@ fn defers_to_global_limits(torrent: &QbTorrent) -> bool {
 pub fn scryer_download_list_completed(_input: String) -> FnResult<String> {
     let config = QbittorrentConfig::from_extism()?;
     Ok(serde_json::to_string(&PluginResult::Ok(
-        completed_downloads(&config)?,
+        completed_downloads(&config, None)?,
     ))?)
 }
 
-fn completed_downloads(config: &QbittorrentConfig) -> Result<Vec<PluginCompletedDownload>, Error> {
+pub fn scryer_download_list_recent_completed(input: String) -> FnResult<String> {
+    let request: PluginDownloadListRecentCompletedRequest = serde_json::from_str(&input)?;
+    let config = QbittorrentConfig::from_extism()?;
+    Ok(serde_json::to_string(&PluginResult::Ok(
+        completed_downloads(&config, Some(request.limit))?,
+    ))?)
+}
+
+fn completed_downloads(
+    config: &QbittorrentConfig,
+    limit: Option<usize>,
+) -> Result<Vec<PluginCompletedDownload>, Error> {
     let torrents = list_completed_torrents(config)?;
-    Ok(torrents
+    let raw_count = torrents.len();
+    let imported_tag_count = torrents
+        .iter()
+        .filter(|torrent| torrent_has_tag(torrent, &config.imported_tag))
+        .count();
+    let (downloads, converted_count) = convert_completed_torrents(torrents, limit);
+    eprintln!(
+        "event=qbittorrent_completed_feedback_poll client=qbittorrent scope=unfiltered \
+         raw_count={raw_count} imported_tag_count={imported_tag_count} returned_count={} \
+         limit={limit:?} saturated={}",
+        downloads.len(),
+        limit.is_some_and(|limit| converted_count >= limit)
+    );
+    Ok(downloads)
+}
+
+fn convert_completed_torrents(
+    torrents: Vec<QbTorrent>,
+    limit: Option<usize>,
+) -> (Vec<PluginCompletedDownload>, usize) {
+    let mut downloads = torrents
         .into_iter()
         .filter_map(torrent_to_completed_download)
-        .collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let converted_count = downloads.len();
+    if let Some(limit) = limit {
+        downloads.truncate(limit);
+    }
+    (downloads, converted_count)
 }
 
 fn completed_history_items(config: &QbittorrentConfig) -> Result<Vec<PluginDownloadItem>, Error> {
@@ -473,7 +502,28 @@ fn completed_history_items(config: &QbittorrentConfig) -> Result<Vec<PluginDownl
 }
 
 fn list_completed_torrents(config: &QbittorrentConfig) -> Result<Vec<QbTorrent>, Error> {
-    collect_completed_torrents(|filter| list_torrents(config, filter))
+    let mut torrents =
+        collect_completed_torrents(|filter| list_completed_torrents_for_filter(config, filter))?;
+    sort_and_dedupe_completed_torrents(&mut torrents, &config.imported_tag);
+    Ok(torrents)
+}
+
+fn torrent_has_tag(torrent: &QbTorrent, tag: &str) -> bool {
+    torrent.tags.as_deref().is_some_and(|tags| {
+        tags.split(',')
+            .any(|candidate| candidate.trim().eq_ignore_ascii_case(tag.trim()))
+    })
+}
+
+fn sort_and_dedupe_completed_torrents(torrents: &mut Vec<QbTorrent>, imported_tag: &str) {
+    torrents.sort_by(|left, right| {
+        torrent_has_tag(left, imported_tag)
+            .cmp(&torrent_has_tag(right, imported_tag))
+            .then_with(|| right.completion_on.cmp(&left.completion_on))
+            .then_with(|| left.hash.cmp(&right.hash))
+    });
+    let mut seen = HashSet::new();
+    torrents.retain(|torrent| seen.insert(normalize_hash(&torrent.hash)));
 }
 
 fn collect_completed_torrents<F>(mut fetch: F) -> Result<Vec<QbTorrent>, Error>
@@ -608,39 +658,16 @@ pub fn scryer_download_mark_imported(input: String) -> FnResult<String> {
 
     apply_post_import_isolation(&config, &hash, &request)?;
 
-    match config.post_import_action {
-        PostImportAction::Retain => {}
-        PostImportAction::TagImported => {
-            create_tag_if_missing(&config, &config.imported_tag)?;
-            post_form(
-                &config,
-                "/torrents/addTags",
-                &[
-                    ("hashes".to_string(), hash.clone()),
-                    ("tags".to_string(), config.imported_tag.clone()),
-                ],
-            )?;
-        }
-        PostImportAction::Remove => {
-            post_form(
-                &config,
-                "/torrents/delete",
-                &[
-                    ("hashes".to_string(), hash.clone()),
-                    ("deleteFiles".to_string(), "false".to_string()),
-                ],
-            )?;
-        }
-        PostImportAction::RemoveWithData => {
-            post_form(
-                &config,
-                "/torrents/delete",
-                &[
-                    ("hashes".to_string(), hash.clone()),
-                    ("deleteFiles".to_string(), "true".to_string()),
-                ],
-            )?;
-        }
+    if config.tag_after_import {
+        create_tag_if_missing(&config, &config.imported_tag)?;
+        post_form(
+            &config,
+            "/torrents/addTags",
+            &[
+                ("hashes".to_string(), hash.clone()),
+                ("tags".to_string(), config.imported_tag.clone()),
+            ],
+        )?;
     }
 
     Ok(serde_json::to_string(&PluginResult::Ok(()))?)
@@ -675,12 +702,6 @@ pub fn scryer_download_status(_input: String) -> FnResult<String> {
                 .to_string(),
         );
     }
-    if matches!(config.post_import_action, PostImportAction::RemoveWithData) {
-        warnings.push(
-            "post-import action removes torrent data from qBittorrent after import".to_string(),
-        );
-    }
-
     let sorting_mode = match (
         preferences.auto_tmm_enabled.unwrap_or(false),
         preferences.queueing_enabled.unwrap_or(false),
@@ -695,10 +716,7 @@ pub fn scryer_download_status(_input: String) -> FnResult<String> {
         version: Some(version),
         is_localhost: Some(is_localhost_url(&config.webui_url)),
         remote_output_roots: roots.into_iter().collect(),
-        removes_completed_downloads: Some(matches!(
-            config.post_import_action,
-            PostImportAction::Remove | PostImportAction::RemoveWithData
-        )),
+        removes_completed_downloads: Some(false),
         sorting_mode,
         warnings,
     };
@@ -783,19 +801,12 @@ impl QbittorrentConfig {
             .flatten()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| IMPORTED_TAG_DEFAULT.to_string());
-        let post_import_action = match config::get("post_import_action")
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "tag_imported".to_string())
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "retain" => PostImportAction::Retain,
-            "remove" => PostImportAction::Remove,
-            "remove_with_data" => PostImportAction::RemoveWithData,
-            _ => PostImportAction::TagImported,
-        };
+        let explicit_tag_after_import = config::get("tag_after_import").ok().flatten();
+        let legacy_post_import_action = config::get("post_import_action").ok().flatten();
+        let tag_after_import = resolve_tag_after_import(
+            explicit_tag_after_import.as_deref(),
+            legacy_post_import_action.as_deref(),
+        );
 
         Ok(Self {
             webui_url,
@@ -810,7 +821,7 @@ impl QbittorrentConfig {
             force_start,
             skip_checking,
             imported_tag,
-            post_import_action,
+            tag_after_import,
         })
     }
 }
@@ -978,37 +989,22 @@ fn config_fields() -> Vec<ConfigFieldDef> {
             help_text: Some("Skip piece recheck when adding local torrent payloads".to_string()),
         },
         ConfigFieldDef {
-            key: "post_import_action".to_string(),
-            label: "Post-Import Action".to_string(),
-            field_type: ConfigFieldType::Select,
+            key: "tag_after_import".to_string(),
+            label: "Tag after import".to_string(),
+            field_type: ConfigFieldType::Bool,
             required: false,
-            default_value: Some("tag_imported".to_string()),
+            default_value: Some("true".to_string()),
             value_source: Default::default(),
             host_binding: None,
             role: None,
-            options: vec![
-                ConfigFieldOption {
-                    value: "tag_imported".to_string(),
-                    label: "Tag Imported".to_string(),
-                },
-                ConfigFieldOption {
-                    value: "retain".to_string(),
-                    label: "Retain".to_string(),
-                },
-                ConfigFieldOption {
-                    value: "remove".to_string(),
-                    label: "Remove Torrent".to_string(),
-                },
-                ConfigFieldOption {
-                    value: "remove_with_data".to_string(),
-                    label: "Remove With Data".to_string(),
-                },
-            ],
-            help_text: Some("What Scryer should do in qBittorrent after a successful import".to_string()),
+            options: vec![],
+            help_text: Some(
+                "Apply the imported tag after Scryer verifies a successful import".to_string(),
+            ),
         },
         ConfigFieldDef {
             key: "imported_tag".to_string(),
-            label: "Imported Tag".to_string(),
+            label: "Imported tag".to_string(),
             field_type: ConfigFieldType::Tag,
             required: false,
             default_value: Some(IMPORTED_TAG_DEFAULT.to_string()),
@@ -1016,24 +1012,29 @@ fn config_fields() -> Vec<ConfigFieldDef> {
             host_binding: None,
             role: None,
             options: vec![],
-            help_text: Some(
-                "Tag applied after import when post-import action is set to Tag Imported"
-                    .to_string(),
-            ),
+            help_text: Some("Tag applied after a verified import".to_string()),
         },
     ]
+}
+
+fn config_bool_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn resolve_tag_after_import(explicit: Option<&str>, legacy_action: Option<&str>) -> bool {
+    explicit.map(config_bool_value).unwrap_or_else(|| {
+        !legacy_action.is_some_and(|action| action.trim().eq_ignore_ascii_case("retain"))
+    })
 }
 
 fn config_bool(key: &str, default: bool) -> bool {
     config::get(key)
         .ok()
         .flatten()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+        .map(|value| config_bool_value(&value))
         .unwrap_or(default)
 }
 
@@ -1227,12 +1228,28 @@ fn list_torrents(
     config: &QbittorrentConfig,
     filter: Option<&str>,
 ) -> Result<Vec<QbTorrent>, Error> {
-    let mut path = "/torrents/info?sort=added_on&reverse=true".to_string();
+    get_json(config, &torrents_info_path(filter, false))
+}
+
+fn list_completed_torrents_for_filter(
+    config: &QbittorrentConfig,
+    filter: Option<&str>,
+) -> Result<Vec<QbTorrent>, Error> {
+    get_json(config, &torrents_info_path(filter, true))
+}
+
+fn torrents_info_path(filter: Option<&str>, completed: bool) -> String {
+    let sort = if completed {
+        "completion_on"
+    } else {
+        "added_on"
+    };
+    let mut path = format!("/torrents/info?sort={sort}&reverse=true");
     if let Some(filter) = filter {
         path.push_str("&filter=");
         path.push_str(&url_encode(filter));
     }
-    get_json(config, &path)
+    path
 }
 
 fn torrent_exists(config: &QbittorrentConfig, hash: &str) -> Result<bool, Error> {
@@ -2554,6 +2571,118 @@ mod tests {
         );
     }
 
+    fn feedback_torrent(hash: &str, completion_on: i64) -> QbTorrent {
+        QbTorrent {
+            hash: hash.to_string(),
+            name: hash.to_string(),
+            state: "pausedUP".to_string(),
+            save_path: Some("/downloads".to_string()),
+            content_path: Some(format!("/downloads/{hash}.mkv")),
+            completion_on: Some(completion_on),
+            ..QbTorrent::default()
+        }
+    }
+
+    #[test]
+    fn completed_queries_sort_by_completion_time() {
+        assert_eq!(
+            torrents_info_path(Some("completed"), true),
+            "/torrents/info?sort=completion_on&reverse=true&filter=completed"
+        );
+        assert_eq!(
+            torrents_info_path(Some("all"), false),
+            "/torrents/info?sort=added_on&reverse=true&filter=all"
+        );
+    }
+
+    #[test]
+    fn completed_order_prioritizes_untagged_and_deduplicates_hashes() {
+        let mut tagged = feedback_torrent("aaaa", 100);
+        tagged.tags = Some(IMPORTED_TAG_DEFAULT.to_string());
+        let mut torrents = vec![
+            tagged,
+            feedback_torrent("bbbb", 90),
+            feedback_torrent("BBBB", 80),
+            QbTorrent {
+                hash: "cccc".to_string(),
+                name: "cccc".to_string(),
+                state: "pausedUP".to_string(),
+                save_path: Some("/downloads".to_string()),
+                content_path: Some("/downloads/cccc.mkv".to_string()),
+                ..QbTorrent::default()
+            },
+        ];
+
+        sort_and_dedupe_completed_torrents(&mut torrents, IMPORTED_TAG_DEFAULT);
+
+        assert_eq!(
+            torrents
+                .iter()
+                .map(|torrent| normalize_hash(&torrent.hash))
+                .collect::<Vec<_>>(),
+            vec!["bbbb", "cccc", "aaaa"]
+        );
+    }
+
+    #[test]
+    fn recent_limit_is_applied_after_completed_conversion() {
+        let mut torrents = vec![
+            feedback_torrent("bbbb", 9),
+            QbTorrent {
+                hash: "cccc".to_string(),
+                state: "pausedUP".to_string(),
+                completion_on: Some(10),
+                ..QbTorrent::default()
+            },
+        ];
+        sort_and_dedupe_completed_torrents(&mut torrents, IMPORTED_TAG_DEFAULT);
+
+        let (downloads, converted_count) = convert_completed_torrents(torrents, Some(1));
+
+        assert_eq!(converted_count, 1);
+        assert_eq!(downloads.len(), 1);
+        assert_eq!(downloads[0].client_item_id, "bbbb");
+    }
+
+    #[test]
+    fn imported_tag_priority_drains_a_500_torrent_backlog_in_batches() {
+        let mut torrents = (0..500)
+            .map(|index| feedback_torrent(&format!("{index:040x}"), 10_000 - index))
+            .collect::<Vec<_>>();
+
+        sort_and_dedupe_completed_torrents(&mut torrents, IMPORTED_TAG_DEFAULT);
+        let first_batch = torrents
+            .iter()
+            .take(300)
+            .map(|torrent| torrent.hash.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(first_batch.len(), 300);
+
+        for torrent in &mut torrents {
+            if first_batch.contains(&torrent.hash) {
+                torrent.tags = Some(IMPORTED_TAG_DEFAULT.to_string());
+            }
+        }
+        sort_and_dedupe_completed_torrents(&mut torrents, IMPORTED_TAG_DEFAULT);
+
+        let next_unimported = torrents
+            .iter()
+            .take_while(|torrent| !torrent_has_tag(torrent, IMPORTED_TAG_DEFAULT))
+            .collect::<Vec<_>>();
+        assert_eq!(next_unimported.len(), 200);
+        assert!(
+            next_unimported
+                .iter()
+                .all(|torrent| !first_batch.contains(&torrent.hash))
+        );
+        assert!(
+            torrents
+                .iter()
+                .skip(200)
+                .all(|torrent| torrent_has_tag(torrent, IMPORTED_TAG_DEFAULT))
+        );
+    }
+
     #[test]
     fn completed_torrents_fall_back_to_all_filter_when_completed_filter_is_empty() {
         let mut requested_filters = Vec::new();
@@ -2755,6 +2884,33 @@ mod tests {
         assert!(!api_key.required);
         assert!(!username.required);
         assert!(!password.required);
+    }
+
+    #[test]
+    fn post_import_configuration_is_non_destructive_and_migrates_legacy_values() {
+        let fields = config_fields();
+        assert!(fields.iter().all(|field| field.key != "post_import_action"));
+        let tag_after_import = fields
+            .iter()
+            .find(|field| field.key == "tag_after_import")
+            .expect("tag-after-import field");
+        assert_eq!(tag_after_import.field_type, ConfigFieldType::Bool);
+        assert_eq!(tag_after_import.default_value.as_deref(), Some("true"));
+        assert!(
+            fields
+                .iter()
+                .any(|field| field.key == "imported_tag" && field.label == "Imported tag")
+        );
+
+        assert!(!resolve_tag_after_import(None, Some("retain")));
+        for legacy in ["tag_imported", "remove", "remove_with_data"] {
+            assert!(resolve_tag_after_import(None, Some(legacy)));
+        }
+        assert!(!resolve_tag_after_import(
+            Some("false"),
+            Some("remove_with_data")
+        ));
+        assert!(resolve_tag_after_import(Some("true"), Some("retain")));
     }
 
     #[test]
@@ -3018,7 +3174,7 @@ mod tests {
             force_start: false,
             skip_checking: false,
             imported_tag: IMPORTED_TAG_DEFAULT.to_string(),
-            post_import_action: PostImportAction::TagImported,
+            tag_after_import: true,
         }
     }
 
@@ -3386,7 +3542,7 @@ scryer_plugin_pdk::scryer_download_client_bridge_main!(
     list_queue = scryer_download_list_queue,
     list_history = scryer_download_list_history,
     list_completed = scryer_download_list_completed,
-    list_recent_completed = None,
+    list_recent_completed = Some(scryer_download_list_recent_completed),
     control = scryer_download_control,
     mark_imported = scryer_download_mark_imported,
     status = scryer_download_status,
