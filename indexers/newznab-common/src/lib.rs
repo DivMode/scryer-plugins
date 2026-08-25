@@ -369,7 +369,7 @@ pub fn extract_base_metadata(
 // ---------------------------------------------------------------------------
 
 /// Rate limit metadata returned by Newznab indexers in `<limits>` elements.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct ApiLimits {
     api_current: Option<u32>,
     api_max: Option<u32>,
@@ -528,20 +528,7 @@ pub fn execute_full_search(
         };
         let (status, body) = match search_result {
             Ok(response) => response,
-            Err(error) if is_hit_budget_exhausted_error(&error) => {
-                if page == 0 {
-                    let budget = hit_budget_snapshot(&config.http_behavior)?.unwrap_or_default();
-                    let (api_current, api_max) = budget.limiting_current_max();
-                    return Ok(SearchResponse {
-                        results: vec![],
-                        api_current,
-                        api_max,
-                        grab_current: None,
-                        grab_max: None,
-                    });
-                }
-                break;
-            }
+            Err(error) if is_hit_budget_exhausted_error(&error) => return Err(error),
             Err(error) => return Err(error),
         };
 
@@ -553,39 +540,49 @@ pub fn execute_full_search(
 
         if is_xml {
             if let Some((code, description)) = parse_error_xml(&body) {
-                if page == 0 {
-                    return Err(classify_and_format_error(&code, &description));
-                }
-                break; // Later pages erroring is not fatal
+            if page == 0 {
+                return Err(classify_and_format_error(&code, &description));
+            }
+            return Err(Error::msg(format!(
+                "Newznab page {page} returned an error: {code}: {description}"
+            )));
             }
         } else if let Some((code, description)) = parse_error_json(&body) {
             if page == 0 {
                 return Err(classify_and_format_error(&code, &description));
             }
-            break;
+            return Err(Error::msg(format!(
+                "Newznab page {page} returned an error: {code}: {description}"
+            )));
         }
 
         if status >= 400 {
             if page == 0 {
                 return Err(Error::msg(format!("Newznab API returned HTTP {status}")));
             }
-            break;
+            return Err(Error::msg(format!(
+                "Newznab page {page} returned HTTP {status}"
+            )));
         }
 
-        let (page_results, limits) = if is_xml {
+        let (page_results, limits, page_count) = if is_xml {
             parse_newznab_xml(&body, page_size, extract_fn)
         } else {
             parse_newznab_json(&body, page_size, extract_fn)
-        };
+        }?;
 
         last_limits = limits;
-        let page_count = page_results.len();
         all_results.extend(page_results);
 
         // Stop if this page was less than full (no more results)
         // or we've hit the overall max
-        if page_count < page_size || all_results.len() >= max_results {
+        if page_count < page_size {
             break;
+        }
+        if page + 1 == max_pages {
+            return Err(Error::msg(format!(
+                "Newznab search reached the configured {max_pages}-page ceiling while results remain"
+            )));
         }
     }
 
@@ -666,34 +663,44 @@ pub fn execute_raw_search(
                 if page == 0 {
                     return Err(classify_and_format_error(&code, &description));
                 }
-                break;
+                return Err(Error::msg(format!(
+                    "Newznab page {page} returned an error: {code}: {description}"
+                )));
             }
         } else if let Some((code, description)) = parse_error_json(&body) {
             if page == 0 {
                 return Err(classify_and_format_error(&code, &description));
             }
-            break;
+            return Err(Error::msg(format!(
+                "Newznab page {page} returned an error: {code}: {description}"
+            )));
         }
 
         if status >= 400 {
             if page == 0 {
                 return Err(Error::msg(format!("Newznab API returned HTTP {status}")));
             }
-            break;
+            return Err(Error::msg(format!(
+                "Newznab page {page} returned HTTP {status}"
+            )));
         }
 
-        let (page_results, limits) = if is_xml {
+        let (page_results, limits, page_count) = if is_xml {
             parse_newznab_xml(&body, page_size, extract_fn)
         } else {
             parse_newznab_json(&body, page_size, extract_fn)
-        };
+        }?;
 
         last_limits = limits;
-        let page_count = page_results.len();
         all_results.extend(page_results);
 
-        if page_count < page_size || all_results.len() >= max_results {
+        if page_count < page_size {
             break;
+        }
+        if page + 1 == max_pages {
+            return Err(Error::msg(format!(
+                "Newznab search reached the configured {max_pages}-page ceiling while results remain"
+            )));
         }
     }
 
@@ -779,20 +786,7 @@ fn execute_rss_search(
         );
         let (status, body) = match search_result {
             Ok(response) => response,
-            Err(error) if is_hit_budget_exhausted_error(&error) => {
-                if all_results.is_empty() {
-                    let budget = hit_budget_snapshot(&config.http_behavior)?.unwrap_or_default();
-                    let (api_current, api_max) = budget.limiting_current_max();
-                    return Ok(SearchResponse {
-                        results: vec![],
-                        api_current,
-                        api_max,
-                        grab_current: None,
-                        grab_max: None,
-                    });
-                }
-                break;
-            }
+            Err(error) if is_hit_budget_exhausted_error(&error) => return Err(error),
             Err(error) => return Err(error),
         };
 
@@ -803,41 +797,21 @@ fn execute_rss_search(
 
         if is_xml {
             if let Some((code, description)) = parse_error_xml(&body) {
-                log!(
-                    LogLevel::Warn,
-                    "RSS fetch error for t={}: {} — {}",
-                    search_type,
-                    code,
-                    description
-                );
-                continue;
+                return Err(classify_and_format_error(&code, &description));
             }
         } else if let Some((code, description)) = parse_error_json(&body) {
-            log!(
-                LogLevel::Warn,
-                "RSS fetch error for t={}: {} — {}",
-                search_type,
-                code,
-                description
-            );
-            continue;
+            return Err(classify_and_format_error(&code, &description));
         }
 
         if status >= 400 {
-            log!(
-                LogLevel::Warn,
-                "RSS fetch HTTP {} for t={}",
-                status,
-                search_type
-            );
-            continue;
+            return Err(Error::msg(format!("Newznab API returned HTTP {status}")));
         }
 
-        let (page_results, limits) = if is_xml {
+        let (page_results, limits, _page_count) = if is_xml {
             parse_newznab_xml(&body, config.page_size, extract_fn)
         } else {
             parse_newznab_json(&body, config.page_size, extract_fn)
-        };
+        }?;
 
         log!(
             LogLevel::Info,
@@ -2197,11 +2171,9 @@ fn parse_newznab_json(
     body: &str,
     limit: usize,
     extract_fn: MetadataExtractor,
-) -> (Vec<SearchResult>, ApiLimits) {
-    let parsed: NewznabJsonResponse = match serde_json::from_str(body) {
-        Ok(v) => v,
-        Err(_) => return (vec![], ApiLimits::default()),
-    };
+) -> Result<(Vec<SearchResult>, ApiLimits, usize), Error> {
+    let parsed: NewznabJsonResponse = serde_json::from_str(body)
+        .map_err(|error| Error::msg(format!("invalid Newznab JSON feed: {error}")))?;
 
     // Extract API limits from channel.limits if present
     let limits = parsed
@@ -2217,10 +2189,14 @@ fn parse_newznab_json(
         })
         .unwrap_or_default();
 
-    let items = match parsed.channel.and_then(|c| c.item) {
+    let channel = parsed
+        .channel
+        .ok_or_else(|| Error::msg("invalid Newznab JSON feed: missing channel root"))?;
+    let items = match channel.item {
         Some(items) => items.into_vec(),
-        None => return (vec![], limits),
+        None => return Ok((vec![], limits, 0)),
     };
+    let item_count = items.len();
 
     let results: Vec<SearchResult> = items
         .into_iter()
@@ -2310,7 +2286,7 @@ fn parse_newznab_json(
         })
         .collect();
 
-    (results, limits)
+    Ok((results, limits, item_count))
 }
 
 // ---------------------------------------------------------------------------
@@ -2506,12 +2482,13 @@ fn parse_newznab_xml(
     body: &str,
     limit: usize,
     extract_fn: MetadataExtractor,
-) -> (Vec<SearchResult>, ApiLimits) {
+) -> Result<(Vec<SearchResult>, ApiLimits, usize), Error> {
     let mut reader = Reader::from_str(body);
     reader.config_mut().trim_text(true);
 
     let mut buf = Vec::new();
     let mut results = Vec::new();
+    let mut item_count = 0;
     let mut api_limits = ApiLimits::default();
     let mut in_item = false;
 
@@ -2526,12 +2503,25 @@ fn parse_newznab_xml(
     let mut enclosure_type: Option<String> = None;
     let mut attrs: Vec<(String, String)> = Vec::new();
     let mut current_tag: Option<String> = None;
+    let mut saw_rss_root = false;
+    let mut saw_channel = false;
+    let mut saw_rss_end = false;
+    let mut saw_channel_end = false;
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if tag_name == "item" {
+                if !saw_rss_root {
+                    if tag_name != "rss" {
+                        return Err(Error::msg(format!(
+                            "invalid Newznab XML feed root: expected rss, found {tag_name}"
+                        )));
+                    }
+                    saw_rss_root = true;
+                } else if tag_name == "channel" {
+                    saw_channel = true;
+                } else if tag_name == "item" {
                     in_item = true;
                     title = None;
                     guid = None;
@@ -2632,8 +2622,13 @@ fn parse_newznab_xml(
             }
             Ok(Event::End(ref e)) => {
                 let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if tag_name == "item" && in_item {
+                if tag_name == "rss" {
+                    saw_rss_end = true;
+                } else if tag_name == "channel" {
+                    saw_channel_end = true;
+                } else if tag_name == "item" && in_item {
                     in_item = false;
+                    item_count += 1;
                     if let Some(ref t) = title {
                         if !t.is_empty() {
                             // Fallback: use size from newznab:attr if enclosure length was 0 or missing
@@ -2701,10 +2696,8 @@ fn parse_newznab_xml(
                                 }
                             }
 
-                            results.push(result);
-
-                            if results.len() >= limit {
-                                break;
+                            if results.len() < limit {
+                                results.push(result);
                             }
                         }
                     }
@@ -2712,13 +2705,21 @@ fn parse_newznab_xml(
                 current_tag = None;
             }
             Ok(Event::Eof) => break,
-            Err(_) => break,
+            Err(error) => {
+                return Err(Error::msg(format!("invalid Newznab XML feed: {error}")));
+            }
             _ => {}
         }
         buf.clear();
     }
 
-    (results, api_limits)
+    if !saw_rss_root || !saw_channel || !saw_rss_end || !saw_channel_end {
+        return Err(Error::msg(
+            "invalid Newznab XML feed: missing rss/channel root",
+        ));
+    }
+
+    Ok((results, api_limits, item_count))
 }
 
 /// `<newznab:attr>` / `<torznab:attr>` carries its payload in attributes and
@@ -4222,8 +4223,21 @@ mod tests {
     #[test]
     fn json_empty_channel() {
         let body = r#"{"channel":{}}"#;
-        let (results, _) = parse_newznab_json(body, 100, extract_base_metadata);
+        let (results, _, _) = parse_newznab_json(body, 100, extract_base_metadata).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn json_requires_a_channel_root() {
+        let error = parse_newznab_json("{}", 100, extract_base_metadata).unwrap_err();
+        assert!(error.to_string().contains("missing channel root"));
+    }
+
+    #[test]
+    fn malformed_json_is_not_an_empty_feed() {
+        let error = parse_newznab_json("<html>indexer login</html>", 100, extract_base_metadata)
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid Newznab JSON feed"));
     }
 
     #[test]
@@ -4250,7 +4264,7 @@ mod tests {
                 }
             }
         }"#;
-        let (results, _) = parse_newznab_json(body, 100, extract_base_metadata);
+        let (results, _, _) = parse_newznab_json(body, 100, extract_base_metadata).unwrap();
         assert_eq!(results.len(), 1);
         let r = &results[0];
         assert_eq!(r.title, "Test.Release.720p");
@@ -4279,14 +4293,14 @@ mod tests {
                 ]
             }
         }"#;
-        let (results, _) = parse_newznab_json(body, 2, extract_base_metadata);
+        let (results, _, _) = parse_newznab_json(body, 2, extract_base_metadata).unwrap();
         assert_eq!(results.len(), 2);
     }
 
     #[test]
     fn json_item_without_title_skipped() {
         let body = r#"{"channel":{"item":{"guid":"abc"}}}"#;
-        let (results, _) = parse_newznab_json(body, 100, extract_base_metadata);
+        let (results, _, _) = parse_newznab_json(body, 100, extract_base_metadata).unwrap();
         assert!(results.is_empty());
     }
 
@@ -4303,7 +4317,7 @@ mod tests {
                 }
             }
         }"#;
-        let (_, limits) = parse_newznab_json(body, 100, extract_base_metadata);
+        let (_, limits, _) = parse_newznab_json(body, 100, extract_base_metadata).unwrap();
         assert_eq!(limits.api_current, Some(5));
         assert_eq!(limits.api_max, Some(100));
         assert_eq!(limits.grab_current, Some(10));
@@ -4315,8 +4329,19 @@ mod tests {
     #[test]
     fn xml_empty_rss() {
         let body = r#"<?xml version="1.0"?><rss><channel></channel></rss>"#;
-        let (results, _) = parse_newznab_xml(body, 100, extract_base_metadata);
+        let (results, _, _) = parse_newznab_xml(body, 100, extract_base_metadata).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn xml_requires_rss_channel_root_and_well_formed_body() {
+        let html = parse_newznab_xml("<html><body>login</body></html>", 100, extract_base_metadata)
+            .unwrap_err();
+        assert!(html.to_string().contains("expected rss"));
+
+        let malformed = parse_newznab_xml("<rss><channel>", 100, extract_base_metadata)
+            .unwrap_err();
+        assert!(malformed.to_string().contains("invalid Newznab XML feed"));
     }
 
     #[test]
@@ -4336,7 +4361,7 @@ mod tests {
   </item>
 </channel>
 </rss>"#;
-        let (results, _) = parse_newznab_xml(body, 100, extract_base_metadata);
+        let (results, _, _) = parse_newznab_xml(body, 100, extract_base_metadata).unwrap();
         assert_eq!(results.len(), 1);
         let r = &results[0];
         assert_eq!(r.title, "Test.Release.1080p");
@@ -4365,7 +4390,7 @@ mod tests {
   </item>
 </channel>
 </rss>"#;
-        let (results, _) = parse_newznab_xml(body, 100, extract_base_metadata);
+        let (results, _, _) = parse_newznab_xml(body, 100, extract_base_metadata).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(
             results[0].password_hint.as_deref(),
@@ -4401,7 +4426,7 @@ mod tests {
 </channel>
 </rss>"#
             );
-            let (results, _) = parse_newznab_xml(&body, 100, extract_base_metadata);
+            let (results, _, _) = parse_newznab_xml(&body, 100, extract_base_metadata).unwrap();
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].password_hint, None);
             assert!(!results[0].provider_extra.contains_key("password"));
@@ -4427,7 +4452,7 @@ mod tests {
   </item>
 </channel>
 </rss>"#;
-        let (results, _) = parse_newznab_xml(body, 100, extract_base_metadata);
+        let (results, _, _) = parse_newznab_xml(body, 100, extract_base_metadata).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].password_hint, None);
         assert!(!results[0].provider_extra.contains_key("password"));
@@ -4456,7 +4481,7 @@ mod tests {
   </item>
 </channel>
 </rss>"#;
-        let (results, _) = parse_newznab_xml(body, 100, extract_torrent_test_metadata);
+        let (results, _, _) = parse_newznab_xml(body, 100, extract_torrent_test_metadata).unwrap();
         assert_eq!(results.len(), 1);
         let r = &results[0];
         assert_eq!(r.seeders, Some(7));
@@ -4487,7 +4512,7 @@ mod tests {
   </item>
 </channel>
 </rss>"#;
-        let (results, _) = parse_newznab_xml(body, 100, extract_torrent_test_metadata);
+        let (results, _, _) = parse_newznab_xml(body, 100, extract_torrent_test_metadata).unwrap();
         assert_eq!(results.len(), 1);
         let r = &results[0];
 
@@ -4519,7 +4544,7 @@ mod tests {
   </item>
 </channel>
 </rss>"#;
-        let (results, _) = parse_newznab_xml(body, 100, extract_base_metadata);
+        let (results, _, _) = parse_newznab_xml(body, 100, extract_base_metadata).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(
             results[0].download_url.as_deref(),
@@ -4542,7 +4567,7 @@ mod tests {
   </item>
 </channel>
 </rss>"#;
-        let (results, _) = parse_newznab_xml(body, 100, extract_base_metadata);
+        let (results, _, _) = parse_newznab_xml(body, 100, extract_base_metadata).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(
             results[0].download_url.as_deref(),
@@ -4560,7 +4585,7 @@ mod tests {
   <item><title>B</title></item>
   <item><title>C</title></item>
 </channel></rss>"#;
-        let (results, _) = parse_newznab_xml(body, 1, extract_base_metadata);
+        let (results, _, _) = parse_newznab_xml(body, 1, extract_base_metadata).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "A");
     }
@@ -4577,7 +4602,7 @@ mod tests {
   </item>
 </channel>
 </rss>"#;
-        let (results, _) = parse_newznab_xml(body, 100, extract_base_metadata);
+        let (results, _, _) = parse_newznab_xml(body, 100, extract_base_metadata).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].size_bytes, Some(12345));
     }
@@ -4590,7 +4615,7 @@ mod tests {
   <newznab:limits api_current="5" api_max="100" grab_current="10" grab_max="500"/>
 </channel>
 </rss>"#;
-        let (results, limits) = parse_newznab_xml(body, 100, extract_base_metadata);
+        let (results, limits, _) = parse_newznab_xml(body, 100, extract_base_metadata).unwrap();
         assert!(results.is_empty());
         assert_eq!(limits.api_current, Some(5));
         assert_eq!(limits.api_max, Some(100));
