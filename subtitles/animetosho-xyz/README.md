@@ -4,7 +4,7 @@ An anime episode subtitle catalog that searches AnimeTosho's JSON release API an
 
 ## Configure in Scryer
 
-**api_key** is required. **base_url** defaults to https://feed.animetosho.xyz and **site_url** defaults to https://animetosho.org; both are required because the API supplies release data while the site supplies subtitle links. **search_threshold** controls how many releases are inspected per request, with a default of 6 and a hard range of 1–15.
+**api_key** is required. **base_url** defaults to https://feed.animetosho.xyz and **site_url** defaults to https://animetosho.xyz; both are required because the API supplies release data while the site supplies subtitle links. **search_threshold** controls how many releases are inspected per request, with a default of 6 and a hard range of 1–15.
 
 The validation action performs a small API query, so it validates both the configured endpoint and key.
 
