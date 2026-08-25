@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use indexer_command_compat::{LogLevel, log};
@@ -186,6 +186,7 @@ fn build_descriptor() -> PluginDescriptor {
                     IndexerSearchInput::IdQuery,
                     IndexerSearchInput::Season,
                     IndexerSearchInput::Episode,
+                    IndexerSearchInput::AbsoluteEpisode,
                     IndexerSearchInput::Limit,
                 ],
                 supported_external_ids: vec!["tvdb_id".into(), "anidb_id".into()],
@@ -253,26 +254,89 @@ fn execute_api_search(
     config: &AniNzbConfig,
     request: &SearchRequest,
 ) -> Result<SearchResponse, Error> {
-    let url = build_api_search_url(config, request)?;
+    let urls = build_api_search_urls(config, request)?;
+    let mut result_sets = Vec::with_capacity(urls.len());
+    let mut first_error = None;
+    for url in urls {
+        match execute_api_search_url(config, &url) {
+            Ok(results) => result_sets.push(results),
+            Err(error) => {
+                log!(
+                    LogLevel::Warn,
+                    "AniNZB search variant failed; retaining results from other variants: {}",
+                    error
+                );
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    if result_sets.is_empty()
+        && let Some(error) = first_error
+    {
+        return Err(error);
+    }
+    let results = merge_api_result_sets(result_sets, result_limit(request.limit));
+    Ok(SearchResponse {
+        results,
+        ..SearchResponse::default()
+    })
+}
+
+fn execute_api_search_url(
+    config: &AniNzbConfig,
+    url: &str,
+) -> Result<Vec<SearchResult>, Error> {
     wait_for_api_request_slot()?;
     let (status, body) =
-        polite_http_get(&url, "application/json, */*;q=0.8", &config.http_behavior)?;
+        polite_http_get(url, "application/json, */*;q=0.8", &config.http_behavior)?;
     if !(200..300).contains(&status) {
         return Err(Error::msg(format!("AniNZB API returned HTTP {status}")));
     }
 
     let response = parse_api_response(&body)?;
-    let results = response
+    Ok(response
         .items
         .unwrap_or_default()
         .iter()
         .filter_map(api_item_to_search_result)
-        .take(result_limit(request.limit))
-        .collect();
-    Ok(SearchResponse {
-        results,
-        ..SearchResponse::default()
-    })
+        .collect())
+}
+
+fn merge_api_result_sets(result_sets: Vec<Vec<SearchResult>>, limit: usize) -> Vec<SearchResult> {
+    let mut iterators = result_sets
+        .into_iter()
+        .map(Vec::into_iter)
+        .collect::<Vec<_>>();
+    let mut results = Vec::with_capacity(limit);
+    let mut seen = HashSet::new();
+
+    while results.len() < limit {
+        let mut advanced = false;
+        for iterator in &mut iterators {
+            let Some(result) = iterator.next() else {
+                continue;
+            };
+            advanced = true;
+            let dedupe_key = result
+                .guid
+                .clone()
+                .or_else(|| result.download_url.clone())
+                .unwrap_or_else(|| result.title.clone());
+            if seen.insert(dedupe_key) {
+                results.push(result);
+                if results.len() == limit {
+                    break;
+                }
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+
+    results
 }
 
 fn parse_api_response(body: &str) -> Result<AniNzbApiResponse, Error> {
@@ -340,47 +404,198 @@ fn current_epoch_millis() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn build_api_search_url(config: &AniNzbConfig, request: &SearchRequest) -> Result<String, Error> {
+#[derive(Clone, Debug, Default)]
+struct AniNzbApiQuery {
+    anidb_id: Option<String>,
+    tvdb_id: Option<String>,
+    name: Option<String>,
+    season: Option<u32>,
+    episode: Option<u32>,
+    filename: Option<String>,
+    largest_first: bool,
+}
+
+fn build_api_search_urls(
+    config: &AniNzbConfig,
+    request: &SearchRequest,
+) -> Result<Vec<String>, Error> {
+    let anidb_id = request_id(request, "anidb_id");
+    let tvdb_id = request_id(request, "tvdb_id");
+    let name = search_name(request);
+    let mut searches = Vec::new();
+
+    // AniNZB caps every query at 50 rows, and season packs may have a null
+    // `season`. Search the filename token largest-first so those packs are not
+    // buried behind episode releases.
+    if let Some(season) = request
+        .season
+        .filter(|_| request.episode.is_none() && request.absolute_episode.is_none())
+    {
+        let filename = format!("S{season:02}");
+        let mut pack_search = AniNzbApiQuery {
+            filename: Some(filename),
+            largest_first: true,
+            ..AniNzbApiQuery::default()
+        };
+        if let Some(name) = name.clone() {
+            pack_search.name = Some(name);
+        } else if let Some(anidb_id) = anidb_id.clone() {
+            pack_search.anidb_id = Some(anidb_id);
+        } else if let Some(tvdb_id) = tvdb_id.clone() {
+            pack_search.tvdb_id = Some(tvdb_id);
+        }
+        searches.push(pack_search);
+
+        // AniDB identifies the anime season already, so adding the TV season
+        // number can over-constrain or misdirect that lookup. TVDB identifies
+        // the series and therefore keeps the explicit season filter. Their
+        // result sets are complementary, so query and merge both.
+        if let Some(anidb_id) = anidb_id {
+            searches.push(AniNzbApiQuery {
+                anidb_id: Some(anidb_id),
+                ..AniNzbApiQuery::default()
+            });
+        }
+        if let Some(tvdb_id) = tvdb_id {
+            searches.push(AniNzbApiQuery {
+                tvdb_id: Some(tvdb_id),
+                season: Some(season),
+                ..AniNzbApiQuery::default()
+            });
+        }
+        if searches.len() == 1
+            && let Some(name) = name
+        {
+            searches.push(AniNzbApiQuery {
+                name: Some(name),
+                season: Some(season),
+                ..AniNzbApiQuery::default()
+            });
+        }
+    } else if request.episode.is_some() || request.absolute_episode.is_some() {
+        let is_anime = request_is_anime_shaped(request);
+        if let Some(anidb_id) = anidb_id {
+            searches.push(AniNzbApiQuery {
+                anidb_id: Some(anidb_id),
+                episode: if is_anime {
+                    request.absolute_episode.or(request.episode)
+                } else {
+                    request.episode.or(request.absolute_episode)
+                },
+                ..AniNzbApiQuery::default()
+            });
+        }
+        if let (Some(tvdb_id), Some(episode)) = (tvdb_id, request.episode) {
+            searches.push(AniNzbApiQuery {
+                tvdb_id: Some(tvdb_id),
+                season: request.season,
+                episode: Some(episode),
+                ..AniNzbApiQuery::default()
+            });
+        }
+        if searches.is_empty()
+            && let Some(name) = name
+        {
+            searches.push(AniNzbApiQuery {
+                name: Some(name),
+                season: request.season,
+                episode: request.absolute_episode.or(request.episode),
+                ..AniNzbApiQuery::default()
+            });
+        }
+    } else {
+        // Unscoped title searches serve series and multi-season pack planning.
+        // Merge the largest releases with the default newest-first results so
+        // the API's 50-row cap does not hide packs behind recent episodes.
+        if let Some(anidb_id) = anidb_id {
+            searches.push(AniNzbApiQuery {
+                anidb_id: Some(anidb_id.clone()),
+                largest_first: true,
+                ..AniNzbApiQuery::default()
+            });
+            searches.push(AniNzbApiQuery {
+                anidb_id: Some(anidb_id),
+                ..AniNzbApiQuery::default()
+            });
+        }
+        if let Some(tvdb_id) = tvdb_id {
+            searches.push(AniNzbApiQuery {
+                tvdb_id: Some(tvdb_id.clone()),
+                largest_first: true,
+                ..AniNzbApiQuery::default()
+            });
+            searches.push(AniNzbApiQuery {
+                tvdb_id: Some(tvdb_id),
+                ..AniNzbApiQuery::default()
+            });
+        }
+        if searches.is_empty()
+            && let Some(name) = name
+        {
+            searches.push(AniNzbApiQuery {
+                name: Some(name),
+                ..AniNzbApiQuery::default()
+            });
+        }
+    }
+
+    if searches.is_empty() {
+        searches.push(AniNzbApiQuery::default());
+    }
+
+    let mut seen = HashSet::new();
+    searches
+        .iter()
+        .map(|search| build_api_search_url(config, search))
+        .filter(|url| match url {
+            Ok(url) => seen.insert(url.clone()),
+            Err(_) => true,
+        })
+        .collect()
+}
+
+fn build_api_search_url(config: &AniNzbConfig, search: &AniNzbApiQuery) -> Result<String, Error> {
     let mut url = Url::parse(config.api_base_url)
         .map_err(|error| Error::msg(format!("invalid fixed AniNZB API URL: {error}")))?;
     url.set_path("/");
     url.set_query(None);
     url.set_fragment(None);
 
-    let anidb_id = request_id(request, "anidb_id");
-    let tvdb_id = request_id(request, "tvdb_id");
-    let name = search_name(request);
-    let episode = request.episode.or(request.absolute_episode);
     {
         let mut query = url.query_pairs_mut();
-        if !has_api_search_filter(request) {
+        if search.anidb_id.is_none()
+            && search.tvdb_id.is_none()
+            && search.name.is_none()
+            && search.season.is_none()
+            && search.episode.is_none()
+            && search.filename.is_none()
+        {
             query.append_pair("source", "release");
         }
-        if let Some(anidb_id) = anidb_id.as_deref() {
+        if let Some(anidb_id) = search.anidb_id.as_deref() {
             query.append_pair("anidb", anidb_id);
         }
-        if let Some(tvdb_id) = tvdb_id.as_deref() {
+        if let Some(tvdb_id) = search.tvdb_id.as_deref() {
             query.append_pair("tvdb", tvdb_id);
         }
-        if let Some(name) = name.as_deref() {
+        if let Some(name) = search.name.as_deref() {
             query.append_pair("name", name);
         }
-        if let Some(season) = request.season {
+        if let Some(season) = search.season {
             query.append_pair("season", &season.to_string());
         }
-        if let Some(episode) = episode {
+        if let Some(episode) = search.episode {
             query.append_pair("episode", &episode.to_string());
+        }
+        if let Some(filename) = search.filename.as_deref() {
+            query.append_pair("filename", filename);
+        }
+        if search.largest_first {
+            query.append_pair("sort", "size");
+            query.append_pair("order", "desc");
         }
     }
     Ok(url.to_string())
-}
-
-fn has_api_search_filter(request: &SearchRequest) -> bool {
-    request_id(request, "anidb_id").is_some()
-        || request_id(request, "tvdb_id").is_some()
-        || search_name(request).is_some()
-        || request.season.is_some()
-        || request.episode.or(request.absolute_episode).is_some()
 }
 
 fn result_limit(request_limit: usize) -> usize {
@@ -402,6 +617,15 @@ fn request_is_movie_shaped(request: &SearchRequest) -> bool {
             .is_some_and(|facet| facet.trim().eq_ignore_ascii_case("movie"))
 }
 
+fn request_is_anime_shaped(request: &SearchRequest) -> bool {
+    request.context.as_ref().is_some_and(|context| {
+        context.subject_kind == PluginSearchSubjectKind::AnimeEpisode
+    }) || request
+        .facet
+        .as_deref()
+        .is_some_and(|facet| facet.trim().eq_ignore_ascii_case("anime"))
+}
+
 fn request_id(request: &SearchRequest, key: &str) -> Option<String> {
     request
         .ids
@@ -413,6 +637,34 @@ fn request_id(request: &SearchRequest, key: &str) -> Option<String> {
 fn search_name(request: &SearchRequest) -> Option<String> {
     let query = request.query.trim();
     if !query.is_empty() {
+        if request.season.is_some()
+            || request.episode.is_some()
+            || request.absolute_episode.is_some()
+        {
+            if let Some(alias) = request
+                .tagged_aliases
+                .iter()
+                .map(|alias| alias.name.trim())
+                .filter(|alias| !alias.is_empty())
+                .filter(|alias| {
+                    query
+                        .get(..alias.len())
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(alias))
+                        && query
+                            .get(alias.len()..)
+                            .is_some_and(|suffix| {
+                                suffix.is_empty()
+                                    || suffix.starts_with([' ', '.', '-', '_'])
+                            })
+                })
+                .max_by_key(|alias| alias.len())
+            {
+                return Some(alias.to_string());
+            }
+            if let Some(base_name) = strip_search_scope_suffix(query, request) {
+                return Some(base_name.to_string());
+            }
+        }
         return Some(query.to_string());
     }
     request
@@ -421,6 +673,32 @@ fn search_name(request: &SearchRequest) -> Option<String> {
         .map(|alias| alias.name.trim())
         .find(|alias| !alias.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn strip_search_scope_suffix<'a>(query: &'a str, request: &SearchRequest) -> Option<&'a str> {
+    let mut suffixes = Vec::new();
+    if let (Some(season), Some(episode)) = (request.season, request.episode) {
+        suffixes.push(format!(" S{season:02}E{episode:02}"));
+        suffixes.push(format!(" S{season}E{episode}"));
+    }
+    if let Some(season) = request.season {
+        suffixes.push(format!(" S{season:02}"));
+        suffixes.push(format!(" S{season}"));
+    }
+    if let Some(absolute_episode) = request.absolute_episode {
+        suffixes.push(format!(" {absolute_episode:03}"));
+        suffixes.push(format!(" {absolute_episode}"));
+    }
+
+    suffixes.into_iter().find_map(|suffix| {
+        let split_at = query.len().checked_sub(suffix.len())?;
+        query
+            .get(split_at..)
+            .filter(|candidate| candidate.eq_ignore_ascii_case(&suffix))
+            .and_then(|_| query.get(..split_at))
+            .map(str::trim_end)
+            .filter(|base_name| !base_name.is_empty())
+    })
 }
 
 fn api_item_to_search_result(item: &AniNzbApiItem) -> Option<SearchResult> {
@@ -582,6 +860,21 @@ mod tests {
         }
     }
 
+    fn api_queries(request: &SearchRequest) -> Vec<HashMap<String, String>> {
+        let config = migrate_legacy_config(LegacyAniNzbConfig::default());
+        build_api_search_urls(&config, request)
+            .unwrap()
+            .into_iter()
+            .map(|url| {
+                Url::parse(&url)
+                    .unwrap()
+                    .query_pairs()
+                    .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                    .collect()
+            })
+            .collect()
+    }
+
     #[test]
     fn descriptor_keeps_only_the_legacy_base_url_configuration() {
         let descriptor = build_descriptor();
@@ -604,6 +897,12 @@ mod tests {
         assert_eq!(
             indexer.capabilities.episode_param.as_deref(),
             Some("episode")
+        );
+        assert!(
+            indexer
+                .capabilities
+                .search_inputs
+                .contains(&IndexerSearchInput::AbsoluteEpisode)
         );
         assert!(indexer.capabilities.rss);
         assert_eq!(
@@ -667,46 +966,148 @@ mod tests {
     }
 
     #[test]
-    fn api_url_maps_supported_request_filters() {
+    fn anime_absolute_episode_search_merges_anidb_and_tvdb_shapes() {
         let request = SearchRequest {
-            query: "Mushoku Tensei & Friends".to_string(),
+            query: "Bleach 055".to_string(),
             ids: HashMap::from([
-                ("anidb_id".to_string(), "14758".to_string()),
-                ("tvdb_id".to_string(), "371310".to_string()),
+                ("anidb_id".to_string(), "2369".to_string()),
+                ("tvdb_id".to_string(), "74796".to_string()),
             ]),
+            facet: Some("anime".to_string()),
+            season: Some(3),
+            episode: Some(4),
+            absolute_episode: Some(55),
+            ..SearchRequest::default()
+        };
+        let queries = api_queries(&request);
+
+        assert_eq!(queries.len(), 2);
+        assert_eq!(queries[0].get("anidb").map(String::as_str), Some("2369"));
+        assert_eq!(queries[0].get("episode").map(String::as_str), Some("55"));
+        assert_eq!(queries[1].get("tvdb").map(String::as_str), Some("74796"));
+        assert_eq!(queries[1].get("season").map(String::as_str), Some("3"));
+        assert_eq!(queries[1].get("episode").map(String::as_str), Some("4"));
+    }
+
+    #[test]
+    fn anime_sxex_search_queries_anidb_and_tvdb_independently() {
+        let request = SearchRequest {
+            query: "Bleach S02E04".to_string(),
+            ids: HashMap::from([
+                ("anidb_id".to_string(), "2369".to_string()),
+                ("tvdb_id".to_string(), "74796".to_string()),
+            ]),
+            facet: Some("anime".to_string()),
             season: Some(2),
             episode: Some(4),
             ..SearchRequest::default()
         };
-        let config = migrate_legacy_config(LegacyAniNzbConfig::default());
-        let url = Url::parse(&build_api_search_url(&config, &request).unwrap()).unwrap();
-        let query = url.query_pairs().collect::<HashMap<_, _>>();
+        let queries = api_queries(&request);
+
+        assert_eq!(queries.len(), 2);
+        assert_eq!(queries[0].get("anidb").map(String::as_str), Some("2369"));
+        assert_eq!(queries[0].get("episode").map(String::as_str), Some("4"));
+        assert_eq!(queries[1].get("tvdb").map(String::as_str), Some("74796"));
+        assert_eq!(queries[1].get("season").map(String::as_str), Some("2"));
+        assert_eq!(queries[1].get("episode").map(String::as_str), Some("4"));
+    }
+
+    #[test]
+    fn anime_season_pack_search_merges_filename_anidb_and_tvdb_queries() {
+        let request = SearchRequest {
+            query: "Bleach S06".to_string(),
+            ids: HashMap::from([
+                ("anidb_id".to_string(), "2369".to_string()),
+                ("tvdb_id".to_string(), "74796".to_string()),
+            ]),
+            facet: Some("anime".to_string()),
+            season: Some(6),
+            ..SearchRequest::default()
+        };
+        let queries = api_queries(&request);
+
+        assert_eq!(queries.len(), 3);
+        assert_eq!(queries[0].get("name").map(String::as_str), Some("Bleach"));
+        assert_eq!(queries[0].get("filename").map(String::as_str), Some("S06"));
+        assert_eq!(queries[0].get("sort").map(String::as_str), Some("size"));
+        assert_eq!(queries[0].get("order").map(String::as_str), Some("desc"));
+        assert_eq!(queries[1].get("anidb").map(String::as_str), Some("2369"));
+        assert!(!queries[1].contains_key("season"));
+        assert_eq!(queries[2].get("tvdb").map(String::as_str), Some("74796"));
+        assert_eq!(queries[2].get("season").map(String::as_str), Some("6"));
+    }
+
+    #[test]
+    fn scoped_text_search_uses_base_title_for_pack_and_structured_queries() {
+        let request = SearchRequest {
+            query: "Bleach S02".to_string(),
+            facet: Some("anime".to_string()),
+            season: Some(2),
+            ..SearchRequest::default()
+        };
+        let queries = api_queries(&request);
+
+        assert_eq!(queries.len(), 2);
+        assert_eq!(queries[0].get("name").map(String::as_str), Some("Bleach"));
+        assert_eq!(queries[0].get("filename").map(String::as_str), Some("S02"));
+        assert_eq!(queries[1].get("name").map(String::as_str), Some("Bleach"));
+        assert_eq!(queries[1].get("season").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn title_search_merges_largest_and_newest_results_for_each_identity() {
+        let request = SearchRequest {
+            ids: HashMap::from([
+                ("anidb_id".to_string(), "2369".to_string()),
+                ("tvdb_id".to_string(), "74796".to_string()),
+            ]),
+            facet: Some("anime".to_string()),
+            ..SearchRequest::default()
+        };
+        let queries = api_queries(&request);
+
+        assert_eq!(queries.len(), 4);
+        assert_eq!(queries[0].get("anidb").map(String::as_str), Some("2369"));
+        assert_eq!(queries[0].get("sort").map(String::as_str), Some("size"));
+        assert_eq!(queries[1].get("anidb").map(String::as_str), Some("2369"));
+        assert!(!queries[1].contains_key("sort"));
+        assert_eq!(queries[2].get("tvdb").map(String::as_str), Some("74796"));
+        assert_eq!(queries[2].get("sort").map(String::as_str), Some("size"));
+        assert_eq!(queries[3].get("tvdb").map(String::as_str), Some("74796"));
+        assert!(!queries[3].contains_key("sort"));
+    }
+
+    #[test]
+    fn merged_api_results_are_round_robin_and_deduplicated() {
+        let result = |guid: &str| SearchResult {
+            title: guid.to_string(),
+            guid: Some(guid.to_string()),
+            ..SearchResult::default()
+        };
+
+        let merged = merge_api_result_sets(
+            vec![
+                vec![result("shared"), result("anidb")],
+                vec![result("shared"), result("tvdb")],
+            ],
+            3,
+        );
 
         assert_eq!(
-            query.get("anidb").map(|value| value.as_ref()),
-            Some("14758")
+            merged
+                .iter()
+                .filter_map(|result| result.guid.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["shared", "anidb", "tvdb"]
         );
-        assert_eq!(
-            query.get("tvdb").map(|value| value.as_ref()),
-            Some("371310")
-        );
-        assert_eq!(
-            query.get("name").map(|value| value.as_ref()),
-            Some("Mushoku Tensei & Friends")
-        );
-        assert_eq!(query.get("season").map(|value| value.as_ref()), Some("2"));
-        assert_eq!(query.get("episode").map(|value| value.as_ref()), Some("4"));
     }
 
     #[test]
     fn api_url_for_recent_search_uses_newest_release_source() {
-        let config = migrate_legacy_config(LegacyAniNzbConfig::default());
-        let url =
-            Url::parse(&build_api_search_url(&config, &SearchRequest::default()).unwrap()).unwrap();
-        let query = url.query_pairs().collect::<HashMap<_, _>>();
+        let queries = api_queries(&SearchRequest::default());
 
         assert_eq!(
-            query.get("source").map(|value| value.as_ref()),
+            queries[0].get("source").map(String::as_str),
             Some("release")
         );
     }
