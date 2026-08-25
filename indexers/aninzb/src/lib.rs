@@ -284,10 +284,7 @@ fn execute_api_search(
     })
 }
 
-fn execute_api_search_url(
-    config: &AniNzbConfig,
-    url: &str,
-) -> Result<Vec<SearchResult>, Error> {
+fn execute_api_search_url(config: &AniNzbConfig, url: &str) -> Result<Vec<SearchResult>, Error> {
     wait_for_api_request_slot()?;
     let (status, body) =
         polite_http_get(url, "application/json, */*;q=0.8", &config.http_behavior)?;
@@ -618,12 +615,14 @@ fn request_is_movie_shaped(request: &SearchRequest) -> bool {
 }
 
 fn request_is_anime_shaped(request: &SearchRequest) -> bool {
-    request.context.as_ref().is_some_and(|context| {
-        context.subject_kind == PluginSearchSubjectKind::AnimeEpisode
-    }) || request
-        .facet
-        .as_deref()
-        .is_some_and(|facet| facet.trim().eq_ignore_ascii_case("anime"))
+    request
+        .context
+        .as_ref()
+        .is_some_and(|context| context.subject_kind == PluginSearchSubjectKind::AnimeEpisode)
+        || request
+            .facet
+            .as_deref()
+            .is_some_and(|facet| facet.trim().eq_ignore_ascii_case("anime"))
 }
 
 fn request_id(request: &SearchRequest, key: &str) -> Option<String> {
@@ -650,12 +649,9 @@ fn search_name(request: &SearchRequest) -> Option<String> {
                     query
                         .get(..alias.len())
                         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(alias))
-                        && query
-                            .get(alias.len()..)
-                            .is_some_and(|suffix| {
-                                suffix.is_empty()
-                                    || suffix.starts_with([' ', '.', '-', '_'])
-                            })
+                        && query.get(alias.len()..).is_some_and(|suffix| {
+                            suffix.is_empty() || suffix.starts_with([' ', '.', '-', '_'])
+                        })
                 })
                 .max_by_key(|alias| alias.len())
             {
