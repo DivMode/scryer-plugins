@@ -19,9 +19,9 @@ const ANINZB_API_HOST: &str = "api.aninzb.moe";
 const LEGACY_BASE_URL_DEFAULT: &str = "https://aninzb.moe";
 const API_MAX_RESULTS: usize = 50;
 const MAX_API_RESPONSE_BYTES: usize = 20 * 1024 * 1024;
-const API_REQUESTS_PER_SECOND: u32 = 2;
+const API_REQUESTS_PER_SECOND: u32 = 3;
 const API_REQUEST_INTERVAL: Duration =
-    Duration::from_millis(1_000 / API_REQUESTS_PER_SECOND as u64);
+    Duration::from_millis(1_000_u64.div_ceil(API_REQUESTS_PER_SECOND as u64));
 const API_REQUEST_PACING_VAR: &str = "aninzb.api_request_pacing";
 const DEFAULT_HOURLY_HIT_CAP: u32 = 500;
 const DEFAULT_DAILY_HIT_CAP: u32 = 3000;
@@ -939,8 +939,8 @@ mod tests {
                 .all(|character| !matches!(character, '\r' | '\n' | '\\'))
         );
         assert_eq!(config.http_behavior.pre_request_delay, Duration::ZERO);
-        assert_eq!(API_REQUESTS_PER_SECOND, 2);
-        assert_eq!(API_REQUEST_INTERVAL, Duration::from_millis(500));
+        assert_eq!(API_REQUESTS_PER_SECOND, 3);
+        assert_eq!(API_REQUEST_INTERVAL, Duration::from_millis(334));
         assert_eq!(config.http_behavior.max_search_pages, 1);
         let budget = config.http_behavior.hit_budget.expect("hit budget");
         assert_eq!(budget.hourly_limit, DEFAULT_HOURLY_HIT_CAP);
@@ -948,17 +948,17 @@ mod tests {
     }
 
     #[test]
-    fn api_request_pacing_has_no_initial_delay_and_caps_at_two_per_second() {
+    fn api_request_pacing_has_no_initial_delay_and_caps_at_three_per_second() {
         assert_eq!(api_request_delay(None, 10_000), Duration::ZERO);
         assert_eq!(
             api_request_delay(Some(10_000), 10_000),
-            Duration::from_millis(500)
+            Duration::from_millis(334)
         );
         assert_eq!(
-            api_request_delay(Some(10_000), 10_250),
-            Duration::from_millis(250)
+            api_request_delay(Some(10_000), 10_167),
+            Duration::from_millis(167)
         );
-        assert_eq!(api_request_delay(Some(10_000), 10_500), Duration::ZERO);
+        assert_eq!(api_request_delay(Some(10_000), 10_334), Duration::ZERO);
     }
 
     #[test]
