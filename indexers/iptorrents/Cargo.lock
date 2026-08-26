@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "iptorrents-indexer"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "indexer-command-compat",
  "rss-indexer-common",
