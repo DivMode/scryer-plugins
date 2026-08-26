@@ -600,7 +600,7 @@ impl ApiRequestFailure {
 
     fn invalid_kind(&self) -> Option<IndexerSearchInvalidResponseKind> {
         match self {
-            Self::Invalid(kind, _) => Some(kind.clone()),
+            Self::Invalid(kind, _) => Some(*kind),
             _ => None,
         }
     }

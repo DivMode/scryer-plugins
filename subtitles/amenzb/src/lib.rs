@@ -1266,12 +1266,14 @@ fn plugin_error(error: AmenzbError) -> PluginError {
             public_message: "ameNZB rate limit reached".to_string(),
             debug_message: None,
             retry_after_seconds: retry_after_seconds.and_then(|value| i64::try_from(value).ok()),
+            details: None,
         },
         AmenzbError::Message(message) => PluginError {
             code: PluginErrorCode::Permanent,
             public_message: message,
             debug_message: None,
             retry_after_seconds: None,
+            details: None,
         },
     }
 }
