@@ -61,18 +61,42 @@ macro_rules! log {
 /// `debug_message`, matching what the download-client bridge does: the guest
 /// cannot tell a bad API key from a flaky upstream, so the conservative code is
 /// the one that lets Scryer retry rather than condemning the indexer.
-pub fn to_plugin_result<T, E>(result: Result<T, E>) -> PluginResult<T>
-where
-    E: std::fmt::Display,
-{
+#[derive(Debug)]
+pub struct StructuredPluginError(PluginError);
+
+impl std::fmt::Display for StructuredPluginError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0.public_message)
+    }
+}
+
+impl std::error::Error for StructuredPluginError {}
+
+impl StructuredPluginError {
+    pub fn plugin_error(&self) -> &PluginError {
+        &self.0
+    }
+}
+
+pub fn structured_plugin_error(error: PluginError) -> pdk::Error {
+    pdk::Error::new(StructuredPluginError(error))
+}
+
+pub fn to_plugin_result<T>(result: Result<T, pdk::Error>) -> PluginResult<T> {
     match result {
         Ok(value) => PluginResult::Ok(value),
-        Err(error) => PluginResult::Err(PluginError {
-            code: PluginErrorCode::Temporary,
-            public_message: "indexer command failed".to_string(),
-            debug_message: Some(error.to_string()),
-            retry_after_seconds: None,
-        }),
+        Err(error) => {
+            if let Some(structured) = error.downcast_ref::<StructuredPluginError>() {
+                return PluginResult::Err(structured.0.clone());
+            }
+            PluginResult::Err(PluginError {
+                code: PluginErrorCode::Temporary,
+                public_message: "indexer command failed".to_string(),
+                debug_message: Some(error.to_string()),
+                retry_after_seconds: None,
+                details: None,
+            })
+        }
     }
 }
 
@@ -88,6 +112,7 @@ pub fn action_unsupported(action: &str) -> PluginError {
         public_message: format!("this indexer does not support the '{action}' action"),
         debug_message: None,
         retry_after_seconds: None,
+        details: None,
     }
 }
 
@@ -141,7 +166,7 @@ mod tests {
 
     #[test]
     fn ok_values_pass_through() {
-        let result: PluginResult<u8> = to_plugin_result(Ok::<u8, String>(7));
+        let result: PluginResult<u8> = to_plugin_result(Ok::<u8, pdk::Error>(7));
         match result {
             PluginResult::Ok(value) => assert_eq!(value, 7),
             PluginResult::Err(error) => panic!("unexpected error: {error:?}"),
@@ -150,7 +175,8 @@ mod tests {
 
     #[test]
     fn errors_stay_retryable_and_keep_their_detail() {
-        let result: PluginResult<u8> = to_plugin_result(Err::<u8, String>("upstream 503".into()));
+        let result: PluginResult<u8> =
+            to_plugin_result(Err::<u8, pdk::Error>(pdk::Error::msg("upstream 503")));
         let PluginResult::Err(error) = result else {
             panic!("expected an error");
         };
@@ -160,6 +186,22 @@ mod tests {
             !error.public_message.contains("503"),
             "upstream detail must stay in debug_message"
         );
+    }
+
+    #[test]
+    fn structured_errors_survive_command_result_conversion() {
+        let result: PluginResult<u8> = to_plugin_result(Err(structured_plugin_error(PluginError {
+            code: PluginErrorCode::RateLimited,
+            public_message: "search deferred".to_string(),
+            debug_message: Some("quota exhausted".to_string()),
+            retry_after_seconds: Some(60),
+            details: None,
+        })));
+        let PluginResult::Err(error) = result else {
+            panic!("expected structured error");
+        };
+        assert_eq!(error.code, PluginErrorCode::RateLimited);
+        assert_eq!(error.retry_after_seconds, Some(60));
     }
 
     #[test]

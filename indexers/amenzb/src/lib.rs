@@ -35,6 +35,7 @@ fn build_descriptor() -> PluginDescriptor {
         provider: ProviderDescriptor::Indexer(IndexerDescriptor {
             provider_type: PROVIDER_ID.to_string(),
             provider_aliases: vec![],
+            search_semantics_version: Some(1),
             source_kind: IndexerSourceKind::Usenet,
             capabilities: Capabilities {
                 supported_ids: HashMap::from([
@@ -717,7 +718,7 @@ mod tests {
 
     fn request() -> SearchRequest {
         SearchRequest {
-            query: "Frieren".to_string(),
+            query: "Example Animation".to_string(),
             ids: HashMap::new(),
             facet: None,
             category: None,

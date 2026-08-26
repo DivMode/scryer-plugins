@@ -6,5 +6,5 @@ license = "GPL-3.0-only"
 description = "Migration support for indexer plugins moving from the Extism SDK to the command-style PDK"
 
 [dependencies]
-scryer-plugin-pdk = "0.5.7"
-scryer-plugin-sdk = "3.7.0"
+scryer-plugin-pdk = "0.5.10"
+scryer-plugin-sdk = "3.9.0"

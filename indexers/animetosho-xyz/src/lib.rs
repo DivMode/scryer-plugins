@@ -80,6 +80,7 @@ fn build_descriptor() -> PluginDescriptor {
         provider: ProviderDescriptor::Indexer(IndexerDescriptor {
             provider_type: PROVIDER_ID.to_string(),
             provider_aliases: vec![],
+            search_semantics_version: Some(1),
             source_kind: IndexerSourceKind::Generic,
             capabilities: Capabilities {
                 supported_ids: HashMap::new(),
@@ -479,7 +480,7 @@ mod tests {
     #[test]
     fn normalize_request_drops_id_search_shape() {
         let mut request = SearchRequest {
-            query: "Frieren S02E01".to_string(),
+            query: "Example Animation S02E01".to_string(),
             ids: HashMap::from([("tvdb_id".to_string(), "424536".to_string())]),
             season: Some(2),
             episode: Some(1),
