@@ -21,6 +21,7 @@ fn build_descriptor() -> PluginDescriptor {
         provider: ProviderDescriptor::Indexer(IndexerDescriptor {
             provider_type: "torznab".to_string(),
             provider_aliases: vec!["jackett".to_string()],
+            search_semantics_version: Some(1),
             source_kind: IndexerSourceKind::Torrent,
             capabilities: Capabilities {
                 supported_ids: HashMap::from([

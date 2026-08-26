@@ -21,6 +21,7 @@ fn build_descriptor() -> PluginDescriptor {
         provider: ProviderDescriptor::Indexer(IndexerDescriptor {
             provider_type: "nzbgeek".to_string(),
             provider_aliases: vec![],
+            search_semantics_version: Some(1),
             source_kind: IndexerSourceKind::Usenet,
             capabilities: Capabilities {
                 supported_ids: HashMap::from([
@@ -69,7 +70,7 @@ fn build_descriptor() -> PluginDescriptor {
                 limits: Some(IndexerLimitCapabilities {
                     page_size: Some(100),
                     max_page_size: Some(100),
-                    max_pages: Some(10),
+                    max_pages: Some(30),
                     api_quota_supported: true,
                     grab_quota_supported: true,
                     ..IndexerLimitCapabilities::default()

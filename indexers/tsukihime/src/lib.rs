@@ -50,6 +50,7 @@ fn build_descriptor() -> PluginDescriptor {
         provider: ProviderDescriptor::Indexer(IndexerDescriptor {
             provider_type: PROVIDER_TYPE.to_string(),
             provider_aliases: vec!["tsukihime.org".to_string()],
+            search_semantics_version: None,
             source_kind: IndexerSourceKind::Generic,
             capabilities: IndexerCapabilities {
                 supported_ids: HashMap::from([(
