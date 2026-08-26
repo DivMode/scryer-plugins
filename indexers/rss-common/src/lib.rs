@@ -163,6 +163,7 @@ pub fn build_indexer_descriptor(spec: DescriptorSpec) -> PluginDescriptor {
         provider: ProviderDescriptor::Indexer(IndexerDescriptor {
             provider_type: spec.provider_type.to_string(),
             provider_aliases: spec.provider_aliases,
+            search_semantics_version: None,
             source_kind: spec.source_kind,
             capabilities: Capabilities {
                 supported_ids: spec.supported_ids,

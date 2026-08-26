@@ -28,6 +28,7 @@ fn build_descriptor() -> PluginDescriptor {
         provider: ProviderDescriptor::Indexer(IndexerDescriptor {
             provider_type: "filelist".to_string(),
             provider_aliases: vec!["filelist.io".to_string()],
+            search_semantics_version: None,
             source_kind: IndexerSourceKind::Torrent,
             capabilities: Capabilities {
                 supported_ids: HashMap::from([("series".to_string(), vec!["imdb_id".to_string()])]),

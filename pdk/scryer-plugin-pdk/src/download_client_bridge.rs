@@ -22,6 +22,7 @@ pub struct LegacyDownloadClientFunctions {
     pub list_recent_completed: Option<fn(String) -> FnResult<String>>,
     pub control: fn(String) -> FnResult<String>,
     pub mark_imported: fn(String) -> FnResult<String>,
+    pub mark_imported_non_destructive: Option<fn(String) -> FnResult<String>>,
     pub status: fn(String) -> FnResult<String>,
     pub test_connection: fn(String) -> FnResult<String>,
 }
@@ -53,22 +54,41 @@ fn bridge_download_client_command(
         PluginDownloadClientCommand::ListQueue => {
             PluginDownloadClientCommandResult::ListQueue(list_queue_with_failed_history(functions))
         }
+        PluginDownloadClientCommand::ListQueueScoped(_) => {
+            PluginDownloadClientCommandResult::ListQueueScoped(scoped_list_response(
+                list_queue_with_failed_history(functions),
+            ))
+        }
         PluginDownloadClientCommand::ListHistory => {
             PluginDownloadClientCommandResult::ListHistory(call(functions.list_completed, ()))
+        }
+        PluginDownloadClientCommand::ListHistoryScoped(_) => {
+            PluginDownloadClientCommandResult::ListHistoryScoped(scoped_list_response(call(
+                functions.list_completed,
+                (),
+            )))
         }
         PluginDownloadClientCommand::ListCompleted => {
             PluginDownloadClientCommandResult::ListCompleted(call(functions.list_completed, ()))
         }
+        PluginDownloadClientCommand::ListCompletedScoped(_) => {
+            PluginDownloadClientCommandResult::ListCompletedScoped(scoped_list_response(call(
+                functions.list_completed,
+                (),
+            )))
+        }
         PluginDownloadClientCommand::ListRecentCompleted(request) => {
-            let result = if let Some(list_recent_completed) = functions.list_recent_completed {
-                call(list_recent_completed, request)
-            } else {
-                // Existing first-party DLCs do not export a separate recent
-                // endpoint. Their complete list is still downloader-owned,
-                // so preserve the legacy adapter's conservative fallback.
-                call(functions.list_completed, ())
+            PluginDownloadClientCommandResult::ListRecentCompleted(list_recent_completed(
+                functions, request,
+            ))
+        }
+        PluginDownloadClientCommand::ListRecentCompletedScoped(request) => {
+            let request = sdk::PluginDownloadListRecentCompletedRequest {
+                limit: request.limit,
             };
-            PluginDownloadClientCommandResult::ListRecentCompleted(result)
+            PluginDownloadClientCommandResult::ListRecentCompletedScoped(scoped_list_response(
+                list_recent_completed(functions, request),
+            ))
         }
         PluginDownloadClientCommand::GetCompleted(PluginDownloadGetCompletedRequest {
             client_item_id,
@@ -90,12 +110,47 @@ fn bridge_download_client_command(
         PluginDownloadClientCommand::MarkImported(request) => {
             PluginDownloadClientCommandResult::MarkImported(call(functions.mark_imported, request))
         }
+        PluginDownloadClientCommand::MarkImportedNonDestructive(request) => {
+            let result = functions.mark_imported_non_destructive.map_or_else(
+                || sdk::PluginResult::Ok(()),
+                |mark_imported| call(mark_imported, request),
+            );
+            PluginDownloadClientCommandResult::MarkImportedNonDestructive(result)
+        }
         PluginDownloadClientCommand::Status => {
             PluginDownloadClientCommandResult::Status(call(functions.status, ()))
         }
         PluginDownloadClientCommand::TestConnection => {
             PluginDownloadClientCommandResult::TestConnection(call(functions.test_connection, ()))
         }
+    }
+}
+
+fn list_recent_completed(
+    functions: &LegacyDownloadClientFunctions,
+    request: sdk::PluginDownloadListRecentCompletedRequest,
+) -> sdk::PluginResult<Vec<sdk::PluginCompletedDownload>> {
+    if let Some(list_recent_completed) = functions.list_recent_completed {
+        call(list_recent_completed, request)
+    } else {
+        // Existing first-party DLCs do not export a separate recent endpoint.
+        // Their complete list is still downloader-owned, so preserve the
+        // legacy adapter's conservative fallback.
+        call(functions.list_completed, ())
+    }
+}
+
+fn scoped_list_response<T>(
+    result: sdk::PluginResult<Vec<T>>,
+) -> sdk::PluginResult<sdk::PluginDownloadScopedListResponse<T>> {
+    match result {
+        sdk::PluginResult::Ok(items) => {
+            sdk::PluginResult::Ok(sdk::PluginDownloadScopedListResponse {
+                items,
+                failures: Vec::new(),
+            })
+        }
+        sdk::PluginResult::Err(error) => sdk::PluginResult::Err(error),
     }
 }
 
@@ -166,6 +221,7 @@ fn bridge_error<T>(message: String) -> sdk::PluginResult<T> {
         public_message: "download client command failed".to_string(),
         debug_message: Some(message),
         retry_after_seconds: None,
+        details: None,
     })
 }
 
@@ -184,6 +240,7 @@ mod tests {
                 download_id: None,
                 info_hash: None,
                 name: "completed item".to_string(),
+                release_name: None,
                 dest_dir: "/downloads".to_string(),
                 category: None,
                 output_kind: None,
@@ -260,6 +317,7 @@ mod tests {
             list_recent_completed: None,
             control: unused,
             mark_imported: unused,
+            mark_imported_non_destructive: None,
             status: unused,
             test_connection: unused,
         };
@@ -292,6 +350,45 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_non_destructive_mark_is_a_safe_no_op() {
+        let functions = LegacyDownloadClientFunctions {
+            describe: unused,
+            add: unused,
+            list_queue: unused,
+            list_history: unused,
+            list_completed: completed_downloads,
+            list_recent_completed: None,
+            control: unused,
+            mark_imported: unused,
+            mark_imported_non_destructive: None,
+            status: unused,
+            test_connection: unused,
+        };
+        let request = sdk::PluginDownloadClientMarkImportedRequest {
+            client_item_id: "ABCDEF".to_string(),
+            info_hash: Some("ABCDEF".to_string()),
+            title_id: None,
+            title_name: None,
+            category: None,
+            post_import_isolation: Vec::new(),
+            imported_path: None,
+            download_path: None,
+        };
+
+        let result = bridge_download_client_command(
+            &functions,
+            PluginDownloadClientCommand::MarkImportedNonDestructive(request),
+        );
+
+        assert!(matches!(
+            result,
+            PluginDownloadClientCommandResult::MarkImportedNonDestructive(
+                sdk::PluginResult::Ok(())
+            )
+        ));
+    }
+
+    #[test]
     fn list_history_uses_completed_download_shape() {
         let functions = LegacyDownloadClientFunctions {
             describe: unused,
@@ -302,6 +399,7 @@ mod tests {
             list_recent_completed: None,
             control: unused,
             mark_imported: unused,
+            mark_imported_non_destructive: None,
             status: unused,
             test_connection: unused,
         };
@@ -324,6 +422,7 @@ mod tests {
             download_id: None,
             info_hash: None,
             name: "retained item".to_string(),
+            release_name: None,
             dest_dir: "/downloads".to_string(),
             category: None,
             output_kind: None,

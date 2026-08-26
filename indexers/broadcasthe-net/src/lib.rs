@@ -28,6 +28,7 @@ fn build_descriptor() -> PluginDescriptor {
         provider: ProviderDescriptor::Indexer(IndexerDescriptor {
             provider_type: "broadcasthe_net".to_string(),
             provider_aliases: vec!["btn".to_string(), "broadcasthe.net".to_string()],
+            search_semantics_version: None,
             source_kind: IndexerSourceKind::Torrent,
             capabilities: Capabilities {
                 supported_ids: HashMap::from([
