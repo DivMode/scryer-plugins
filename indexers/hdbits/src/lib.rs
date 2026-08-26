@@ -28,6 +28,7 @@ fn build_descriptor() -> PluginDescriptor {
         provider: ProviderDescriptor::Indexer(IndexerDescriptor {
             provider_type: "hdbits".to_string(),
             provider_aliases: vec!["hdbits.org".to_string()],
+            search_semantics_version: None,
             source_kind: IndexerSourceKind::Torrent,
             capabilities: Capabilities {
                 supported_ids: HashMap::from([("series".to_string(), vec!["tvdb_id".to_string()])]),

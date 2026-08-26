@@ -1,16 +1,20 @@
-use std::collections::{HashMap, HashSet};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Duration;
 
-use indexer_command_compat::{LogLevel, log};
+use indexer_command_compat::{LogLevel, log, structured_plugin_error};
 use newznab_common::{
     Capabilities, IndexerCategoryModel, IndexerCategoryValueKind, IndexerDescriptor,
     IndexerFeedMode, IndexerLimitCapabilities, IndexerProtocol, IndexerResponseFeatures,
     IndexerSearchInput, IndexerSourceKind, NewznabHitBudget, NewznabHttpBehavior, PluginDescriptor,
     PluginSearchSubjectKind, ProviderDescriptor, SDK_VERSION, SearchRequest, SearchResponse,
-    SearchResult, current_sdk_constraint, polite_http_get,
+    SearchResult, current_sdk_constraint, hit_budget_retry_after_seconds, reserve_hit_budget_uses,
 };
 use scryer_plugin_pdk::*;
-use scryer_plugin_sdk::{ConfigFieldDef, ConfigFieldRole, ConfigFieldType, ConfigFieldValueSource};
+use scryer_plugin_sdk::{
+    ConfigFieldDef, ConfigFieldRole, ConfigFieldType, ConfigFieldValueSource,
+    IndexerSearchIncompleteReason, IndexerSearchInvalidResponseKind, IndexerSearchPluginError,
+    PluginError, PluginErrorCode, PluginErrorDetails, PluginResult,
+};
 use serde::Deserialize;
 use url::Url;
 
@@ -22,9 +26,6 @@ const MAX_PARTITION_REQUESTS: usize = 64;
 const MAX_SIZE_PARTITION_DEPTH: u8 = 12;
 const MAX_API_RESPONSE_BYTES: usize = 20 * 1024 * 1024;
 const API_REQUESTS_PER_SECOND: u32 = 3;
-const API_REQUEST_INTERVAL: Duration =
-    Duration::from_millis(1_000_u64.div_ceil(API_REQUESTS_PER_SECOND as u64));
-const API_REQUEST_PACING_VAR: &str = "aninzb.api_request_pacing";
 const DEFAULT_HOURLY_HIT_CAP: u32 = 1000;
 const DEFAULT_DAILY_HIT_CAP: u32 = 5000;
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
@@ -113,7 +114,7 @@ struct AniNzbApiResponse {
     items: Option<Vec<AniNzbApiItem>>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 struct AniNzbApiItem {
     #[serde(default)]
     source: Option<String>,
@@ -160,6 +161,7 @@ fn build_descriptor() -> PluginDescriptor {
         provider: ProviderDescriptor::Indexer(IndexerDescriptor {
             provider_type: "aninzb".to_string(),
             provider_aliases: vec![],
+            search_semantics_version: Some(1),
             source_kind: IndexerSourceKind::Usenet,
             capabilities: Capabilities {
                 supported_ids: HashMap::from([
@@ -250,53 +252,184 @@ fn execute_api_search(
     config: &AniNzbConfig,
     request: &SearchRequest,
 ) -> Result<SearchResponse, Error> {
-    let mut queries = initial_api_queries(request);
+    let initial_queries = initial_api_queries(request);
+    let mut queries = Vec::new();
     let mut seen_queries = HashSet::new();
     let mut seen_results = HashSet::new();
     let mut results = Vec::new();
-    let mut incomplete = false;
+    let mut incomplete_reason = None;
+    let mut invalid_kind = None;
+    let mut retry_after_seconds = None;
+    let mut completed_request = false;
     let mut request_count = 0;
 
-    while let Some(query) = queries.pop() {
-        if request_count >= MAX_PARTITION_REQUESTS {
-            incomplete = true;
+    let mut probe_batch = Vec::with_capacity(initial_queries.len() * 2);
+    for query in initial_queries {
+        probe_batch.push((
+            query.clone(),
+            build_api_size_probe_url(config, &query, "asc")?,
+        ));
+        probe_batch.push((
+            query.clone(),
+            build_api_size_probe_url(config, &query, "desc")?,
+        ));
+    }
+    let probe_len = u32::try_from(probe_batch.len()).unwrap_or(u32::MAX);
+    if probe_batch.len() > MAX_PARTITION_REQUESTS {
+        return Err(incomplete_search_error(
+            SearchResponse::default(),
+            IndexerSearchIncompleteReason::SaturatedPartition,
+            None,
+            false,
+            None,
+        ));
+    }
+    if let Err(error) = reserve_hit_budget_uses(&config.http_behavior, probe_len) {
+        if newznab_common::is_hit_budget_exhausted_error(&error) {
+            return Err(incomplete_search_error(
+                SearchResponse::default(),
+                IndexerSearchIncompleteReason::RateLimited,
+                hit_budget_retry_after_seconds(&config.http_behavior, probe_len)?,
+                false,
+                None,
+            ));
+        }
+        return Err(error);
+    }
+    request_count += probe_batch.len();
+    let probe_pages = execute_api_search_batch(&probe_batch)?;
+    let mut probes = probe_batch.into_iter().zip(probe_pages);
+    while let Some(((mut query, _), ascending)) = probes.next() {
+        let Some(((_, _), descending)) = probes.next() else {
+            incomplete_reason = Some(IndexerSearchIncompleteReason::FanoutBranchFailed);
             break;
-        }
-        let url = build_api_search_url(config, &query)?;
-        if !seen_queries.insert(url.clone()) {
-            continue;
-        }
-        request_count += 1;
-        let page = execute_api_search_url(config, &url)?;
-        for item in &page.items {
-            let Some(result) = api_item_to_search_result(item) else {
-                continue;
-            };
-            if seen_results.insert(result_identity(&result)) {
-                results.push(result);
+        };
+        match (ascending, descending) {
+            (Ok(ascending), Ok(descending)) => {
+                completed_request = true;
+                append_page_results(&ascending, &mut seen_results, &mut results);
+                append_page_results(&descending, &mut seen_results, &mut results);
+                if ascending.is_saturated() || descending.is_saturated() {
+                    if let Some((minimum, maximum)) =
+                        probe_size_bounds(&ascending, &descending)
+                    {
+                        query.min_size = Some(minimum);
+                        query.max_size = Some(maximum);
+                        queries.push(query);
+                    } else {
+                        incomplete_reason =
+                            Some(IndexerSearchIncompleteReason::SaturatedPartition);
+                    }
+                }
             }
-        }
-
-        if page.is_saturated() {
-            if let Some((lower, upper)) = query.size_partitions(&page.items) {
-                queries.push(upper);
-                queries.push(lower);
-            } else {
-                incomplete = true;
+            (Ok(page), Err(failure)) | (Err(failure), Ok(page)) => {
+                completed_request = true;
+                append_page_results(&page, &mut seen_results, &mut results);
+                record_api_failure(
+                    &failure,
+                    &mut incomplete_reason,
+                    &mut invalid_kind,
+                    &mut retry_after_seconds,
+                );
+                if page.is_saturated() {
+                    queries.push(query);
+                }
+            }
+            (Err(ascending), Err(descending)) => {
+                record_api_failure(
+                    &ascending,
+                    &mut incomplete_reason,
+                    &mut invalid_kind,
+                    &mut retry_after_seconds,
+                );
+                record_api_failure(
+                    &descending,
+                    &mut incomplete_reason,
+                    &mut invalid_kind,
+                    &mut retry_after_seconds,
+                );
             }
         }
     }
 
-    if incomplete {
-        return Err(Error::msg(
-            "AniNZB search response was saturated and could not be fully partitioned",
+    while !queries.is_empty() {
+        let remaining = MAX_PARTITION_REQUESTS.saturating_sub(request_count);
+        if remaining == 0 {
+            incomplete_reason = Some(IndexerSearchIncompleteReason::SaturatedPartition);
+            break;
+        }
+
+        let mut batch = Vec::new();
+        while batch.len() < remaining {
+            let Some(query) = queries.pop() else {
+                break;
+            };
+            let url = build_api_search_url(config, &query)?;
+            if seen_queries.insert(url.clone()) {
+                batch.push((query, url));
+            }
+        }
+        if batch.is_empty() {
+            continue;
+        }
+
+        let batch_len = u32::try_from(batch.len()).unwrap_or(u32::MAX);
+        if let Err(error) = reserve_hit_budget_uses(&config.http_behavior, batch_len) {
+            if newznab_common::is_hit_budget_exhausted_error(&error) {
+                incomplete_reason = Some(IndexerSearchIncompleteReason::RateLimited);
+                retry_after_seconds =
+                    hit_budget_retry_after_seconds(&config.http_behavior, batch_len)?;
+                break;
+            }
+            return Err(error);
+        }
+        request_count += batch.len();
+
+        let pages = execute_api_search_batch(&batch)?;
+        for ((query, _), page) in batch.into_iter().zip(pages) {
+            match page {
+                Ok(page) => {
+                    completed_request = true;
+                    append_page_results(&page, &mut seen_results, &mut results);
+
+                    if page.is_saturated() {
+                        if let Some((lower, upper)) = query.size_partitions(&page.items) {
+                            queries.push(upper);
+                            queries.push(lower);
+                        } else {
+                            incomplete_reason = Some(
+                                IndexerSearchIncompleteReason::SaturatedPartition,
+                            );
+                        }
+                    }
+                }
+                Err(failure) => {
+                    record_api_failure(
+                        &failure,
+                        &mut incomplete_reason,
+                        &mut invalid_kind,
+                        &mut retry_after_seconds,
+                    );
+                }
+            }
+        }
+    }
+
+    let response = SearchResponse {
+        results,
+        ..SearchResponse::default()
+    };
+    if let Some(reason) = incomplete_reason {
+        return Err(incomplete_search_error(
+            response,
+            reason,
+            retry_after_seconds,
+            completed_request,
+            invalid_kind,
         ));
     }
 
-    Ok(SearchResponse {
-        results,
-        ..SearchResponse::default()
-    })
+    Ok(response)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -304,6 +437,7 @@ enum ApiSearchBranch {
     AniDb(String),
     Tvdb(String),
     Name(String),
+    Filename(String),
     Recent,
 }
 
@@ -350,11 +484,31 @@ struct ApiSearchPage {
 
 impl ApiSearchPage {
     fn is_saturated(&self) -> bool {
-        self.items.len() >= API_MAX_RESULTS
-            || self
-                .total_count
-                .is_some_and(|total_count| total_count >= API_MAX_RESULTS as u64)
+        self.total_count.map_or(self.items.len() >= API_MAX_RESULTS, |total_count| {
+            total_count > self.items.len() as u64
+        })
     }
+}
+
+fn append_page_results(
+    page: &ApiSearchPage,
+    seen_results: &mut HashSet<String>,
+    results: &mut Vec<SearchResult>,
+) {
+    for item in &page.items {
+        let Some(result) = api_item_to_search_result(item) else {
+            continue;
+        };
+        if seen_results.insert(result_identity(&result)) {
+            results.push(result);
+        }
+    }
+}
+
+fn probe_size_bounds(ascending: &ApiSearchPage, descending: &ApiSearchPage) -> Option<(i64, i64)> {
+    let minimum = ascending.items.iter().filter_map(|item| item.size).min()?;
+    let maximum = descending.items.iter().filter_map(|item| item.size).max()?;
+    (minimum <= maximum).then_some((minimum, maximum))
 }
 
 fn initial_api_queries(request: &SearchRequest) -> Vec<ApiSearchQuery> {
@@ -385,7 +539,15 @@ fn initial_api_queries(request: &SearchRequest) -> Vec<ApiSearchQuery> {
     }
     if let Some(name) = search_name(request) {
         queries.push(ApiSearchQuery {
-            branch: ApiSearchBranch::Name(name),
+            branch: ApiSearchBranch::Name(name.clone()),
+            season: request.season,
+            episode,
+            min_size: None,
+            max_size: None,
+            partition_depth: 0,
+        });
+        queries.push(ApiSearchQuery {
+            branch: ApiSearchBranch::Filename(name),
             season: request.season,
             episode,
             min_size: None,
@@ -406,18 +568,242 @@ fn initial_api_queries(request: &SearchRequest) -> Vec<ApiSearchQuery> {
     queries
 }
 
-fn execute_api_search_url(config: &AniNzbConfig, url: &str) -> Result<ApiSearchPage, Error> {
-    wait_for_api_request_slot()?;
-    let (status, body) =
-        polite_http_get(&url, "application/json, */*;q=0.8", &config.http_behavior)?;
-    if !(200..300).contains(&status) {
-        return Err(Error::msg(format!("AniNZB API returned HTTP {status}")));
+#[derive(Clone, Debug)]
+enum ApiRequestFailure {
+    RateLimited(Option<i64>),
+    Invalid(IndexerSearchInvalidResponseKind, String),
+    Upstream(String),
+}
+
+impl ApiRequestFailure {
+    fn incomplete_reason(&self) -> IndexerSearchIncompleteReason {
+        match self {
+            Self::RateLimited(_) => IndexerSearchIncompleteReason::RateLimited,
+            Self::Invalid(_, _) => IndexerSearchIncompleteReason::MalformedContent,
+            Self::Upstream(_) => IndexerSearchIncompleteReason::FanoutBranchFailed,
+        }
     }
 
-    let response = parse_api_response(&body)?;
+    fn invalid_kind(&self) -> Option<IndexerSearchInvalidResponseKind> {
+        match self {
+            Self::Invalid(kind, _) => Some(kind.clone()),
+            _ => None,
+        }
+    }
+
+    fn retry_after_seconds(&self) -> Option<i64> {
+        match self {
+            Self::RateLimited(retry_after_seconds) => *retry_after_seconds,
+            _ => None,
+        }
+    }
+}
+
+fn record_api_failure(
+    failure: &ApiRequestFailure,
+    incomplete_reason: &mut Option<IndexerSearchIncompleteReason>,
+    invalid_kind: &mut Option<IndexerSearchInvalidResponseKind>,
+    retry_after_seconds: &mut Option<i64>,
+) {
+    match failure {
+        ApiRequestFailure::RateLimited(_) => {
+            log!(LogLevel::Warn, "AniNZB search branch was rate limited");
+        }
+        ApiRequestFailure::Invalid(_, message) | ApiRequestFailure::Upstream(message) => {
+            log!(LogLevel::Warn, "AniNZB search branch failed: {}", message);
+        }
+    }
+    *incomplete_reason = Some(failure.incomplete_reason());
+    if invalid_kind.is_none() {
+        *invalid_kind = failure.invalid_kind();
+    }
+    if retry_after_seconds.is_none() {
+        *retry_after_seconds = failure.retry_after_seconds();
+    }
+}
+
+fn execute_api_search_batch(
+    batch: &[(ApiSearchQuery, String)],
+) -> Result<Vec<Result<ApiSearchPage, ApiRequestFailure>>, Error> {
+    let requests = batch
+        .iter()
+        .map(|(_, url)| PluginHttpRequest {
+            url: url.clone(),
+            method: Some("GET".to_string()),
+            headers: BTreeMap::from([
+                ("Accept".to_string(), "application/json".to_string()),
+                ("User-Agent".to_string(), USER_AGENT.to_string()),
+            ]),
+            body: Vec::new(),
+        })
+        .collect();
+    let request = PluginHttpBatchRequest {
+        requests,
+        desired_start_rate: PluginHttpStartRate {
+            starts: API_REQUESTS_PER_SECOND,
+            interval_ms: 1_000,
+        },
+    };
+
+    let response = match scryer_plugin_pdk::host::call(PluginHostRequest::HttpBatch(request)) {
+        Ok(PluginHostResponse::HttpBatch(PluginResult::Ok(response))) => response,
+        Ok(PluginHostResponse::HttpBatch(PluginResult::Err(error))) => {
+            return Ok(std::iter::repeat_with(|| {
+                Err(api_failure_from_plugin_error(&error))
+            })
+            .take(batch.len())
+            .collect());
+        }
+        Ok(_) => {
+            return Ok(std::iter::repeat_with(|| {
+                Err(ApiRequestFailure::Upstream(
+                    "host returned the wrong response operation for AniNZB HTTP batch"
+                        .to_string(),
+                ))
+            })
+            .take(batch.len())
+            .collect());
+        }
+        Err(error) => {
+            return Ok(std::iter::repeat_with(|| {
+                Err(ApiRequestFailure::Upstream(format!(
+                    "AniNZB HTTP batch failed: {error}"
+                )))
+            })
+            .take(batch.len())
+            .collect());
+        }
+    };
+
+    if response.results.len() != batch.len() {
+        return Ok(std::iter::repeat_with(|| {
+            Err(ApiRequestFailure::Upstream(format!(
+                "AniNZB HTTP batch returned {} results for {} requests",
+                response.results.len(),
+                batch.len()
+            )))
+        })
+        .take(batch.len())
+        .collect());
+    }
+
+    Ok(response
+        .results
+        .into_iter()
+        .map(|result| match result {
+            PluginResult::Ok(response) => parse_api_http_response(response),
+            PluginResult::Err(error) => Err(api_failure_from_plugin_error(&error)),
+        })
+        .collect())
+}
+
+fn api_failure_from_plugin_error(error: &PluginError) -> ApiRequestFailure {
+    if error.code == PluginErrorCode::RateLimited {
+        ApiRequestFailure::RateLimited(error.retry_after_seconds)
+    } else {
+        ApiRequestFailure::Upstream(error.public_message.clone())
+    }
+}
+
+fn parse_api_http_response(
+    response: PluginHttpResponse,
+) -> Result<ApiSearchPage, ApiRequestFailure> {
+    if response.status == 429 {
+        return Err(ApiRequestFailure::RateLimited(
+            response_header(&response.headers, "retry-after")
+                .and_then(|value| value.parse::<i64>().ok()),
+        ));
+    }
+    if !(200..300).contains(&response.status) {
+        return Err(ApiRequestFailure::Upstream(format!(
+            "AniNZB API returned HTTP {}",
+            response.status
+        )));
+    }
+
+    let content_type = response_header(&response.headers, "content-type").unwrap_or_default();
+    if !content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().ends_with("/json") || value.trim().ends_with("+json"))
+    {
+        return Err(ApiRequestFailure::Invalid(
+            IndexerSearchInvalidResponseKind::UnexpectedContentType,
+            "AniNZB API returned a non-JSON content type".to_string(),
+        ));
+    }
+    validate_api_response_size(response.body.len()).map_err(|error| {
+        ApiRequestFailure::Invalid(
+            IndexerSearchInvalidResponseKind::TruncatedBody,
+            error.to_string(),
+        )
+    })?;
+    let body = std::str::from_utf8(&response.body).map_err(|error| {
+        ApiRequestFailure::Invalid(
+            IndexerSearchInvalidResponseKind::MalformedBody,
+            format!("AniNZB API response was not valid UTF-8: {error}"),
+        )
+    })?;
+    let parsed = parse_api_response(body).map_err(|error| {
+        ApiRequestFailure::Invalid(
+            IndexerSearchInvalidResponseKind::MalformedBody,
+            error.to_string(),
+        )
+    })?;
+    if parsed.total_count.is_none() && parsed.items.is_none() {
+        return Err(ApiRequestFailure::Invalid(
+            IndexerSearchInvalidResponseKind::InvalidRoot,
+            "AniNZB API response did not contain a result root".to_string(),
+        ));
+    }
+
     Ok(ApiSearchPage {
-        total_count: response.total_count,
-        items: response.items.unwrap_or_default(),
+        total_count: parsed.total_count,
+        items: parsed.items.unwrap_or_default(),
+    })
+}
+
+fn response_header<'a>(headers: &'a BTreeMap<String, String>, name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn incomplete_search_error(
+    response: SearchResponse,
+    reason: IndexerSearchIncompleteReason,
+    retry_after_seconds: Option<i64>,
+    completed_request: bool,
+    invalid_kind: Option<IndexerSearchInvalidResponseKind>,
+) -> Error {
+    let code = if reason == IndexerSearchIncompleteReason::RateLimited {
+        PluginErrorCode::RateLimited
+    } else {
+        PluginErrorCode::UpstreamUnavailable
+    };
+    let details = if !completed_request {
+        if let Some(kind) = invalid_kind {
+            IndexerSearchPluginError::InvalidResponse { kind }
+        } else {
+            IndexerSearchPluginError::Deferred {
+                reason,
+                retry_after_seconds,
+            }
+        }
+    } else {
+        IndexerSearchPluginError::PartialResults {
+            response: Box::new(response),
+            reason,
+            retry_after_seconds,
+        }
+    };
+    structured_plugin_error(PluginError {
+        code,
+        public_message: "AniNZB search did not complete".to_string(),
+        debug_message: Some("one or more AniNZB search branches did not complete".to_string()),
+        retry_after_seconds,
+        details: Some(PluginErrorDetails::IndexerSearch(details)),
     })
 }
 
@@ -436,56 +822,6 @@ fn validate_api_response_size(response_bytes: usize) -> Result<(), Error> {
     Ok(())
 }
 
-fn wait_for_api_request_slot() -> Result<(), Error> {
-    let prior_request_millis = var::get::<String>(API_REQUEST_PACING_VAR)
-        .map_err(|error| {
-            Error::msg(format!(
-                "failed to read AniNZB request pacing state: {error}"
-            ))
-        })?
-        .map(|value| {
-            value.parse::<u64>().map_err(|error| {
-                Error::msg(format!(
-                    "failed to parse AniNZB request pacing state: {error}"
-                ))
-            })
-        })
-        .transpose()?;
-
-    let delay = api_request_delay(prior_request_millis, current_epoch_millis());
-    if !delay.is_zero() {
-        std::thread::sleep(delay);
-    }
-
-    var::set(API_REQUEST_PACING_VAR, current_epoch_millis().to_string()).map_err(|error| {
-        Error::msg(format!(
-            "failed to store AniNZB request pacing state: {error}"
-        ))
-    })
-}
-
-fn api_request_delay(prior_request_millis: Option<u64>, now_millis: u64) -> Duration {
-    let Some(prior_request_millis) = prior_request_millis else {
-        return Duration::ZERO;
-    };
-    let interval_millis = API_REQUEST_INTERVAL
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX);
-    Duration::from_millis(
-        interval_millis.saturating_sub(now_millis.saturating_sub(prior_request_millis)),
-    )
-}
-
-fn current_epoch_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
-}
-
 fn build_api_search_url(config: &AniNzbConfig, request: &ApiSearchQuery) -> Result<String, Error> {
     let mut url = Url::parse(config.api_base_url)
         .map_err(|error| Error::msg(format!("invalid fixed AniNZB API URL: {error}")))?;
@@ -499,6 +835,7 @@ fn build_api_search_url(config: &AniNzbConfig, request: &ApiSearchQuery) -> Resu
             ApiSearchBranch::AniDb(anidb_id) => query.append_pair("anidb", anidb_id),
             ApiSearchBranch::Tvdb(tvdb_id) => query.append_pair("tvdb", tvdb_id),
             ApiSearchBranch::Name(name) => query.append_pair("name", name),
+            ApiSearchBranch::Filename(filename) => query.append_pair("filename", filename),
             ApiSearchBranch::Recent => query.append_pair("source", "release"),
         };
         if let Some(season) = request.season {
@@ -514,6 +851,19 @@ fn build_api_search_url(config: &AniNzbConfig, request: &ApiSearchQuery) -> Resu
             query.append_pair("max_size", &max_size.to_string());
         }
     }
+    Ok(url.to_string())
+}
+
+fn build_api_size_probe_url(
+    config: &AniNzbConfig,
+    request: &ApiSearchQuery,
+    order: &str,
+) -> Result<String, Error> {
+    let mut url = Url::parse(&build_api_search_url(config, request)?)
+        .map_err(|error| Error::msg(format!("invalid AniNZB size probe URL: {error}")))?;
+    url.query_pairs_mut()
+        .append_pair("sort", "size")
+        .append_pair("order", order);
     Ok(url.to_string())
 }
 
@@ -781,7 +1131,6 @@ mod tests {
         );
         assert_eq!(config.http_behavior.pre_request_delay, Duration::ZERO);
         assert_eq!(API_REQUESTS_PER_SECOND, 3);
-        assert_eq!(API_REQUEST_INTERVAL, Duration::from_millis(334));
         assert_eq!(config.http_behavior.max_search_pages, 1);
         let budget = config.http_behavior.hit_budget.expect("hit budget");
         assert_eq!(budget.hourly_limit, DEFAULT_HOURLY_HIT_CAP);
@@ -789,23 +1138,20 @@ mod tests {
     }
 
     #[test]
-    fn api_request_pacing_has_no_initial_delay_and_caps_at_three_per_second() {
-        assert_eq!(api_request_delay(None, 10_000), Duration::ZERO);
-        assert_eq!(
-            api_request_delay(Some(10_000), 10_000),
-            Duration::from_millis(334)
-        );
-        assert_eq!(
-            api_request_delay(Some(10_000), 10_250),
-            Duration::from_millis(84)
-        );
-        assert_eq!(api_request_delay(Some(10_000), 10_334), Duration::ZERO);
+    fn batch_rate_is_host_declared_at_three_starts_per_second() {
+        assert_eq!(API_REQUESTS_PER_SECOND, 3);
+        let rate = PluginHttpStartRate {
+            starts: API_REQUESTS_PER_SECOND,
+            interval_ms: 1_000,
+        };
+        assert_eq!(rate.starts, 3);
+        assert_eq!(rate.interval_ms, 1_000);
     }
 
     #[test]
     fn api_queries_fan_out_ids_and_keep_anidb_season_scoped() {
         let request = SearchRequest {
-            query: "Mushoku Tensei & Friends".to_string(),
+            query: "Example Animation & Companions".to_string(),
             ids: HashMap::from([
                 ("anidb_id".to_string(), "14758".to_string()),
                 ("tvdb_id".to_string(), "371310".to_string()),
@@ -816,7 +1162,7 @@ mod tests {
         };
         let config = migrate_legacy_config(LegacyAniNzbConfig::default());
         let queries = initial_api_queries(&request);
-        assert_eq!(queries.len(), 3);
+        assert_eq!(queries.len(), 4);
 
         let anidb_query = queries
             .iter()
@@ -858,8 +1204,26 @@ mod tests {
         let name = name_url.query_pairs().collect::<HashMap<_, _>>();
         assert_eq!(
             name.get("name").map(|value| value.as_ref()),
-            Some("Mushoku Tensei & Friends")
+            Some("Example Animation & Companions")
         );
+
+        let filename_query = queries
+            .iter()
+            .find(|query| matches!(query.branch, ApiSearchBranch::Filename(_)))
+            .expect("filename query");
+        let filename_url =
+            Url::parse(&build_api_search_url(&config, filename_query).unwrap()).unwrap();
+        let filename = filename_url.query_pairs().collect::<HashMap<_, _>>();
+        assert_eq!(
+            filename.get("filename").map(|value| value.as_ref()),
+            Some("Example Animation & Companions")
+        );
+
+        let probe_url =
+            Url::parse(&build_api_size_probe_url(&config, anidb_query, "asc").unwrap()).unwrap();
+        let probe = probe_url.query_pairs().collect::<HashMap<_, _>>();
+        assert_eq!(probe.get("sort").map(|value| value.as_ref()), Some("size"));
+        assert_eq!(probe.get("order").map(|value| value.as_ref()), Some("asc"));
     }
 
     #[test]
@@ -974,6 +1338,11 @@ mod tests {
             }; API_MAX_RESULTS],
         }
         .is_saturated());
+        assert!(!ApiSearchPage {
+            total_count: Some(API_MAX_RESULTS as u64),
+            items: vec![AniNzbApiItem::default(); API_MAX_RESULTS],
+        }
+        .is_saturated());
     }
 
     #[test]
@@ -991,8 +1360,8 @@ mod tests {
           "total_count": 1,
           "items": [{
             "source": "release", "id": 10936,
-            "filename": "Mushoku.Tensei.S03E01.1080p-VARYG",
-            "anidb": 14758, "series_name": ["Mushoku Tensei", "無職転生"],
+            "filename": "Example.Animation.S03E01.1080p-VARYG",
+            "anidb": 14758, "series_name": ["Example Animation", "Example Localized Name"],
             "episode": 1.0, "season": 3, "tvdb": "371310",
             "size": 1640102917, "group": "VARYG", "date": 0,
             "nzb": "https://api.aninzb.moe/releases/10936/release.nzb",
@@ -1006,7 +1375,7 @@ mod tests {
         let result = api_item_to_search_result(&response.items.as_ref().expect("items")[0])
             .expect("usable result");
 
-        assert_eq!(result.title, "Mushoku.Tensei.S03E01.1080p-VARYG");
+        assert_eq!(result.title, "Example.Animation.S03E01.1080p-VARYG");
         assert_eq!(
             result.download_url.as_deref(),
             Some("https://api.aninzb.moe/releases/10936/release.nzb")

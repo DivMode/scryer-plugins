@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use indexer_command_compat::{LogLevel, log};
+use indexer_command_compat::{LogLevel, log, structured_plugin_error};
 use quick_xml::escape::unescape;
 use quick_xml::events::{Event, attributes::Attribute};
 use quick_xml::{Reader, XmlVersion};
@@ -19,7 +19,9 @@ pub use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldRole, ConfigFieldType, IndexerCapabilities as Capabilities,
     IndexerCategoryModel, IndexerCategoryValueKind, IndexerDescriptor, IndexerFeedMode,
     IndexerLimitCapabilities, IndexerProtocol, IndexerResponseFeatures, IndexerSearchInput,
-    IndexerSourceKind, IndexerTorrentCapabilities, PluginDescriptor, PluginResult,
+    IndexerSearchIncompleteReason, IndexerSearchInvalidResponseKind, IndexerSearchPluginError,
+    IndexerSourceKind, IndexerTorrentCapabilities, PluginDescriptor, PluginError,
+    PluginErrorCode, PluginErrorDetails, PluginResult,
     PluginScoringPolicy as ScoringPolicy, PluginSearchRequest as SearchRequest,
     PluginSearchResponse as SearchResponse, PluginSearchResult as SearchResult,
     PluginSearchSubjectKind, ProviderDescriptor, SDK_VERSION, current_sdk_constraint,
@@ -369,12 +371,106 @@ pub fn extract_base_metadata(
 // ---------------------------------------------------------------------------
 
 /// Rate limit metadata returned by Newznab indexers in `<limits>` elements.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct ApiLimits {
     api_current: Option<u32>,
     api_max: Option<u32>,
     grab_current: Option<u32>,
     grab_max: Option<u32>,
+}
+
+#[derive(Debug)]
+struct FeedParseFailure {
+    kind: IndexerSearchInvalidResponseKind,
+    message: String,
+}
+
+fn parse_newznab_feed(
+    body: &str,
+    is_xml: bool,
+    limit: usize,
+    extract_fn: MetadataExtractor,
+) -> Result<(Vec<SearchResult>, ApiLimits, usize), FeedParseFailure> {
+    let trimmed = body.trim_start();
+    if trimmed.starts_with("<!DOCTYPE html")
+        || trimmed.starts_with("<html")
+        || (!is_xml && !trimmed.starts_with('{'))
+    {
+        return Err(FeedParseFailure {
+            kind: IndexerSearchInvalidResponseKind::UnexpectedContentType,
+            message: "Newznab endpoint returned an incompatible response format".to_string(),
+        });
+    }
+
+    let parsed = if is_xml {
+        parse_newznab_xml(body, limit, extract_fn)
+    } else {
+        parse_newznab_json(body, limit, extract_fn)
+    };
+    parsed.map_err(|error| {
+        let message = error.to_string();
+        let kind = if message.contains("missing channel root")
+            || message.contains("feed root: expected")
+        {
+            IndexerSearchInvalidResponseKind::InvalidRoot
+        } else if message.contains("UnexpectedEof")
+            || message.contains("unexpected end")
+            || (is_xml && trimmed.starts_with("<rss") && !trimmed.contains("</rss>"))
+        {
+            IndexerSearchInvalidResponseKind::TruncatedBody
+        } else {
+            IndexerSearchInvalidResponseKind::MalformedBody
+        };
+        FeedParseFailure { kind, message }
+    })
+}
+
+fn newznab_search_response(results: Vec<SearchResult>, limits: &ApiLimits) -> SearchResponse {
+    SearchResponse {
+        results,
+        api_current: limits.api_current,
+        api_max: limits.api_max,
+        grab_current: limits.grab_current,
+        grab_max: limits.grab_max,
+    }
+}
+
+fn incomplete_newznab_search_error(
+    response: SearchResponse,
+    reason: IndexerSearchIncompleteReason,
+    retry_after_seconds: Option<i64>,
+    completed_page: bool,
+    invalid_kind: Option<IndexerSearchInvalidResponseKind>,
+    debug_message: String,
+) -> Error {
+    let code = if reason == IndexerSearchIncompleteReason::RateLimited {
+        PluginErrorCode::RateLimited
+    } else {
+        PluginErrorCode::UpstreamUnavailable
+    };
+    let details = if !completed_page {
+        if let Some(kind) = invalid_kind {
+            IndexerSearchPluginError::InvalidResponse { kind }
+        } else {
+            IndexerSearchPluginError::Deferred {
+                reason,
+                retry_after_seconds,
+            }
+        }
+    } else {
+        IndexerSearchPluginError::PartialResults {
+            response: Box::new(response),
+            reason,
+            retry_after_seconds,
+        }
+    };
+    structured_plugin_error(PluginError {
+        code,
+        public_message: "indexer search did not complete".to_string(),
+        debug_message: Some(debug_message),
+        retry_after_seconds,
+        details: Some(PluginErrorDetails::IndexerSearch(details)),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -472,15 +568,10 @@ pub fn execute_full_search(
         .http_behavior
         .max_search_pages
         .clamp(1, DEFAULT_MAX_SEARCH_PAGES);
-    let max_results = page_size * max_pages;
-    let limit = if req.limit == 0 {
-        max_results
-    } else {
-        req.limit.min(max_results)
-    };
 
     let mut all_results: Vec<SearchResult> = Vec::new();
     let mut last_limits = ApiLimits::default();
+    let mut completed_page = false;
 
     for page in 0..max_pages {
         let offset = page * page_size;
@@ -528,8 +619,27 @@ pub fn execute_full_search(
         };
         let (status, body) = match search_result {
             Ok(response) => response,
-            Err(error) if is_hit_budget_exhausted_error(&error) => return Err(error),
-            Err(error) => return Err(error),
+            Err(error) if is_hit_budget_exhausted_error(&error) => {
+                let retry_after_seconds = hit_budget_retry_after_seconds(&config.http_behavior, 1)?;
+                return Err(incomplete_newznab_search_error(
+                    newznab_search_response(all_results, &last_limits),
+                    IndexerSearchIncompleteReason::RateLimited,
+                    retry_after_seconds,
+                    completed_page,
+                    None,
+                    error.to_string(),
+                ));
+            }
+            Err(error) => {
+                return Err(incomplete_newznab_search_error(
+                    newznab_search_response(all_results, &last_limits),
+                    IndexerSearchIncompleteReason::UpstreamFailure,
+                    None,
+                    completed_page,
+                    None,
+                    error.to_string(),
+                ));
+            }
         };
 
         // Detect response format and check for errors
@@ -540,39 +650,66 @@ pub fn execute_full_search(
 
         if is_xml {
             if let Some((code, description)) = parse_error_xml(&body) {
-            if page == 0 {
-                return Err(classify_and_format_error(&code, &description));
-            }
-            return Err(Error::msg(format!(
-                "Newznab page {page} returned an error: {code}: {description}"
-            )));
+                if page == 0 {
+                    return Err(classify_and_format_error(&code, &description));
+                }
+                return Err(incomplete_newznab_search_error(
+                    newznab_search_response(all_results, &last_limits),
+                    IndexerSearchIncompleteReason::UpstreamFailure,
+                    None,
+                    completed_page,
+                    None,
+                    format!("Newznab page {page} returned an error: {code}: {description}"),
+                ));
             }
         } else if let Some((code, description)) = parse_error_json(&body) {
             if page == 0 {
                 return Err(classify_and_format_error(&code, &description));
             }
-            return Err(Error::msg(format!(
-                "Newznab page {page} returned an error: {code}: {description}"
-            )));
+            return Err(incomplete_newznab_search_error(
+                newznab_search_response(all_results, &last_limits),
+                IndexerSearchIncompleteReason::UpstreamFailure,
+                None,
+                completed_page,
+                None,
+                format!("Newznab page {page} returned an error: {code}: {description}"),
+            ));
         }
 
         if status >= 400 {
-            if page == 0 {
-                return Err(Error::msg(format!("Newznab API returned HTTP {status}")));
-            }
-            return Err(Error::msg(format!(
-                "Newznab page {page} returned HTTP {status}"
-            )));
+            let reason = if status == 429 {
+                IndexerSearchIncompleteReason::RateLimited
+            } else {
+                IndexerSearchIncompleteReason::UpstreamFailure
+            };
+            return Err(incomplete_newznab_search_error(
+                newznab_search_response(all_results, &last_limits),
+                reason,
+                None,
+                completed_page,
+                None,
+                format!("Newznab page {page} returned HTTP {status}"),
+            ));
         }
 
-        let (page_results, limits, page_count) = if is_xml {
-            parse_newznab_xml(&body, page_size, extract_fn)
-        } else {
-            parse_newznab_json(&body, page_size, extract_fn)
-        }?;
+        let (page_results, limits, page_count) =
+            match parse_newznab_feed(&body, is_xml, page_size, extract_fn) {
+                Ok(parsed) => parsed,
+                Err(failure) => {
+                    return Err(incomplete_newznab_search_error(
+                        newznab_search_response(all_results, &last_limits),
+                        IndexerSearchIncompleteReason::MalformedContent,
+                        None,
+                        completed_page,
+                        Some(failure.kind),
+                        failure.message,
+                    ));
+                }
+            };
 
         last_limits = limits;
         all_results.extend(page_results);
+        completed_page = true;
 
         // Stop if this page was less than full (no more results)
         // or we've hit the overall max
@@ -580,15 +717,17 @@ pub fn execute_full_search(
             break;
         }
         if page + 1 == max_pages {
-            return Err(Error::msg(format!(
-                "Newznab search reached the configured {max_pages}-page ceiling while results remain"
-            )));
+            return Err(incomplete_newznab_search_error(
+                newznab_search_response(all_results, &last_limits),
+                IndexerSearchIncompleteReason::PageCeilingReached,
+                None,
+                completed_page,
+                None,
+                format!(
+                    "Newznab search reached the configured {max_pages}-page ceiling while results remain"
+                ),
+            ));
         }
-    }
-
-    // Respect the caller's requested limit
-    if all_results.len() > limit {
-        all_results.truncate(limit);
     }
 
     let (budget_current, budget_max) = hit_budget_snapshot(&config.http_behavior)?
@@ -617,15 +756,10 @@ pub fn execute_raw_search(
         .http_behavior
         .max_search_pages
         .clamp(1, DEFAULT_MAX_SEARCH_PAGES);
-    let max_results = page_size * max_pages;
-    let limit = if req.limit == 0 {
-        max_results
-    } else {
-        req.limit.min(max_results)
-    };
 
     let mut all_results = Vec::new();
     let mut last_limits = ApiLimits::default();
+    let mut completed_page = false;
 
     for page in 0..max_pages {
         let offset = page * page_size;
@@ -635,7 +769,7 @@ pub fn execute_raw_search(
             format!("{}&offset={offset}", config.additional_params)
         };
 
-        let (status, body) = execute_search(
+        let search_result = execute_search(
             &endpoint,
             "search",
             (!query.is_empty()).then_some(query),
@@ -651,7 +785,31 @@ pub fn execute_raw_search(
             None,
             &page_params,
             &config.http_behavior,
-        )?;
+        );
+        let (status, body) = match search_result {
+            Ok(response) => response,
+            Err(error) if is_hit_budget_exhausted_error(&error) => {
+                let retry_after_seconds = hit_budget_retry_after_seconds(&config.http_behavior, 1)?;
+                return Err(incomplete_newznab_search_error(
+                    newznab_search_response(all_results, &last_limits),
+                    IndexerSearchIncompleteReason::RateLimited,
+                    retry_after_seconds,
+                    completed_page,
+                    None,
+                    error.to_string(),
+                ));
+            }
+            Err(error) => {
+                return Err(incomplete_newznab_search_error(
+                    newznab_search_response(all_results, &last_limits),
+                    IndexerSearchIncompleteReason::UpstreamFailure,
+                    None,
+                    completed_page,
+                    None,
+                    error.to_string(),
+                ));
+            }
+        };
 
         let trimmed = body.trim_start();
         let is_xml = trimmed.starts_with("<?xml")
@@ -663,49 +821,79 @@ pub fn execute_raw_search(
                 if page == 0 {
                     return Err(classify_and_format_error(&code, &description));
                 }
-                return Err(Error::msg(format!(
-                    "Newznab page {page} returned an error: {code}: {description}"
-                )));
+                return Err(incomplete_newznab_search_error(
+                    newznab_search_response(all_results, &last_limits),
+                    IndexerSearchIncompleteReason::UpstreamFailure,
+                    None,
+                    completed_page,
+                    None,
+                    format!("Newznab page {page} returned an error: {code}: {description}"),
+                ));
             }
         } else if let Some((code, description)) = parse_error_json(&body) {
             if page == 0 {
                 return Err(classify_and_format_error(&code, &description));
             }
-            return Err(Error::msg(format!(
-                "Newznab page {page} returned an error: {code}: {description}"
-            )));
+            return Err(incomplete_newznab_search_error(
+                newznab_search_response(all_results, &last_limits),
+                IndexerSearchIncompleteReason::UpstreamFailure,
+                None,
+                completed_page,
+                None,
+                format!("Newznab page {page} returned an error: {code}: {description}"),
+            ));
         }
 
         if status >= 400 {
-            if page == 0 {
-                return Err(Error::msg(format!("Newznab API returned HTTP {status}")));
-            }
-            return Err(Error::msg(format!(
-                "Newznab page {page} returned HTTP {status}"
-            )));
+            let reason = if status == 429 {
+                IndexerSearchIncompleteReason::RateLimited
+            } else {
+                IndexerSearchIncompleteReason::UpstreamFailure
+            };
+            return Err(incomplete_newznab_search_error(
+                newznab_search_response(all_results, &last_limits),
+                reason,
+                None,
+                completed_page,
+                None,
+                format!("Newznab page {page} returned HTTP {status}"),
+            ));
         }
 
-        let (page_results, limits, page_count) = if is_xml {
-            parse_newznab_xml(&body, page_size, extract_fn)
-        } else {
-            parse_newznab_json(&body, page_size, extract_fn)
-        }?;
+        let (page_results, limits, page_count) =
+            match parse_newznab_feed(&body, is_xml, page_size, extract_fn) {
+                Ok(parsed) => parsed,
+                Err(failure) => {
+                    return Err(incomplete_newznab_search_error(
+                        newznab_search_response(all_results, &last_limits),
+                        IndexerSearchIncompleteReason::MalformedContent,
+                        None,
+                        completed_page,
+                        Some(failure.kind),
+                        failure.message,
+                    ));
+                }
+            };
 
         last_limits = limits;
         all_results.extend(page_results);
+        completed_page = true;
 
         if page_count < page_size {
             break;
         }
         if page + 1 == max_pages {
-            return Err(Error::msg(format!(
-                "Newznab search reached the configured {max_pages}-page ceiling while results remain"
-            )));
+            return Err(incomplete_newznab_search_error(
+                newznab_search_response(all_results, &last_limits),
+                IndexerSearchIncompleteReason::PageCeilingReached,
+                None,
+                completed_page,
+                None,
+                format!(
+                    "Newznab search reached the configured {max_pages}-page ceiling while results remain"
+                ),
+            ));
         }
-    }
-
-    if all_results.len() > limit {
-        all_results.truncate(limit);
     }
 
     Ok(SearchResponse {
@@ -765,6 +953,7 @@ fn execute_rss_search(
 
     let mut all_results: Vec<SearchResult> = Vec::new();
     let mut last_limits = ApiLimits::default();
+    let mut completed_page = false;
 
     for search_type in &search_types {
         let search_result = execute_search(
@@ -786,8 +975,27 @@ fn execute_rss_search(
         );
         let (status, body) = match search_result {
             Ok(response) => response,
-            Err(error) if is_hit_budget_exhausted_error(&error) => return Err(error),
-            Err(error) => return Err(error),
+            Err(error) if is_hit_budget_exhausted_error(&error) => {
+                let retry_after_seconds = hit_budget_retry_after_seconds(&config.http_behavior, 1)?;
+                return Err(incomplete_newznab_search_error(
+                    newznab_search_response(all_results, &last_limits),
+                    IndexerSearchIncompleteReason::RateLimited,
+                    retry_after_seconds,
+                    completed_page,
+                    None,
+                    error.to_string(),
+                ));
+            }
+            Err(error) => {
+                return Err(incomplete_newznab_search_error(
+                    newznab_search_response(all_results, &last_limits),
+                    IndexerSearchIncompleteReason::UpstreamFailure,
+                    None,
+                    completed_page,
+                    None,
+                    error.to_string(),
+                ));
+            }
         };
 
         let trimmed = body.trim_start();
@@ -797,21 +1005,62 @@ fn execute_rss_search(
 
         if is_xml {
             if let Some((code, description)) = parse_error_xml(&body) {
+                if completed_page {
+                    return Err(incomplete_newznab_search_error(
+                        newznab_search_response(all_results, &last_limits),
+                        IndexerSearchIncompleteReason::FanoutBranchFailed,
+                        None,
+                        true,
+                        None,
+                        format!("Newznab feed branch returned {code}: {description}"),
+                    ));
+                }
                 return Err(classify_and_format_error(&code, &description));
             }
         } else if let Some((code, description)) = parse_error_json(&body) {
+            if completed_page {
+                return Err(incomplete_newznab_search_error(
+                    newznab_search_response(all_results, &last_limits),
+                    IndexerSearchIncompleteReason::FanoutBranchFailed,
+                    None,
+                    true,
+                    None,
+                    format!("Newznab feed branch returned {code}: {description}"),
+                ));
+            }
             return Err(classify_and_format_error(&code, &description));
         }
 
         if status >= 400 {
-            return Err(Error::msg(format!("Newznab API returned HTTP {status}")));
+            let reason = if status == 429 {
+                IndexerSearchIncompleteReason::RateLimited
+            } else {
+                IndexerSearchIncompleteReason::FanoutBranchFailed
+            };
+            return Err(incomplete_newznab_search_error(
+                newznab_search_response(all_results, &last_limits),
+                reason,
+                None,
+                completed_page,
+                None,
+                format!("Newznab feed branch returned HTTP {status}"),
+            ));
         }
 
-        let (page_results, limits, _page_count) = if is_xml {
-            parse_newznab_xml(&body, config.page_size, extract_fn)
-        } else {
-            parse_newznab_json(&body, config.page_size, extract_fn)
-        }?;
+        let (page_results, limits, page_count) =
+            match parse_newznab_feed(&body, is_xml, config.page_size, extract_fn) {
+                Ok(parsed) => parsed,
+                Err(failure) => {
+                    return Err(incomplete_newznab_search_error(
+                        newznab_search_response(all_results, &last_limits),
+                        IndexerSearchIncompleteReason::MalformedContent,
+                        None,
+                        completed_page,
+                        Some(failure.kind),
+                        failure.message,
+                    ));
+                }
+            };
 
         log!(
             LogLevel::Info,
@@ -821,6 +1070,17 @@ fn execute_rss_search(
         );
         last_limits = limits;
         all_results.extend(page_results);
+        completed_page = true;
+        if page_count >= config.page_size {
+            return Err(incomplete_newznab_search_error(
+                newznab_search_response(all_results, &last_limits),
+                IndexerSearchIncompleteReason::PageCeilingReached,
+                None,
+                completed_page,
+                None,
+                "Newznab feed branch returned a full page without pagination".to_string(),
+            ));
+        }
     }
 
     log!(
@@ -1599,6 +1859,13 @@ pub fn hit_budget_snapshot(
 fn record_hit_budget_use(
     behavior: &NewznabHttpBehavior,
 ) -> Result<Option<NewznabHitBudgetSnapshot>, Error> {
+    reserve_hit_budget_uses(behavior, 1)
+}
+
+pub fn reserve_hit_budget_uses(
+    behavior: &NewznabHttpBehavior,
+    uses: u32,
+) -> Result<Option<NewznabHitBudgetSnapshot>, Error> {
     let Some(budget) = &behavior.hit_budget else {
         return Ok(None);
     };
@@ -1607,7 +1874,9 @@ fn record_hit_budget_use(
         load_hit_budget_state(budget)?,
         current_epoch_seconds(),
     );
-    if snapshot.exhausted() {
+    let hourly_remaining = snapshot.hourly_limit.saturating_sub(snapshot.hourly_count);
+    let daily_remaining = snapshot.daily_limit.saturating_sub(snapshot.daily_count);
+    if snapshot.exhausted() || uses > hourly_remaining || uses > daily_remaining {
         return Err(Error::msg(format!(
             "{HIT_BUDGET_EXHAUSTED}: hourly={}/{} daily={}/{}",
             snapshot.hourly_count,
@@ -1617,12 +1886,31 @@ fn record_hit_budget_use(
         )));
     }
 
-    state.hourly_count = state.hourly_count.saturating_add(1);
-    state.daily_count = state.daily_count.saturating_add(1);
+    state.hourly_count = state.hourly_count.saturating_add(uses);
+    state.daily_count = state.daily_count.saturating_add(uses);
     save_hit_budget_state(budget, &state)?;
     snapshot.hourly_count = state.hourly_count;
     snapshot.daily_count = state.daily_count;
     Ok(Some(snapshot))
+}
+
+pub fn hit_budget_retry_after_seconds(
+    behavior: &NewznabHttpBehavior,
+    required_uses: u32,
+) -> Result<Option<i64>, Error> {
+    let Some(budget) = &behavior.hit_budget else {
+        return Ok(None);
+    };
+    let now = current_epoch_seconds();
+    let (snapshot, _) = snapshot_for_budget(budget, load_hit_budget_state(budget)?, now);
+    let mut retry_after = 0_u64;
+    if required_uses > snapshot.hourly_limit.saturating_sub(snapshot.hourly_count) {
+        retry_after = retry_after.max((now / 3_600 + 1) * 3_600 - now);
+    }
+    if required_uses > snapshot.daily_limit.saturating_sub(snapshot.daily_count) {
+        retry_after = retry_after.max((now / 86_400 + 1) * 86_400 - now);
+    }
+    Ok((retry_after > 0).then_some(i64::try_from(retry_after).unwrap_or(i64::MAX)))
 }
 
 fn load_hit_budget_state(budget: &NewznabHitBudget) -> Result<StoredHitBudget, Error> {
@@ -3041,7 +3329,7 @@ mod tests {
     #[test]
     fn titled_request_retains_title_and_category_for_full_search() {
         let request = SearchRequest {
-            query: "Frieren S02E01".to_string(),
+            query: "Example Series S02E01".to_string(),
             categories: vec!["5070".to_string()],
             ..SearchRequest::default()
         };
@@ -3065,7 +3353,10 @@ mod tests {
         .expect("search URL");
 
         assert_eq!(query_value(&url, "t").as_deref(), Some("tvsearch"));
-        assert_eq!(query_value(&url, "q").as_deref(), Some("Frieren S02E01"));
+        assert_eq!(
+            query_value(&url, "q").as_deref(),
+            Some("Example Series S02E01")
+        );
         assert_eq!(query_value(&url, "cat").as_deref(), Some("5070"));
     }
 
@@ -3458,7 +3749,7 @@ mod tests {
         let url = build_search_url(
             "https://api.nzbgeek.info/api",
             "movie",
-            Some("12 years a slave"),
+            Some("Example Feature"),
             "test-api-key",
             Some("tt2024544"),
             None,
@@ -3474,7 +3765,7 @@ mod tests {
         .unwrap();
 
         assert!(url.contains("t=movie"));
-        assert_eq!(query_value(&url, "q").as_deref(), Some("12 years a slave"));
+        assert_eq!(query_value(&url, "q").as_deref(), Some("Example Feature"));
         assert!(url.contains("imdbid=002024544"));
         assert!(url.contains("limit=200"));
         assert!(url.contains("extended=1"));
@@ -3486,7 +3777,7 @@ mod tests {
     fn build_raw_search_url_uses_search_without_typed_ids() {
         let url = build_raw_search_url(
             "https://feed.animetosho.xyz/api/newznab",
-            Some("Frieren"),
+            Some("Example Series"),
             "test-api-key",
             Some("5070"),
             200,
@@ -3495,7 +3786,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(query_value(&url, "t").as_deref(), Some("search"));
-        assert_eq!(query_value(&url, "q").as_deref(), Some("Frieren"));
+        assert_eq!(query_value(&url, "q").as_deref(), Some("Example Series"));
         assert_eq!(query_value(&url, "cat").as_deref(), Some("5070"));
         assert_eq!(query_value(&url, "limit").as_deref(), Some("200"));
         assert_eq!(query_value(&url, "offset").as_deref(), Some("400"));
@@ -4238,6 +4529,72 @@ mod tests {
         let error = parse_newznab_json("<html>indexer login</html>", 100, extract_base_metadata)
             .unwrap_err();
         assert!(error.to_string().contains("invalid Newznab JSON feed"));
+    }
+
+    #[test]
+    fn feed_parser_classifies_html_invalid_roots_and_truncation() {
+        let html = parse_newznab_feed(
+            "<html>upstream landing page</html>",
+            false,
+            100,
+            extract_base_metadata,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            html.kind,
+            IndexerSearchInvalidResponseKind::UnexpectedContentType
+        ));
+
+        let invalid_root =
+            parse_newznab_feed("{}", false, 100, extract_base_metadata).unwrap_err();
+        assert!(matches!(
+            invalid_root.kind,
+            IndexerSearchInvalidResponseKind::InvalidRoot
+        ));
+
+        let truncated = parse_newznab_feed(
+            "<rss><channel>",
+            true,
+            100,
+            extract_base_metadata,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            truncated.kind,
+            IndexerSearchInvalidResponseKind::TruncatedBody
+        ));
+    }
+
+    #[test]
+    fn later_page_failures_retain_candidates_as_typed_partial_results() {
+        let response = SearchResponse {
+            results: vec![SearchResult {
+                title: "Example.Release.S01E01".to_string(),
+                ..SearchResult::default()
+            }],
+            ..SearchResponse::default()
+        };
+        let error = incomplete_newznab_search_error(
+            response,
+            IndexerSearchIncompleteReason::MalformedContent,
+            None,
+            true,
+            Some(IndexerSearchInvalidResponseKind::MalformedBody),
+            "later page was malformed".to_string(),
+        );
+        let structured = error
+            .downcast_ref::<indexer_command_compat::StructuredPluginError>()
+            .expect("structured plugin error");
+        let Some(PluginErrorDetails::IndexerSearch(
+            IndexerSearchPluginError::PartialResults {
+                response, reason, ..
+            },
+        )) = structured.plugin_error().details.as_ref()
+        else {
+            panic!("expected typed partial results");
+        };
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(*reason, IndexerSearchIncompleteReason::MalformedContent);
     }
 
     #[test]

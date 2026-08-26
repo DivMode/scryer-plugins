@@ -20,6 +20,7 @@ fn build_descriptor() -> PluginDescriptor {
         provider: ProviderDescriptor::Indexer(IndexerDescriptor {
             provider_type: "dognzb".to_string(),
             provider_aliases: vec![],
+            search_semantics_version: Some(1),
             source_kind: IndexerSourceKind::Usenet,
             capabilities: Capabilities {
                 supported_ids: HashMap::from([
