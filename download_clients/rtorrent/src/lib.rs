@@ -9,8 +9,8 @@ use scryer_plugin_sdk::{
     PluginDescriptor, PluginDownloadClientAddRequest, PluginDownloadClientAddResponse,
     PluginDownloadClientControlRequest, PluginDownloadClientMarkImportedRequest,
     PluginDownloadClientStatus, PluginDownloadItem, PluginDownloadListRecentCompletedRequest,
-    PluginDownloadOutputKind, PluginError,
-    PluginErrorCode, PluginResult, PluginTorrentItem, ProviderDescriptor, SDK_VERSION,
+    PluginDownloadOutputKind, PluginError, PluginErrorCode, PluginResult, PluginTorrentItem,
+    ProviderDescriptor, SDK_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -235,24 +235,26 @@ pub fn scryer_download_list_history(_input: String) -> FnResult<String> {
     // surfaces its newest completions to the download tracker, so automatic
     // import silently stalls. Mirrors the qBittorrent completion-backlog fix.
     sort_newest_finished_first(&mut torrents);
-    let items = torrents.into_iter().map(torrent_to_item).collect::<Vec<_>>();
+    let items = torrents
+        .into_iter()
+        .map(torrent_to_item)
+        .collect::<Vec<_>>();
     Ok(serde_json::to_string(&PluginResult::Ok(items))?)
 }
 
 pub fn scryer_download_list_completed(_input: String) -> FnResult<String> {
     let config = RTorrentConfig::from_extism()?;
-    Ok(serde_json::to_string(&PluginResult::Ok(completed_downloads(
-        &config, None,
-    )?))?)
+    Ok(serde_json::to_string(&PluginResult::Ok(
+        completed_downloads(&config, None)?,
+    ))?)
 }
 
 pub fn scryer_download_list_recent_completed(input: String) -> FnResult<String> {
     let request: PluginDownloadListRecentCompletedRequest = serde_json::from_str(&input)?;
     let config = RTorrentConfig::from_extism()?;
-    Ok(serde_json::to_string(&PluginResult::Ok(completed_downloads(
-        &config,
-        Some(request.limit),
-    )?))?)
+    Ok(serde_json::to_string(&PluginResult::Ok(
+        completed_downloads(&config, Some(request.limit))?,
+    ))?)
 }
 
 fn completed_downloads(
