@@ -1,6 +1,6 @@
 [package]
 name = "downloadstation-download-client"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 rust-version = "1.97.1"
 license = "GPL-3.0-only"
@@ -27,7 +27,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 base64 = "0.23"
-scryer-plugin-sdk = { git = "https://github.com/scryer-media/scryer.git", branch = "release-NEXT", version = "3.10.0" }
+scryer-plugin-sdk = "3.11.0"
 scryer-plugin-pdk = { path = "../../pdk/scryer-plugin-pdk", version = "0.6.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
